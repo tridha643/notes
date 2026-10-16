@@ -1,0 +1,17 @@
+[package]
+name = "notes-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+
+[[bin]]
+name = "notes"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
