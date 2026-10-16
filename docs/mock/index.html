@@ -1,0 +1,79 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Sideshow</title>
+<style>
+:root{--accent:10 132 255;--tx:245 245 247;--t2:174 174 178;--t3:120 120 126;--green:48 209 88;--red:255 105 97}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden}
+body{font:13px/1.5 -apple-system,"SF Pro Text",system-ui,sans-serif;color:rgb(var(--tx));-webkit-font-smoothing:antialiased;background:#0b0b0d}
+.wall{position:fixed;inset:-10%;background:radial-gradient(60% 50% at 20% 25%,#27507d 0,transparent 70%),radial-gradient(50% 50% at 85% 75%,#2c2c34 0,transparent 70%),radial-gradient(40% 40% at 50% 100%,#14505f 0,transparent 70%);}
+@keyframes drift{to{transform:translate3d(3%,-3%,0) scale(1.05)}}
+.win{position:fixed;inset:5vh 6vw;border-radius:14px;display:grid;grid-template-columns:200px 1fr;overflow:hidden;border:.5px solid rgb(255 255 255/.18);box-shadow:0 30px 80px rgba(0,0,0,.55),0 2px 8px rgba(0,0,0,.3);background:rgb(22 22 24/.96)}
+.side{background:rgb(40 40 44/.5);backdrop-filter:blur(40px) saturate(1.6);-webkit-backdrop-filter:blur(40px) saturate(1.6);border-right:.5px solid rgb(255 255 255/.1);display:flex;flex-direction:column;box-shadow:inset 0 .5px 0 rgb(255 255 255/.2)}
+.top{height:46px;display:flex;align-items:center;padding:0 14px}
+.dots{display:flex;gap:8px}.dots i{width:12px;height:12px;border-radius:50%;display:block}
+.search{margin:0 10px 8px;padding:6px 10px;border-radius:8px;background:rgb(255 255 255/.07);color:rgb(var(--t3));display:flex;justify-content:space-between}
+.sec{margin:10px 18px 4px;font-size:11px;font-weight:600;color:rgb(var(--t3))}
+#list{padding:0 8px;overflow:auto}
+.row{padding:4px 10px;min-height:28px;border-radius:7px;border-radius:8px;cursor:default;transition:background .12s ease;display:grid;grid-template-columns:1fr auto;gap:0 8px}
+.row:hover{background:rgb(255 255 255/.06)}
+.row.on{background:rgb(255 255 255/.09)}.row{display:block}.ttl{color:rgb(var(--t2))}.row.on .ttl{color:rgb(var(--tx))}.side{background:rgb(40 40 44/.35)}
+.cap{font-size:11px;color:rgb(var(--t3))}.ttl{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.path{font-size:11px;color:rgb(var(--t3));white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.time{font-size:11px;color:rgb(var(--t3));grid-row:1}
+.st{font-size:11px}.st.run{color:rgb(var(--accent))}.st.ok{color:rgb(var(--green))}.st.wait{color:#ffd60a}
+.agents{margin-top:auto;border-top:.5px solid rgb(255 255 255/.1);padding:10px 14px;font-size:12px}
+.agents div{display:flex;align-items:center;gap:8px;padding:2px 0;color:rgb(var(--t2))}
+.dot{width:7px;height:7px;border-radius:50%;background:rgb(var(--green));}.dot.idle{background:rgb(var(--t3));animation:none}
+@keyframes pulse{50%{opacity:.4}}
+.pane{display:flex;flex-direction:column;min-width:0;position:relative}
+.bar{height:46px;display:flex;align-items:center;justify-content:space-between;padding:0 22px;border-bottom:.5px solid rgb(255 255 255/.07)}
+.bar b{font-weight:600}.bar span{color:rgb(var(--t3));font-size:12px}
+.main{overflow:auto;flex:1;padding:28px 0 110px}.row{grid-template-columns:1fr auto}
+.col p{text-wrap:pretty}.col{max-width:680px;margin:0 auto;padding:0 28px;}
+@keyframes in{from{opacity:0;transform:translateY(4px)}}
+h1{text-wrap:balance;margin:0 0 2px;font-size:22px;font-weight:700;letter-spacing:-.02em}
+.meta{color:rgb(var(--t3));font-size:12px;margin-bottom:18px}
+code{background:rgb(255 255 255/.09);padding:1px 5px;border-radius:5px;font:12px ui-monospace,"SF Mono",monospace}
+.code{background:rgb(0 0 0/.28);border:.5px solid rgb(255 255 255/.1);border-radius:10px;overflow:hidden;font:12px/1.6 ui-monospace,"SF Mono",monospace;margin:0 0 18px}
+.ln{display:grid;grid-template-columns:44px 1fr;padding-right:12px}.ln i{color:rgb(var(--t3));text-align:right;padding-right:10px;font-style:normal;user-select:none}
+.ln.a{background:rgb(48 209 88/.14)}.ln.a i{background:rgb(48 209 88/.12)}.ln.d{background:rgb(255 105 97/.13)}.ln.d i{background:rgb(255 105 97/.12)}
+.fhead{padding:6px 12px;color:rgb(var(--t3));background:rgb(255 255 255/.05);display:flex;justify-content:space-between}
+.stat .g{color:rgb(var(--green))}.stat .r{color:rgb(var(--red))}
+.card{margin:10px 0;padding:10px 14px;background:rgb(255 255 255/.05);border:.5px solid rgb(255 255 255/.08);border-radius:12px}
+.card .h{font-size:12px;margin-bottom:2px}.card .h b{font-weight:600}.card .h span{color:rgb(var(--t3))}
+.compose{position:absolute;left:50%;bottom:20px;transform:translateX(-50%);width:min(560px,calc(100% - 48px));padding:10px 14px;border-radius:16px;background:rgb(52 52 58/.96);border:.5px solid rgb(255 255 255/.18);box-shadow:0 12px 40px rgba(0,0,0,.45),inset 0 .5px 0 rgb(255 255 255/.25)}
+.compose textarea{width:100%;background:none;border:0;outline:0;color:inherit;font:inherit;resize:none;height:22px}
+.compose .hint{display:flex;justify-content:space-between;align-items:center;color:rgb(var(--t3));font-size:11px;margin-top:4px}
+.btn{background:rgb(var(--accent));color:#fff;border-radius:7px;padding:3px 10px;font-size:12px;font-weight:500}
+.status{height:22px;border-top:.5px solid rgb(255 255 255/.07);display:flex;justify-content:space-between;align-items:center;padding:0 14px;font:11px ui-monospace,monospace;color:rgb(var(--t3))}
+.cli{position:fixed;right:30px;bottom:14px;font:11px ui-monospace,monospace;color:rgb(255 255 255/.55)}
+</style></head><body>
+<div class="wall"></div>
+<div class="win">
+ <div class="side">
+  <div class="top"><div class="dots"><i style="background:#ff5f57"></i><i style="background:#febc2e"></i><i style="background:#28c840"></i></div></div>
+    <div class="sec">Notes</div><div id="list"></div>
+   </div>
+ <div class="pane">
+  <div class="bar"><b id="bar"></b><span id="barmeta"></span></div>
+  <div class="main"><div class="col" id="main"></div></div>
+  <div class="compose"><textarea id="ta" placeholder="Write to this note…"></textarea><div class="hint"><span>Humans and agents edit the same note</span><span><span style="margin-right:8px">⌘↵</span><span class="btn">Send</span></span></div></div>
+ </div>
+</div>
+<script>
+const L=(n,t,c,k)=>`<div class="ln ${c||''}"><i>${n}</i><span>${t}</span></div>`;
+const posts=[
+{cap:'You',t:'Glass layer notes',path:'Only the sidebar is vibrant. Reading pane stays opaque.',time:'now',st:'',
+ b:`<p>Only the sidebar is vibrant. The reading pane stays nearly opaque so text is always legible.</p><p>Try <code>NSGlassEffectView</code> first. Custom blur only if needed.</p>`,
+ c:[['claude-code','2m','Added a section on frame pacing. Want a checklist?'],['You','1m','Yes, add it.']]},
+{cap:'claude-code',t:'Frame budget',path:'120 fps = 8.3 ms per frame',time:'14m',st:'',
+ b:`<p>Target 8.3 ms per frame at 120 Hz and about 0% CPU when idle. Redraw only the changed view.</p>`,c:[]},
+{cap:'You',t:'Launch plan',path:'Resident daemon, paint cached view first',time:'1h',st:'',
+ b:`<p>Keep a resident daemon and paint the last view from a cached snapshot, so the window appears before anything loads.</p>`,c:[['perf','1h','Target 30 ms warm start.']]}];
+const list=document.getElementById('list'),main=document.getElementById('main');
+function show(i){[...list.children].forEach((c,j)=>c.classList.toggle('on',i==j));const p=posts[i];
+bar.textContent=p.t;barmeta.textContent=p.cap;
+
+main.innerHTML=`<h1>${p.t}</h1><div class="meta">Edited by ${p.cap} · ${p.time} ago</div>${p.b}${p.c.map(c=>`<div class="card"><div class="h"><b>${c[0]}</b> <span>· ${c[1]}</span></div>${c[2]}</div>`).join('')}`}
+posts.forEach((p,i)=>{const d=document.createElement('div');d.className='row';d.innerHTML=`<div class="ttl">${p.t}</div>`;d.onmousedown=()=>show(i);list.appendChild(d)});show(0);
+addEventListener('keydown',e=>{if(document.activeElement.tagName=='TEXTAREA')return;const o=[...list.children],c=o.findIndex(x=>x.classList.contains('on'));if(e.key=='ArrowDown')show(Math.min(c+1,o.length-1));if(e.key=='ArrowUp')show(Math.max(c-1,0))});
+
+</script></body></html>
