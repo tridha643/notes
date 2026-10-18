@@ -9,7 +9,6 @@ name = "notes-ui"
 path = "src/main.rs"
 
 [dependencies]
-# Pinned zed main (2026-10-16). `runtime_shaders` compiles Metal shaders at
-# launch instead of via `xcrun metal`, which Xcode CLT alone doesn't ship.
+# Pinned zed main (2026-10-16). Metal shaders compile at build time (needs Xcode's Metal Toolchain).
 gpui = { git = "https://github.com/zed-industries/zed", rev = "2d4c4831943153f63ad0aeddf49c8f5a3d008e75" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "2d4c4831943153f63ad0aeddf49c8f5a3d008e75", features = ["runtime_shaders", "font-kit"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "2d4c4831943153f63ad0aeddf49c8f5a3d008e75", features = ["font-kit"] }
