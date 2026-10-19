@@ -471,7 +471,7 @@ mod tests {
         );
         assert_eq!(
             verb(&["search", "todo", "work", "-C", "2", "--case"], "").unwrap(),
-            Verb::Search(SearchArgs { query: "todo".into(), folder: Some("work".into()), context: 2, case_sensitive: true, limit: None })
+            Verb::Search(SearchArgs { query: "todo".into(), folder: Some("work".into()), context: 2, case_sensitive: true, fuzzy: false, limit: None })
         );
         assert!(Cli::try_parse_from(["notes", "read", "x", "--lines", "5"]).is_err());
         assert!(Cli::try_parse_from(["notes", "list", "--sort", "size"]).is_err());
