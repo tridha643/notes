@@ -258,6 +258,8 @@ pub struct WatchArgs {
 
 /// Several verbs over one connection. `atomic` runs them in one transaction
 /// and rolls back on the first failure. Nested batches are rejected.
+/// The result is a `Vec<BatchOutcome>`, one per op in order; an atomic batch
+/// stops at the first error, so its last outcome is that error.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BatchArgs {
     pub ops: Vec<Verb>,
@@ -283,6 +285,14 @@ impl Response {
     pub fn err(id: u64, error: ErrorBody) -> Self {
         Response::Err { id, ok: False, error }
     }
+}
+
+/// One op's outcome inside a `batch` result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum BatchOutcome {
+    Ok { ok: True, result: Value },
+    Err { ok: False, error: ErrorBody },
 }
 
 /// Literal `true` / `false` markers so `ok` round-trips exactly in untagged responses.
@@ -317,9 +327,26 @@ pub struct ErrorBody {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
-    /// Extra structured data, e.g. candidate paths or the current version.
+    /// Extra structured data, e.g. candidate paths. `version_conflict` always
+    /// carries `{"current_version": N}`; build it with [`ErrorBody::version_conflict`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
+}
+
+impl ErrorBody {
+    pub fn version_conflict(path: &str, expected: u64, current_version: u64) -> Self {
+        ErrorBody {
+            code: ErrorCode::VersionConflict,
+            message: format!("{path} is at version {current_version}, not {expected}"),
+            hint: Some(format!("re-read the note, or retry with --if-version {current_version}")),
+            details: Some(serde_json::json!({ "current_version": current_version })),
+        }
+    }
+
+    /// `current_version` from a `version_conflict` error's details.
+    pub fn current_version(&self) -> Option<u64> {
+        self.details.as_ref()?.get("current_version")?.as_u64()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -370,10 +397,12 @@ pub struct NoteSummary {
     pub updated_at: i64,
 }
 
+/// One `list` result element; the result is a `Vec<ListEntry>`, folders first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListResult {
-    pub folders: Vec<String>,
-    pub notes: Vec<NoteSummary>,
+#[serde(untagged)]
+pub enum ListEntry {
+    Folder { folder: String },
+    Note(NoteSummary),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -500,8 +529,29 @@ mod tests {
             assert!(line.ends_with('\n') && !line[..line.len() - 1].contains('\n'));
             assert_eq!(serde_json::from_str::<Response>(&line).unwrap(), response);
         }
-        let wire: Value = serde_json::from_str(r#"{"id":7,"ok":false,"error":{"code":"version_conflict","message":"x"}}"#).unwrap();
+        let wire: Value = serde_json::from_str(r#"{"id":7,"ok":false,"error":{"code":"version_conflict","message":"x","details":{"current_version":9}}}"#).unwrap();
         let Response::Err { error, .. } = serde_json::from_value(wire).unwrap() else { panic!("expected error") };
         assert_eq!(error.code.exit_code(), 5);
+        assert_eq!(error.current_version(), Some(9));
+        assert_eq!(ErrorBody::version_conflict("a.md", 3, 4).current_version(), Some(4));
+    }
+
+    #[test]
+    fn list_entries_and_batch_outcomes_are_flat_lines() {
+        let entries = vec![
+            ListEntry::Folder { folder: "work".into() },
+            ListEntry::Note(NoteSummary { path: "a.md".into(), title: "a".into(), version: 1, updated_at: 0 }),
+        ];
+        let wire = serde_json::to_value(&entries).unwrap();
+        assert_eq!(wire[0], json!({"folder":"work"}));
+        assert_eq!(wire[1]["path"], "a.md");
+        assert_eq!(serde_json::from_value::<Vec<ListEntry>>(wire).unwrap(), entries);
+
+        let outcomes: Vec<BatchOutcome> = serde_json::from_str(
+            r#"[{"ok":true,"result":{"path":"a.md","version":2}},{"ok":false,"error":{"code":"not_found","message":"b"}}]"#,
+        )
+        .unwrap();
+        assert!(matches!(outcomes[0], BatchOutcome::Ok { .. }));
+        assert!(matches!(&outcomes[1], BatchOutcome::Err { error, .. } if error.code == ErrorCode::NotFound));
     }
 }
