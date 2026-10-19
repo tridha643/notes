@@ -2,3 +2,4 @@ target/
 docs/ref/
 .worktrees/
 logs/
+.claude/
