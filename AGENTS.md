@@ -5,7 +5,8 @@ Read docs/fast-notes-research.md, docs/more-optimizations.md, docs/obsidian-inte
 ## Scope
 - A simple, fast note-taking app that also carries all of sideshow's internals and parts (markdown, code, diff, terminal, json, trace, image, mermaid, html). No agent status list, no status bar.
 - macOS-only, Apple Silicon only.
-- Rust daemon (`notesd`, launchd socket activation, kqueue, no timers) owns all data: SQLite (WAL) + FTS5 trigram + Loro CRDT, sideshow's tables (sessions, posts, comments, assets, trace_steps, settings), and an append-only event log clients resume from by sequence number.
+- Notes are plain `.md` files in folders under one vault (`~/Notes`, `NOTES_VAULT`). Folders only, no tags or properties.
+- Rust daemon (`notesd`, launchd socket activation, kqueue, no timers) owns the vault and SQLite (WAL): note versions and history, trash (30 days), sideshow's tables (sessions, posts, comments, assets, trace_steps, settings), and an append-only event log clients resume from by sequence number. Search is the `fff-search` crate (fuzzy paths, content grep, frecency) embedded in `notesd`. Spec: docs/cli-spec.md.
 - Rust CLI (`notes`) and the app both talk to the daemon over a unix socket, one JSON line per request (not MCP, not XPC). Every verb supports JSON output.
 - UI: Swift + AppKit (TextKit 2, NSGlassEffectView, WKWebView for html parts, pele in JavaScriptCore for mermaid). GPUI only for surfaces Core Animation can't carry (big canvas, graph).
 - Renders: heavy work (highlighting, parsing, diff hunking) in the daemon, output cached by content hash, only visible parts laid out, only changed parts re-rendered.
