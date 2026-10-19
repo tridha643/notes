@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.88"
 
 [[bin]]
-name = "notes"
+name = "notes-m1"
 path = "src/main.rs"
 
 [dependencies]

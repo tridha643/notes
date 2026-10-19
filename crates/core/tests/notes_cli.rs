@@ -1,7 +1,7 @@
 use std::process::{Command, Output, Stdio};
 
 fn run_notes(db: &std::path::Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_notes"))
+    Command::new(env!("CARGO_BIN_EXE_notes-m1"))
         .env("NOTES_DB", db)
         .args(args)
         .output()
@@ -60,7 +60,7 @@ fn cli_reports_missing_notes_and_invalid_arguments() {
 #[test]
 fn cli_uses_default_database_under_home() {
     let home = tempfile::tempdir().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_notes"))
+    let output = Command::new(env!("CARGO_BIN_EXE_notes-m1"))
         .env_remove("NOTES_DB")
         .env("HOME", home.path())
         .args(["new", "Default path"])
@@ -93,7 +93,7 @@ fn cli_exits_quietly_when_output_pipe_closes() {
     let note = store
         .create_note("Large note", &"a".repeat(1024 * 1024))
         .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_notes"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_notes-m1"))
         .env("NOTES_DB", &db)
         .args(["show", &note.id.to_string()])
         .stdout(Stdio::piped())
