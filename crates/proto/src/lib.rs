@@ -14,6 +14,9 @@ use std::{env, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod posts;
+use posts::*;
+
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Unix socket `notesd` listens on: `NOTES_SOCK`, else
@@ -86,6 +89,30 @@ pub enum Verb {
     Batch(BatchArgs),
     Manifest,
     Doctor,
+    // Sideshow: sessions, posts, comments, assets, traces, kits, settings (see posts.rs)
+    SessionNew(SessionNewArgs),
+    SessionList,
+    SessionRename(SessionRenameArgs),
+    SessionDelete(IdArgs),
+    PostNew(PostNewArgs),
+    PostUpdate(PostUpdateArgs),
+    PostPart(PostPartArgs),
+    PostList(PostListArgs),
+    PostShow(PostShowArgs),
+    /// Daemon-side render (highlighting, diff hunks, ANSI) for a post version.
+    PostRender(PostShowArgs),
+    PostDelete(IdArgs),
+    CommentNew(CommentNewArgs),
+    CommentList(CommentListArgs),
+    CommentDelete(IdArgs),
+    Wait(WaitArgs),
+    AssetPut(AssetPutArgs),
+    AssetGet(IdArgs),
+    TraceSet(TraceSetArgs),
+    TraceList(IdArgs),
+    Kits,
+    SettingGet(SettingGetArgs),
+    SettingSet(SettingSetArgs),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -379,6 +406,10 @@ impl ErrorCode {
     }
 }
 
+/// One event-log entry. Kinds: `note-created|updated|moved|deleted|restored`,
+/// `folder-created|deleted`, `session-created|updated|deleted`,
+/// `post-created|updated|deleted`, `comment-created|deleted`, `trace-updated`,
+/// `setting-changed`. Notes set `path`; sideshow records set `id`/`session`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub seq: u64,
@@ -387,6 +418,10 @@ pub struct Event {
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 // Result shapes, one per verb family. Paths are vault-relative with `.md`.
@@ -525,7 +560,7 @@ mod tests {
         );
         let event = Response::Event {
             id: 7,
-            event: Event { seq: 12, kind: "note-updated".into(), path: Some("work/plan.md".into()), version: Some(44) },
+            event: Event { seq: 12, kind: "note-updated".into(), path: Some("work/plan.md".into()), version: Some(44), id: None, session: None },
         };
         for response in [ok, err, event] {
             let line = to_line(&response);
@@ -556,5 +591,52 @@ mod tests {
         .unwrap();
         assert!(matches!(outcomes[0], BatchOutcome::Ok { .. }));
         assert!(matches!(&outcomes[1], BatchOutcome::Err { error, .. } if error.code == ErrorCode::NotFound));
+    }
+}
+
+#[cfg(test)]
+mod posts_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn sideshow_verbs_and_parts_use_kebab_kinds() {
+        let request: Request = serde_json::from_value(json!({
+            "v": 1, "id": 3, "verb": "post-new",
+            "args": {"title": "Plan", "parts": [
+                {"kind": "markdown", "markdown": "# Why"},
+                {"kind": "diff", "patch": "--- a\n+++ b\n"},
+                {"kind": "json", "data": {"a": [1, null]}},
+                {"kind": "image", "asset_id": "abc"}
+            ]}
+        }))
+        .unwrap();
+        let Verb::PostNew(args) = &request.verb else { panic!("expected post-new") };
+        assert_eq!(args.parts.len(), 4);
+        assert!(matches!(&args.parts[1], Part::Diff { layout: DiffLayout::Unified, .. }));
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(serde_json::from_value::<Request>(wire).unwrap(), request);
+
+        let wait: Request = serde_json::from_str(r#"{"v":1,"id":4,"verb":"wait","args":{}}"#).unwrap();
+        assert_eq!(wait.verb, Verb::Wait(WaitArgs::default()));
+        let kits: Request = serde_json::from_str(r#"{"v":1,"id":5,"verb":"kits"}"#).unwrap();
+        assert_eq!(kits.verb, Verb::Kits);
+    }
+
+    #[test]
+    fn anchors_and_renders_round_trip() {
+        let anchor: CommentAnchor = serde_json::from_value(json!({
+            "kind": "line-range", "part": 1, "post_version": 2, "start_line": 4, "end_line": 9
+        }))
+        .unwrap();
+        assert!(matches!(anchor, CommentAnchor::LineRange { start_line: 4, .. }));
+        let render = PartRender::Code {
+            language: Some("rust".into()),
+            line_start: 1,
+            lines: vec![vec![Span { text: "fn".into(), class: Some("keyword".into()) }]],
+        };
+        let wire = serde_json::to_value(&render).unwrap();
+        assert_eq!(wire["kind"], "code");
+        assert_eq!(serde_json::from_value::<PartRender>(wire).unwrap(), render);
     }
 }
