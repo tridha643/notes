@@ -55,6 +55,11 @@ public final class DaemonClient: Sendable {
 
     /// One request, one response. Event lines for other ids are skipped.
     public func call<Args: Codable & Sendable, Result: Codable & Sendable>(_ verb: String, _ args: Args) throws -> Result {
+        try callLine(verb, args).0
+    }
+
+    /// `call`, also returning the raw response line.
+    func callLine<Args: Codable & Sendable, Result: Codable & Sendable>(_ verb: String, _ args: Args) throws -> (Result, Data) {
         let id = nextID.wrappingAdd(1, ordering: .relaxed).oldValue
         let socket = try Socket(path: socketPath)
         try socket.send(Request(id: id, verb: verb, args: args))
@@ -66,13 +71,63 @@ public final class DaemonClient: Sendable {
                 throw DaemonError.protocolError("bad response to \(verb): \(error)")
             }
             switch response {
-            case .ok(id, let result): return result
+            case .ok(id, let result): return (result, line)
             case .err(id, let error): throw DaemonError.daemon(error)
             default: continue
             }
         }
         throw DaemonError.protocolError("notesd closed the connection before answering \(verb)")
     }
+
+    // MARK: Sideshow
+
+    public func sessionList() throws -> [Session] { try call("session-list", NoArgs()) }
+
+    public func sessionRename(_ id: String, title: String) throws {
+        let _: Ignored = try call("session-rename", SessionRenameArgs(id: id, title: title))
+    }
+
+    public func sessionDelete(_ id: String) throws {
+        let _: Ignored = try call("session-delete", IdArgs(id: id))
+    }
+
+    public func postList(session: String?, limit: UInt32? = nil) throws -> [PostSummary] {
+        try call("post-list", PostListArgs(session: session, limit: limit))
+    }
+
+    /// A post (optionally an older version), with `json` parts in the agent's key order.
+    public func postShow(_ id: String, version: UInt64? = nil) throws -> Post {
+        var (post, line): (Post, Data) = try callLine("post-show", PostShowArgs(id: id, version: version))
+        if post.parts.contains(where: { $0.kind == "json" }), let raw = try? JSONValue.parse(line) {
+            for (i, part) in post.parts.enumerated() {
+                if case .json(_, let pid) = part, let data = raw["result"]?["parts"]?[i]?["data"] { post.parts[i] = .json(data: data, id: pid) }
+            }
+        }
+        return post
+    }
+
+    public func postRender(_ id: String, version: UInt64? = nil) throws -> PostRender {
+        try call("post-render", PostShowArgs(id: id, version: version))
+    }
+
+    public func postDelete(_ id: String) throws {
+        let _: Ignored = try call("post-delete", IdArgs(id: id))
+    }
+
+    public func commentNew(_ args: CommentNewArgs) throws -> Comment { try call("comment-new", args) }
+
+    public func commentList(_ args: CommentListArgs) throws -> [Comment] { try call("comment-list", args) }
+
+    public func commentDelete(_ id: String) throws {
+        let _: Ignored = try call("comment-delete", IdArgs(id: id))
+    }
+
+    public func assetGet(_ id: String) throws -> AssetData { try call("asset-get", IdArgs(id: id)) }
+
+    /// A session's trace steps.
+    public func traceList(session: String) throws -> [TraceStep] { try call("trace-list", IdArgs(id: session)) }
+
+    public func kits() throws -> [Kit] { try call("kits", NoArgs()) }
 
     public func watch(since: UInt64? = nil) throws -> Watch {
         let socket = try Socket(path: socketPath)

@@ -1,17 +1,31 @@
 import AppKit
 import NotesCore
 
-/// A folder or note in the sidebar tree. Folders are keyed by vault-relative path.
+/// A folder or note in the sidebar tree (keyed by vault-relative path), the Agents
+/// group, or an agent session in it (keyed by session id).
 final class Node {
+    enum Kind { case folder, note, agents, session }
+
     let path: String
-    let title: String
-    let isFolder: Bool
+    var title: String
+    let kind: Kind
+    /// A session's agent name.
+    var agent = ""
     var children: [Node] = []
+
+    var isFolder: Bool { kind == .folder }
+    var isNote: Bool { kind == .note }
 
     init(path: String, title: String, isFolder: Bool) {
         self.path = path
         self.title = title
-        self.isFolder = isFolder
+        kind = isFolder ? .folder : .note
+    }
+
+    init(path: String, title: String, kind: Kind) {
+        self.path = path
+        self.title = title
+        self.kind = kind
     }
 
     /// Builds the tree from a recursive `list` (folders first, notes by path).
@@ -40,7 +54,7 @@ final class Node {
 }
 
 @MainActor
-final class Sidebar: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate, NSTextFieldDelegate {
+final class Sidebar: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate, NSTextFieldDelegate, NSMenuDelegate {
     let view: NSView
     let outline = NSOutlineView()
     private let nameField = NSTextField()
@@ -48,9 +62,15 @@ final class Sidebar: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate, N
     private var entries: [ListEntry]?
     private var expanded = Set<String>()
     private var selecting = false
+    /// The "Agents" group below the notes tree; its children are sessions, newest activity first.
+    private let agents = Node(path: "", title: "Agents", kind: .agents)
+    private var sessions: [Session]?
 
     var onOpen: (String) -> Void = { _ in }
     var onCreate: (String) -> Void = { _ in }
+    var onOpenSession: (String) -> Void = { _ in }
+    var onRenameSession: (String, String) -> Void = { _, _ in }
+    var onDeleteSession: (String) -> Void = { _ in }
 
     override init() {
         let glass = NSGlassEffectView()
@@ -70,6 +90,8 @@ final class Sidebar: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate, N
         outline.indentationPerLevel = 12
         outline.dataSource = self
         outline.delegate = self
+        outline.menu = NSMenu()
+        outline.menu?.delegate = self
 
         let scroll = NSScrollView()
         scroll.documentView = outline
@@ -119,11 +141,54 @@ final class Sidebar: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate, N
     func update(_ new: [ListEntry]) {
         guard new != entries else { return }
         entries = new
-        let selected = selectedNode?.path
-        roots = Node.tree(new)
+        let selected = selectedNode
+        roots = Node.tree(new) + (agents.children.isEmpty ? [] : [agents])
         outline.reloadData()
         restoreExpanded(roots)
-        if let selected { select(path: selected) }
+        outline.expandItem(agents)
+        if let selected { selected.kind == .session ? select(session: selected.path) : select(path: selected.path) }
+    }
+
+    /// Replaces the session list, touching only the rows that changed when the order holds.
+    func update(sessions new: [Session]) {
+        let sorted = new.sorted { ($0.lastActiveAt, $0.id) > ($1.lastActiveAt, $1.id) }
+        guard sorted != sessions else { return }
+        let old = sessions ?? []
+        sessions = sorted
+        let selected = selectedNode?.kind == .session ? selectedNode?.path : nil
+        if old.map(\.id) == sorted.map(\.id), !agents.children.isEmpty {
+            for (node, s) in zip(agents.children, sorted) where old.first(where: { $0.id == s.id }) != s {
+                node.title = s.title ?? s.agent
+                node.agent = s.agent
+                outline.reloadItem(node)
+            }
+            return
+        }
+        let hadGroup = !agents.children.isEmpty
+        agents.children = sorted.map {
+            let node = Node(path: $0.id, title: $0.title ?? $0.agent, kind: .session)
+            node.agent = $0.agent
+            return node
+        }
+        selecting = true
+        defer { selecting = false }
+        if hadGroup != !agents.children.isEmpty {
+            roots = roots.filter { $0 !== agents } + (agents.children.isEmpty ? [] : [agents])
+            outline.reloadData()
+            restoreExpanded(roots)
+        } else {
+            outline.reloadItem(agents, reloadChildren: true)
+        }
+        outline.expandItem(agents)
+        if let selected { select(session: selected) }
+    }
+
+    func select(session id: String) {
+        selecting = true
+        defer { selecting = false }
+        guard let node = agents.children.first(where: { $0.path == id }) else { return outline.deselectAll(nil) }
+        let row = outline.row(forItem: node)
+        if row >= 0 { outline.selectRowIndexes([row], byExtendingSelection: false) }
     }
 
     private func restoreExpanded(_ nodes: [Node]) {
@@ -209,7 +274,20 @@ final class Sidebar: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate, N
     }
 
     func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
-        (item as? Node)?.isFolder ?? false
+        guard let node = item as? Node else { return false }
+        return node.isFolder || node.kind == .agents
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, isGroupItem item: Any) -> Bool {
+        (item as? Node)?.kind == .agents
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, shouldSelectItem item: Any) -> Bool {
+        (item as? Node)?.kind != .agents
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, shouldShowOutlineCellForItem item: Any) -> Bool {
+        (item as? Node)?.kind != .agents
     }
 
     func outlineView(_ outlineView: NSOutlineView, rowViewForItem item: Any) -> NSTableRowView? {
@@ -218,7 +296,16 @@ final class Sidebar: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate, N
 
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
         let cell = outlineView.makeView(withIdentifier: Cell.id, owner: nil) as? Cell ?? Cell()
-        cell.textField?.stringValue = (item as? Node)?.title ?? ""
+        guard let node = item as? Node else { return cell }
+        cell.isGroup = node.kind == .agents
+        if node.kind == .session {
+            // "claude  Fix the build": agent dimmed, then the title.
+            let s = NSMutableAttributedString(string: node.agent, attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: NSColor.tertiaryLabelColor])
+            if node.title != node.agent { s.append(NSAttributedString(string: "  " + node.title, attributes: [.font: NSFont.systemFont(ofSize: 13)])) }
+            cell.textField?.attributedStringValue = s
+        } else {
+            cell.textField?.stringValue = node.title
+        }
         return cell
     }
 
@@ -231,8 +318,53 @@ final class Sidebar: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate, N
     }
 
     func outlineViewSelectionDidChange(_ notification: Notification) {
-        guard !selecting, let node = selectedNode, !node.isFolder else { return }
-        onOpen(node.path)
+        guard !selecting, let node = selectedNode else { return }
+        switch node.kind {
+        case .note: onOpen(node.path)
+        case .session: onOpenSession(node.path)
+        case .folder, .agents: break
+        }
+    }
+
+    // MARK: Session menu
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        guard let node = outline.item(atRow: outline.clickedRow) as? Node, node.kind == .session else { return }
+        for (title, action) in [("Rename Session…", #selector(renameSession(_:))), ("Delete Session", #selector(deleteSession(_:)))] {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            item.representedObject = node.path
+            menu.addItem(item)
+        }
+    }
+
+    @objc private func renameSession(_ item: NSMenuItem) {
+        guard let id = item.representedObject as? String, let window = view.window else { return }
+        let alert = NSAlert()
+        alert.messageText = "Rename Session"
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 22))
+        field.stringValue = agents.children.first { $0.path == id }?.title ?? ""
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        alert.beginSheetModal(for: window) { [weak self] response in
+            let title = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if response == .alertFirstButtonReturn, !title.isEmpty { self?.onRenameSession(id, title) }
+        }
+    }
+
+    @objc private func deleteSession(_ item: NSMenuItem) {
+        guard let id = item.representedObject as? String, let window = view.window else { return }
+        let alert = NSAlert()
+        alert.messageText = "Delete this session?"
+        alert.informativeText = "Its posts, comments and trace are deleted for everyone."
+        alert.addButton(withTitle: "Delete").hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            if response == .alertFirstButtonReturn { self?.onDeleteSession(id) }
+        }
     }
 }
 
@@ -259,8 +391,19 @@ final class Cell: NSTableCellView {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    /// The "Agents" header: the same caption style as "Notes" above the tree.
+    var isGroup = false {
+        didSet {
+            textField?.font = isGroup ? .systemFont(ofSize: 11, weight: .semibold) : .systemFont(ofSize: 13)
+            textField?.textColor = isGroup ? .tertiaryLabelColor : .secondaryLabelColor
+        }
+    }
+
     override var backgroundStyle: NSView.BackgroundStyle {
-        didSet { textField?.textColor = backgroundStyle == .emphasized ? .labelColor : .secondaryLabelColor }
+        didSet {
+            guard !isGroup else { return }
+            textField?.textColor = backgroundStyle == .emphasized ? .labelColor : .secondaryLabelColor
+        }
     }
 }
 

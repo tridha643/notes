@@ -9,6 +9,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemVa
         backing: .buffered, defer: false)
     private let sidebar = Sidebar()
     private let editor = Editor()
+    private let posts = PostsView()
     private let main = NSView()
     private let offline = NSStackView()
     private let offlineDetail = NSTextField(wrappingLabelWithString: "")
@@ -18,12 +19,22 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemVa
     private var lastSeq: UInt64?
     private var listing = false
     private var listAgain = false
+    private var sessionsLoading = false
+    private var sessionsAgain = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.mainMenu = menu()
         buildWindow()
         sidebar.onOpen = { [weak self] path in self?.open(path) }
         sidebar.onCreate = { [weak self] name in self?.create(name) }
+        sidebar.onOpenSession = { [weak self] id in self?.openSession(id) }
+        sidebar.onRenameSession = { [weak self] id, title in
+            daemon({ try $0.sessionRename(id, title: title) }) { _ in self?.refreshSessions() }
+        }
+        sidebar.onDeleteSession = { [weak self] id in
+            daemon({ try $0.sessionDelete(id) }) { _ in self?.refreshSessions() }
+            if self?.posts.session == id { self?.showEditor() }
+        }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate()
         connect()
@@ -48,7 +59,8 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemVa
         window.setFrameAutosaveName("Main")
 
         let root = NSView()
-        for v in [sidebar.view, editor.view] {
+        posts.view.isHidden = true
+        for v in [sidebar.view, editor.view, posts.view] {
             v.translatesAutoresizingMaskIntoConstraints = false
             main.addSubview(v)
         }
@@ -89,6 +101,10 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemVa
             editor.view.trailingAnchor.constraint(equalTo: main.trailingAnchor),
             editor.view.topAnchor.constraint(equalTo: main.topAnchor),
             editor.view.bottomAnchor.constraint(equalTo: main.bottomAnchor),
+            posts.view.leadingAnchor.constraint(equalTo: divider.trailingAnchor),
+            posts.view.trailingAnchor.constraint(equalTo: main.trailingAnchor),
+            posts.view.topAnchor.constraint(equalTo: main.topAnchor),
+            posts.view.bottomAnchor.constraint(equalTo: main.bottomAnchor),
             offline.centerXAnchor.constraint(equalTo: root.centerXAnchor),
             offline.centerYAnchor.constraint(equalTo: root.centerYAnchor),
             offline.widthAnchor.constraint(lessThanOrEqualTo: root.widthAnchor, constant: -40),
@@ -118,7 +134,12 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemVa
             case .success(let entries):
                 setOffline(nil)
                 sidebar.update(entries)
-                if editor.path == nil { open("@last") }
+                refreshSessions()
+                if let id = ProcessInfo.processInfo.environment["NOTES_OPEN_SESSION"], posts.session == nil {
+                    openSession(id)
+                } else if editor.path == nil {
+                    open("@last")
+                }
             case .failure(let error):
                 setOffline(error)
             }
@@ -153,6 +174,13 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemVa
 
     private func handle(_ event: Event) {
         lastSeq = max(lastSeq ?? 0, event.seq)
+        let sideshow = ["session-", "post-", "comment-", "trace-"].contains { event.kind.hasPrefix($0) }
+        if sideshow {
+            posts.handle(event)
+            refreshSessions()
+            return
+        }
+        guard event.kind.hasPrefix("note-") || event.kind.hasPrefix("folder-") else { return }
         refreshList()
         if let path = event.path, path == editor.path, !editor.isDirty, event.version != editor.version {
             daemon({ try $0.read(path) }) { [weak self] result in
@@ -181,12 +209,93 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemVa
         }
     }
 
+    /// Re-lists sessions; bursts of sideshow events coalesce into one extra list.
+    private func refreshSessions() {
+        guard !sessionsLoading else { return sessionsAgain = true }
+        sessionsLoading = true
+        daemon({ try $0.sessionList() }) { [weak self] result in
+            guard let self else { return }
+            sessionsLoading = false
+            if case .success(let sessions) = result { sidebar.update(sessions: sessions) }
+            if sessionsAgain {
+                sessionsAgain = false
+                refreshSessions()
+            }
+        }
+    }
+
     private func open(_ ref: String) {
         editor.flush()
         daemon({ try $0.read(ref) }) { [weak self] result in
             guard let self, case .success(let note) = result else { return }
+            showEditor()
             editor.load(note)
             sidebar.select(path: note.path)
+        }
+    }
+
+    private func showEditor() {
+        posts.close()
+        posts.view.isHidden = true
+        editor.view.isHidden = false
+    }
+
+    private func openSession(_ id: String) {
+        editor.flush()
+        editor.view.isHidden = true
+        posts.view.isHidden = false
+        posts.open(session: id)
+        sidebar.select(session: id)
+        if ProcessInfo.processInfo.environment["NOTES_SCROLL_BENCH"] != nil {
+            posts.onLoaded = { [weak self] in self?.benchmark() }
+        }
+        if let dir = ProcessInfo.processInfo.environment["NOTES_SNAPSHOT"] {
+            posts.onLoaded = { [weak self] in self?.snapshot(dir, 0, y: -(self?.posts.scroll.contentInsets.top ?? 0), delay: 2) }
+        }
+    }
+
+    /// NOTES_SNAPSHOT=dir: page through the opened session, writing what the timeline
+    /// draws to dir/shot-N.png (no screen-recording permission needed). cacheDisplay
+    /// ignores clip-view clipping, so code backgrounds bleed full width in these images.
+    private func snapshot(_ dir: String, _ i: Int, y: CGFloat, delay: Double) {
+        guard i < 12 else { return NSLog("snapshots written to %@", dir) }
+        let clip = posts.scroll.contentView
+        clip.scroll(to: NSPoint(x: 0, y: y))
+        posts.scroll.reflectScrolledClipView(clip)
+        // Async, so renders finishing on the main queue land before each capture.
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let table = self.posts.table, rect = table.visibleRect
+                guard let rep = table.bitmapImageRepForCachingDisplay(in: rect) else { return }
+                table.cacheDisplay(in: rect, to: rep)
+                try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: "\(dir)/shot-\(i).png"))
+                self.snapshot(dir, i + 1, y: y + clip.bounds.height - 200, delay: 0.6)
+            }
+        }
+    }
+
+    /// NOTES_SCROLL_BENCH=1: scroll the opened session top to bottom and back once it
+    /// has loaded and settled, then log per-step main-thread times.
+    private func benchmark() {
+        posts.onLoaded = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                // NOTES_SCROLL_BENCH=N repeats the pass N times (for sampling); the first pass is reported.
+                let repeats = Int(ProcessInfo.processInfo.environment["NOTES_SCROLL_BENCH"] ?? "") ?? 1
+                let all = self.posts.benchmarkScroll()
+                for _ in 1..<max(1, repeats) { _ = self.posts.benchmarkScroll() }
+                guard !all.isEmpty else { return NSLog("scroll bench: nothing to scroll") }
+                // First half scrolls down (rows appear for the first time), second half back up (reuse).
+                for (name, pass) in [("down, cold", all.prefix(all.count / 2)), ("up, warm", all.suffix(all.count / 2))] {
+                    let times = pass.sorted()
+                    func pct(_ p: Double) -> Double { times[min(times.count - 1, Int(Double(times.count) * p))] }
+                    NSLog("scroll bench %@: %d steps, p50 %.2f ms, p95 %.2f ms, p99 %.2f ms, max %.2f ms, over 8.33 ms: %d",
+                          name, times.count, pct(0.5), pct(0.95), pct(0.99), times.last!, times.filter { $0 > 8.33 }.count)
+                }
+                NSLog("scroll bench: web views created %d", WebParts.shared.created)
+            }
         }
     }
 
@@ -213,7 +322,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemVa
     @objc private func newNote(_ sender: Any?) { sidebar.askForName() }
 
     @objc private func deleteNote(_ sender: Any?) {
-        guard let node = sidebar.selectedNode, !node.isFolder else { return }
+        guard let node = sidebar.selectedNode, node.isNote else { return }
         let path = node.path
         daemon({ try $0.delete(path) }) { [weak self] result in
             guard let self else { return }
@@ -227,7 +336,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemVa
         switch item.action {
         // ⌘⌫ only deletes from the sidebar; in the editor it stays "delete to line start".
         case #selector(deleteNote(_:)):
-            window.firstResponder === sidebar.outline && sidebar.selectedNode?.isFolder == false
+            window.firstResponder === sidebar.outline && sidebar.selectedNode?.isNote == true
         case #selector(newNote(_:)):
             main.isHidden == false
         default: true

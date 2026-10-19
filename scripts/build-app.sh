@@ -10,8 +10,11 @@ swift build -c release --package-path "$package"
 bin="$(swift build -c release --package-path "$package" --show-bin-path)"
 
 rm -rf "$app"
-mkdir -p "$app/Contents/MacOS"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin/Notes" "$app/Contents/MacOS/Notes"
+# pele (mermaid renderer, MIT) is loaded from Contents/Resources, with its license.
+cp "$package/Sources/NotesCore/Resources/pele.global.js" "$package/Sources/NotesCore/Resources/pele-LICENSE" "$app/Contents/Resources/"
+cp "$package/Icon/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 cat > "$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -20,6 +23,7 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 	<key>CFBundleIdentifier</key><string>dev.notes.app</string>
 	<key>CFBundleName</key><string>Notes</string>
 	<key>CFBundleExecutable</key><string>Notes</string>
+	<key>CFBundleIconFile</key><string>AppIcon</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
 	<key>CFBundleShortVersionString</key><string>0.1</string>
 	<key>CFBundleVersion</key><string>1</string>

@@ -40,6 +40,30 @@ public struct Request<Args: Codable & Sendable>: Codable, Sendable {
         self.verb = verb
         self.args = args
     }
+
+    enum Key: CodingKey { case v, id, verb, args }
+
+    // Unit verbs (`session-list`, `kits`) carry no `args` key, like serde's unit variants.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Key.self)
+        v = try c.decode(UInt32.self, forKey: .v)
+        id = try c.decode(UInt64.self, forKey: .id)
+        verb = try c.decode(String.self, forKey: .verb)
+        if let none = NoArgs() as? Args { args = none } else { args = try c.decode(Args.self, forKey: .args) }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: Key.self)
+        try c.encode(v, forKey: .v)
+        try c.encode(id, forKey: .id)
+        try c.encode(verb, forKey: .verb)
+        if !(args is NoArgs) { try c.encode(args, forKey: .args) }
+    }
+}
+
+/// Args of a unit verb: the request line has no `args`.
+public struct NoArgs: Codable, Sendable, Equatable {
+    public init() {}
 }
 
 // Args for the verbs the app uses. Optional fields are omitted when nil, like serde's
@@ -167,17 +191,23 @@ public enum ErrorCode: String, Codable, Sendable {
     }
 }
 
+/// Notes set `path`; sideshow records (`session-*`, `post-*`, `comment-*`,
+/// `trace-updated`) set `id` and/or `session`.
 public struct Event: Codable, Sendable, Equatable {
     public var seq: UInt64
     public var kind: String
     public var path: String?
     public var version: UInt64?
+    public var id: String?
+    public var session: String?
 
-    public init(seq: UInt64, kind: String, path: String? = nil, version: UInt64? = nil) {
+    public init(seq: UInt64, kind: String, path: String? = nil, version: UInt64? = nil, id: String? = nil, session: String? = nil) {
         self.seq = seq
         self.kind = kind
         self.path = path
         self.version = version
+        self.id = id
+        self.session = session
     }
 }
 
