@@ -1,0 +1,504 @@
+{
+  "ready": {
+    "event": "ready",
+    "files": 10000,
+    "index_complete_ms": 154.007709,
+    "pid": 34124,
+    "ready_ms": 186.056,
+    "scan_ms": 45.920084,
+    "exec_to_ready_ms": 199.70895803999156
+  },
+  "summary": {
+    "find": {
+      "samples": 1000,
+      "p50_ms": 0.386041,
+      "p95_ms": 0.654042,
+      "max_ms": 1.865958
+    },
+    "search": {
+      "samples": 1000,
+      "p50_ms": 0.568292,
+      "p95_ms": 89.621583,
+      "max_ms": 144.605042
+    }
+  },
+  "correctness": [
+    {
+      "kind": "find",
+      "query": "database-migration",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "databse-migrtion",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "meeting-notes",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "meting-notes",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "release-plan",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "research-paper",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "travel-itinerary",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "recipe-sourdough",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "project-orion",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "weekly-review",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "api-design",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "db-backup",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "performance-budget",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "book-highlights",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "garden-log",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "invoice-audit",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "macos-watcher",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "ui",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "db",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "zzzzunfindable999",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "database migration",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "meeting agenda",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "release checklist",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "research findings",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "train reservation",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "bread fermentation",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "Orion launch",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "weekly retrospective",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "API contract",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "backup recovery",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "latency budget",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "noteidentity09999",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "seed germination",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "invoice reconciliation",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "Observation\\s+[0-9]+",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "borrow checker",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "fermenttaion",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "UI",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "db",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "zzzzunfindable999",
+      "passed": true
+    }
+  ],
+  "watcher": [
+    {
+      "trial": 0,
+      "action": "create",
+      "mutation_ms": 0.09095901623368263,
+      "path_ms": 112.70412500016391,
+      "content_ms": 113.12766699120402,
+      "event_ms": 99.67620897805318,
+      "event_kinds": [
+        "created"
+      ],
+      "polls": 2,
+      "passed": true
+    },
+    {
+      "trial": 0,
+      "action": "edit",
+      "mutation_ms": 0.3929159720428288,
+      "path_ms": 1.3928330154158175,
+      "content_ms": 2.0357079920358956,
+      "event_ms": 77.75954098906368,
+      "event_kinds": [
+        "modified"
+      ],
+      "polls": 7,
+      "passed": true
+    },
+    {
+      "trial": 0,
+      "action": "delete",
+      "mutation_ms": 2.1222919458523393,
+      "path_ms": 96.44483297597617,
+      "content_ms": 3.969707991927862,
+      "event_ms": 387.52520794514567,
+      "event_kinds": [
+        "removed"
+      ],
+      "polls": 8,
+      "passed": true
+    },
+    {
+      "trial": 1,
+      "action": "create",
+      "mutation_ms": 0.15254196478053927,
+      "path_ms": 130.44824998360127,
+      "content_ms": 130.83695794921368,
+      "event_ms": 117.45999997947365,
+      "event_kinds": [
+        "created"
+      ],
+      "polls": 2,
+      "passed": true
+    },
+    {
+      "trial": 1,
+      "action": "edit",
+      "mutation_ms": 0.4383749910630286,
+      "path_ms": 1.1149999918416142,
+      "content_ms": 1.519166980870068,
+      "event_ms": 80.9417919954285,
+      "event_kinds": [
+        "modified"
+      ],
+      "polls": 7,
+      "passed": true
+    },
+    {
+      "trial": 1,
+      "action": "delete",
+      "mutation_ms": 0.12937496649101377,
+      "path_ms": 90.6317500048317,
+      "content_ms": 0.9614169830456376,
+      "event_ms": 332.8522499650717,
+      "event_kinds": [
+        "removed"
+      ],
+      "polls": 8,
+      "passed": true
+    },
+    {
+      "trial": 2,
+      "action": "create",
+      "mutation_ms": 0.7280000136233866,
+      "path_ms": 215.7490830286406,
+      "content_ms": 216.57429198967293,
+      "event_ms": 202.44991697836667,
+      "event_kinds": [
+        "created"
+      ],
+      "polls": 2,
+      "passed": true
+    },
+    {
+      "trial": 2,
+      "action": "edit",
+      "mutation_ms": 0.6104589556343853,
+      "path_ms": 1.8644589581526816,
+      "content_ms": 2.400166995357722,
+      "event_ms": 82.2444999939762,
+      "event_kinds": [
+        "modified"
+      ],
+      "polls": 7,
+      "passed": true
+    },
+    {
+      "trial": 2,
+      "action": "delete",
+      "mutation_ms": 0.14908402226865292,
+      "path_ms": 91.38641698518768,
+      "content_ms": 1.212625007610768,
+      "event_ms": 378.6979590076953,
+      "event_kinds": [
+        "removed"
+      ],
+      "polls": 8,
+      "passed": true
+    },
+    {
+      "trial": 3,
+      "action": "create",
+      "mutation_ms": 0.19770895596593618,
+      "path_ms": 111.97954195085913,
+      "content_ms": 112.42908396525308,
+      "event_ms": 99.410374998115,
+      "event_kinds": [
+        "created"
+      ],
+      "polls": 2,
+      "passed": true
+    },
+    {
+      "trial": 3,
+      "action": "edit",
+      "mutation_ms": 0.30720903305336833,
+      "path_ms": 1.1143750161863863,
+      "content_ms": 1.7105420120060444,
+      "event_ms": 82.00687501812354,
+      "event_kinds": [
+        "modified"
+      ],
+      "polls": 7,
+      "passed": true
+    },
+    {
+      "trial": 3,
+      "action": "delete",
+      "mutation_ms": 2.951833012048155,
+      "path_ms": 93.49749999819323,
+      "content_ms": 3.7170000141486526,
+      "event_ms": 336.5234159864485,
+      "event_kinds": [
+        "removed"
+      ],
+      "polls": 8,
+      "passed": true
+    },
+    {
+      "trial": 4,
+      "action": "create",
+      "mutation_ms": 0.17483404371887445,
+      "path_ms": 109.75091700674966,
+      "content_ms": 110.55604199646041,
+      "event_ms": 96.33650002069771,
+      "event_kinds": [
+        "created"
+      ],
+      "polls": 2,
+      "passed": true
+    },
+    {
+      "trial": 4,
+      "action": "edit",
+      "mutation_ms": 0.5536659737117589,
+      "path_ms": 1.9177499925717711,
+      "content_ms": 2.7404159773141146,
+      "event_ms": 87.95812499010935,
+      "event_kinds": [
+        "modified"
+      ],
+      "polls": 7,
+      "passed": true
+    },
+    {
+      "trial": 4,
+      "action": "delete",
+      "mutation_ms": 0.11570798233151436,
+      "path_ms": 80.79141698544845,
+      "content_ms": 0.8210000232793391,
+      "event_ms": 321.9169580261223,
+      "event_kinds": [
+        "removed"
+      ],
+      "polls": 7,
+      "passed": true
+    }
+  ],
+  "captures": [
+    {
+      "command": [
+        "top",
+        "-l",
+        "2",
+        "-stats",
+        "pid,cpu,idlew",
+        "-pid",
+        "34124"
+      ],
+      "exit_code": 0,
+      "artifact": "top-1s.txt"
+    },
+    {
+      "command": [
+        "top",
+        "-l",
+        "2",
+        "-s",
+        "30",
+        "-stats",
+        "pid,cpu,idlew",
+        "-pid",
+        "34124"
+      ],
+      "exit_code": 0,
+      "artifact": "top-30s.txt"
+    }
+  ],
+  "idle": {
+    "seconds": 30.687485500006005,
+    "before": {
+      "user_time": 161110998,
+      "system_time": 1126481793,
+      "pkg_idle_wkups": 28,
+      "interrupt_wkups": 757,
+      "pageins": 2,
+      "wired_size": 0,
+      "resident_size": 96075776,
+      "phys_footprint": 16482808,
+      "proc_start_abstime": 7056814679433,
+      "proc_exit_abstime": 0,
+      "child_user_time": 0,
+      "child_system_time": 0,
+      "child_pkg_idle_wkups": 0,
+      "child_interrupt_wkups": 0,
+      "child_pageins": 0,
+      "child_elapsed_abstime": 0,
+      "diskio_bytesread": 0,
+      "diskio_byteswritten": 671744,
+      "ns_per_tick": 41.666666666666664
+    },
+    "after": {
+      "user_time": 161385346,
+      "system_time": 1126880579,
+      "pkg_idle_wkups": 190,
+      "interrupt_wkups": 1900,
+      "pageins": 2,
+      "wired_size": 0,
+      "resident_size": 96108544,
+      "phys_footprint": 13287928,
+      "proc_start_abstime": 7056814679433,
+      "proc_exit_abstime": 0,
+      "child_user_time": 0,
+      "child_system_time": 0,
+      "child_pkg_idle_wkups": 0,
+      "child_interrupt_wkups": 0,
+      "child_pageins": 0,
+      "child_elapsed_abstime": 0,
+      "diskio_bytesread": 0,
+      "diskio_byteswritten": 671744,
+      "ns_per_tick": 41.666666666666664
+    },
+    "cpu_ms": 28.04725,
+    "package_idle_wakeups": 162,
+    "interrupt_wakeups": 1143
+  },
+  "rounds": 50,
+  "fff_search": "0.11.0"
+}

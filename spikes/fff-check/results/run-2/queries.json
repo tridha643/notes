@@ -1,0 +1,1076 @@
+{
+  "event": "bench",
+  "queries": [
+    {
+      "example": {
+        "paths": [
+          "personal/reference/database-migration-04740.md",
+          "work/logs/database-migration-09860.md",
+          "archive/ideas/database-migration-03640.md"
+        ],
+        "total_matched": 500,
+        "returned_paths": 50
+      },
+      "max_ms": 1.080209,
+      "p50_ms": 0.449291,
+      "p95_ms": 0.8875000000000001,
+      "request": {
+        "expected_slug": "database-migration",
+        "kind": "find",
+        "query": "database-migration"
+      },
+      "samples_ms": [0.444458, 0.8875000000000001, 0.43295900000000004, 0.8906670000000001, 0.5283329999999999, 0.57625, 0.430459, 0.43970800000000004, 0.466167, 0.418583, 0.42604200000000003, 0.42325, 0.56675, 0.45575, 0.504291, 0.573291, 0.568542, 0.495917, 0.485625, 0.464708, 0.492792, 0.443959, 0.444959, 0.440792, 0.437334, 0.432958, 0.507875, 0.43195799999999995, 1.080209, 0.43533299999999997, 0.5206660000000001, 0.5222920000000001, 0.43520800000000004, 0.43574999999999997, 0.5307499999999999, 0.405959, 0.431542, 0.44625, 0.851917, 0.487209, 0.493417, 0.449291, 0.449, 0.434625, 0.525291, 0.44275, 0.44116700000000003, 0.562, 0.513958, 0.436334]
+    },
+    {
+      "example": {
+        "paths": [
+          "personal/plans/database-migration-09820.md",
+          "work/daily/database-migration-09900.md",
+          "archive/ideas/database-migration-03640.md"
+        ],
+        "total_matched": 500,
+        "returned_paths": 50
+      },
+      "max_ms": 1.194459,
+      "p50_ms": 0.418209,
+      "p95_ms": 0.847042,
+      "request": {
+        "expected_slug": "database-migration",
+        "kind": "find",
+        "query": "databse-migrtion"
+      },
+      "samples_ms": [0.427375, 1.194459, 0.397333, 0.593708, 0.511084, 0.38104099999999996, 0.48429099999999997, 0.395417, 0.392959, 0.391667, 0.387208, 0.38620800000000005, 0.47862499999999997, 0.481, 0.43566699999999997, 0.438334, 0.492542, 0.47612499999999996, 0.423834, 0.412584, 0.470625, 0.383958, 0.39187500000000003, 0.382583, 0.385708, 0.384625, 0.386833, 0.38579199999999997, 0.870125, 0.389708, 0.448666, 0.485583, 0.401834, 0.38491699999999995, 0.412, 0.383834, 0.37225, 0.401875, 0.847042, 0.49304100000000006, 0.48458399999999996, 0.42020799999999997, 0.394125, 0.435, 0.5507500000000001, 0.387166, 0.418209, 0.521625, 0.45849999999999996, 0.46037500000000003]
+    },
+    {
+      "example": {
+        "paths": [
+          "personal/drafts/meeting-notes-08881.md",
+          "archive/daily/meeting-notes-03861.md",
+          "archive/daily/meeting-notes-04041.md"
+        ],
+        "total_matched": 999,
+        "returned_paths": 50
+      },
+      "max_ms": 1.0115,
+      "p50_ms": 0.401458,
+      "p95_ms": 0.6401249999999999,
+      "request": {
+        "expected_slug": "meeting-notes",
+        "kind": "find",
+        "query": "meeting-notes"
+      },
+      "samples_ms": [0.401792, 0.6401249999999999, 0.519541, 0.610875, 0.432958, 0.396875, 0.37879199999999996, 0.401291, 0.375208, 0.398, 0.39849999999999997, 0.401458, 0.540208, 0.399125, 0.44083399999999995, 0.437125, 0.438375, 0.46254100000000004, 0.412916, 0.376292, 0.438083, 0.398584, 0.38725, 0.421792, 0.37116699999999997, 0.373916, 0.373625, 0.36770800000000003, 0.7428750000000001, 0.373792, 0.422541, 0.44879199999999997, 0.39787500000000003, 0.389333, 0.385417, 0.36370800000000003, 0.39475000000000005, 0.402417, 1.0115, 0.409084, 0.41762499999999997, 0.394291, 0.385625, 0.453791, 0.49537500000000007, 0.394042, 0.41558300000000004, 0.47566600000000003, 0.421292, 0.397833]
+    },
+    {
+      "example": {
+        "paths": [
+          "personal/drafts/meeting-notes-08881.md",
+          "archive/daily/meeting-notes-03861.md",
+          "archive/daily/meeting-notes-04041.md"
+        ],
+        "total_matched": 999,
+        "returned_paths": 50
+      },
+      "max_ms": 0.8605,
+      "p50_ms": 0.386041,
+      "p95_ms": 0.596125,
+      "request": {
+        "expected_slug": "meeting-notes",
+        "kind": "find",
+        "query": "meting-notes"
+      },
+      "samples_ms": [0.396958, 0.596125, 0.37195799999999996, 0.363541, 0.366875, 0.369417, 0.402708, 0.386041, 0.405917, 0.376916, 0.351666, 0.358, 0.41800000000000004, 0.366, 0.41925, 0.41554199999999997, 0.399625, 0.419, 0.407417, 0.372166, 0.416917, 0.367541, 0.408542, 0.374209, 0.39775, 0.357375, 0.36537499999999995, 0.360167, 0.848, 0.39820900000000004, 0.416667, 0.427667, 0.378542, 0.386166, 0.359208, 0.375875, 0.380375, 0.361209, 0.8605, 0.430709, 0.376, 0.391667, 0.377792, 0.395084, 0.423042, 0.360792, 0.375708, 0.395209, 0.418375, 0.36225]
+    },
+    {
+      "example": {
+        "paths": [
+          "personal/reviews/release-plan-08882.md",
+          "archive/plans/release-plan-03862.md",
+          "archive/plans/release-plan-04042.md"
+        ],
+        "total_matched": 889,
+        "returned_paths": 50
+      },
+      "max_ms": 1.7203330000000001,
+      "p50_ms": 0.372417,
+      "p95_ms": 0.683542,
+      "request": {
+        "expected_slug": "release-plan",
+        "kind": "find",
+        "query": "release-plan"
+      },
+      "samples_ms": [0.349542, 1.7203330000000001, 0.383917, 0.340959, 0.6223339999999999, 0.33599999999999997, 0.42145900000000003, 0.360333, 0.339834, 0.37583300000000003, 0.359084, 0.368, 0.462709, 0.368334, 0.424667, 0.5535829999999999, 0.448959, 0.432333, 0.422375, 0.344667, 0.40075, 0.41108300000000003, 0.372417, 0.34608300000000003, 0.345084, 0.339125, 0.351667, 0.34675, 0.683542, 0.369625, 0.460334, 0.466291, 0.382, 0.3755, 0.368959, 0.350875, 0.368291, 0.366625, 0.911458, 0.43516699999999997, 0.364292, 0.36475, 0.359417, 0.343875, 0.457875, 0.358541, 0.378, 0.43083299999999997, 0.41058300000000003, 0.393292]
+    },
+    {
+      "example": {
+        "paths": [
+          "personal/ideas/research-paper-04423.md",
+          "work/reviews/research-paper-09863.md",
+          "learning/daily/research-paper-03663.md"
+        ],
+        "total_matched": 500,
+        "returned_paths": 50
+      },
+      "max_ms": 0.953292,
+      "p50_ms": 0.370167,
+      "p95_ms": 0.651166,
+      "request": {
+        "expected_slug": "research-paper",
+        "kind": "find",
+        "query": "research-paper"
+      },
+      "samples_ms": [0.389084, 0.651166, 0.368209, 0.361792, 0.8400420000000001, 0.379375, 0.35975, 0.369458, 0.339875, 0.348, 0.350333, 0.357292, 0.399125, 0.375792, 0.384083, 0.479916, 0.4215, 0.380375, 0.396959, 0.368458, 0.357333, 0.3835, 0.374542, 0.36775, 0.353292, 0.343125, 0.352083, 0.3395, 0.538541, 0.377875, 0.418958, 0.388666, 0.373334, 0.364916, 0.347584, 0.36770800000000003, 0.370167, 0.339792, 0.953292, 0.416542, 0.34858300000000003, 0.34870799999999996, 0.36125, 0.371708, 0.37825000000000003, 0.399333, 0.371625, 0.38412500000000005, 0.368458, 0.347958]
+    },
+    {
+      "example": {
+        "paths": [
+          "personal/daily/travel-itinerary-04464.md",
+          "projects/meetings/travel-itinerary-09884.md",
+          "archive/reading/travel-itinerary-03684.md"
+        ],
+        "total_matched": 500,
+        "returned_paths": 50
+      },
+      "max_ms": 0.797041,
+      "p50_ms": 0.420833,
+      "p95_ms": 0.654292,
+      "request": {
+        "expected_slug": "travel-itinerary",
+        "kind": "find",
+        "query": "travel-itinerary"
+      },
+      "samples_ms": [0.380542, 0.6473749999999999, 0.4325, 0.43975, 0.797041, 0.40945800000000004, 0.403709, 0.40487500000000004, 0.396125, 0.475125, 0.451333, 0.38775000000000004, 0.484334, 0.414125, 0.502833, 0.48424999999999996, 0.506667, 0.477, 0.466042, 0.442334, 0.42404200000000003, 0.381208, 0.377292, 0.423834, 0.39075, 0.41750000000000004, 0.38375, 0.396833, 0.654292, 0.414208, 0.43445799999999996, 0.487625, 0.417, 0.38175, 0.37712500000000004, 0.382167, 0.407833, 0.39125, 0.726, 0.5403749999999999, 0.396625, 0.420833, 0.402375, 0.382334, 0.44925, 0.440167, 0.37841600000000003, 0.442458, 0.440458, 0.42658300000000005]
+    },
+    {
+      "example": {
+        "paths": [
+          "personal/reference/recipe-sourdough-09645.md",
+          "work/daily/recipe-sourdough-05625.md",
+          "archive/ideas/recipe-sourdough-03685.md"
+        ],
+        "total_matched": 500,
+        "returned_paths": 50
+      },
+      "max_ms": 0.7177079999999999,
+      "p50_ms": 0.473792,
+      "p95_ms": 0.7054579999999999,
+      "request": {
+        "expected_slug": "recipe-sourdough",
+        "kind": "find",
+        "query": "recipe-sourdough"
+      },
+      "samples_ms": [0.473792, 0.7177079999999999, 0.47558300000000003, 0.527458, 0.62425, 0.444, 0.419042, 0.475375, 0.41508300000000004, 0.491792, 0.5002500000000001, 0.446333, 0.523334, 0.464125, 0.455459, 0.546125, 0.5664589999999999, 0.497208, 0.532042, 0.5299579999999999, 0.490875, 0.44049999999999995, 0.412125, 0.5099170000000001, 0.467208, 0.428166, 0.512042, 0.45608299999999996, 0.717042, 0.45645800000000003, 0.48054199999999997, 0.537833, 0.408125, 0.410375, 0.466917, 0.42012499999999997, 0.41141700000000003, 0.417833, 0.7054579999999999, 0.53625, 0.525333, 0.44412500000000005, 0.41079099999999996, 0.416417, 0.438041, 0.554334, 0.451208, 0.47679200000000005, 0.49950000000000006, 0.41612499999999997]
+    },
+    {
+      "example": {
+        "paths": [
+          "personal/drafts/project-orion-08926.md",
+          "archive/daily/project-orion-03906.md",
+          "archive/daily/project-orion-04086.md"
+        ],
+        "total_matched": 1889,
+        "returned_paths": 50
+      },
+      "max_ms": 0.9825,
+      "p50_ms": 0.630625,
+      "p95_ms": 0.7685,
+      "request": {
+        "expected_slug": "project-orion",
+        "kind": "find",
+        "query": "project-orion"
+      },
+      "samples_ms": [0.604708, 0.9825, 0.6059169999999999, 0.638959, 0.662125, 0.6300840000000001, 0.641709, 0.61325, 0.654042, 0.63625, 0.6939169999999999, 0.630583, 0.645416, 0.712916, 0.632292, 0.8085829999999999, 0.6138330000000001, 0.641583, 0.6097910000000001, 0.613916, 0.613208, 0.630542, 0.660792, 0.617083, 0.6287079999999999, 0.635834, 0.614916, 0.608417, 0.6718339999999999, 0.630375, 0.633792, 0.6619170000000001, 0.62725, 0.63075, 0.6311249999999999, 0.63925, 0.625708, 0.625292, 0.7685, 0.626541, 0.627542, 0.7135, 0.73725, 0.625334, 0.630625, 0.663458, 0.6152500000000001, 0.624792, 0.630792, 0.624792]
+    },
+    {
+      "example": {
+        "paths": [
+          "personal/reviews/weekly-review-08927.md",
+          "archive/plans/weekly-review-03907.md",
+          "archive/plans/weekly-review-04087.md"
+        ],
+        "total_matched": 612,
+        "returned_paths": 50
+      },
+      "max_ms": 0.50225,
+      "p50_ms": 0.304,
+      "p95_ms": 0.438083,
+      "request": {
+        "expected_slug": "weekly-review",
+        "kind": "find",
+        "query": "weekly-review"
+      },
+      "samples_ms": [0.293333, 0.41625, 0.32404200000000005, 0.297708, 0.442459, 0.306792, 0.292916, 0.28566699999999995, 0.311667, 0.307917, 0.294583, 0.306708, 0.311291, 0.300458, 0.308166, 0.360666, 0.349625, 0.30166699999999996, 0.40091699999999997, 0.304208, 0.309042, 0.301, 0.31375000000000003, 0.30124999999999996, 0.296333, 0.296041, 0.27175, 0.296083, 0.438083, 0.298292, 0.314125, 0.300458, 0.298875, 0.305667, 0.29325, 0.304125, 0.296333, 0.29683299999999996, 0.50225, 0.32249999999999995, 0.304, 0.298958, 0.307166, 0.29125, 0.30320899999999995, 0.322375, 0.290958, 0.315292, 0.30495799999999995, 0.295833]
+    },
+    {
+      "example": {
+        "paths": [
+          "personal/ideas/api-design-08968.md",
+          "archive/drafts/api-design-03868.md",
+          "archive/drafts/api-design-04048.md"
+        ],
+        "total_matched": 1499,
+        "returned_paths": 50
+      },
+      "max_ms": 0.49025,
+      "p50_ms": 0.230208,
+      "p95_ms": 0.361834,
+      "request": {
+        "expected_slug": "api-design",
+        "kind": "find",
+        "query": "api-design"
+      },
+      "samples_ms": [0.215083, 0.33754100000000004, 0.22962500000000002, 0.216958, 0.45175, 0.21429199999999998, 0.230666, 0.216833, 0.21554199999999998, 0.239459, 0.21645799999999998, 0.231458, 0.29575, 0.272333, 0.239042, 0.35958399999999996, 0.28404199999999996, 0.24820799999999998, 0.26629200000000003, 0.26675, 0.237667, 0.219, 0.22045800000000002, 0.218083, 0.220791, 0.225709, 0.22154100000000002, 0.219958, 0.361834, 0.225083, 0.245042, 0.246333, 0.216584, 0.221333, 0.21325, 0.214417, 0.21437499999999998, 0.230208, 0.49025, 0.312, 0.245542, 0.27379200000000004, 0.21645799999999998, 0.21258400000000002, 0.272583, 0.25012500000000004, 0.212792, 0.229125, 0.24608300000000002, 0.26495799999999997]
+    },
+    {
+      "example": {
+        "paths": [
+          "personal/daily/db-backup-04689.md",
+          "work/ideas/db-backup-09949.md",
+          "archive/reading/db-backup-03729.md"
+        ],
+        "total_matched": 500,
+        "returned_paths": 50
+      },
+      "max_ms": 0.45854100000000003,
+      "p50_ms": 0.14925,
+      "p95_ms": 0.248292,
+      "request": {
+        "expected_slug": "db-backup",
+        "kind": "find",
+        "query": "db-backup"
+      },
+      "samples_ms": [0.141542, 0.210667, 0.141125, 0.144834, 0.45854100000000003, 0.144917, 0.146792, 0.146916, 0.162041, 0.14962499999999998, 0.145875, 0.147, 0.159584, 0.15512499999999999, 0.15308300000000002, 0.266625, 0.170459, 0.154291, 0.160084, 0.15, 0.15454199999999998, 0.14183300000000001, 0.163459, 0.140417, 0.1425, 0.142375, 0.160708, 0.146167, 0.193375, 0.138708, 0.16275, 0.174917, 0.143667, 0.143709, 0.153709, 0.15770800000000001, 0.141542, 0.147, 0.248292, 0.154, 0.161708, 0.142292, 0.146833, 0.140667, 0.149042, 0.135083, 0.141375, 0.160083, 0.14925, 0.153458]
+    },
+    {
+      "example": {
+        "paths": [
+          "personal/reference/performance-budget-04830.md",
+          "work/logs/performance-budget-09950.md",
+          "archive/ideas/performance-budget-03730.md"
+        ],
+        "total_matched": 500,
+        "returned_paths": 50
+      },
+      "max_ms": 0.875167,
+      "p50_ms": 0.494083,
+      "p95_ms": 0.83725,
+      "request": {
+        "expected_slug": "performance-budget",
+        "kind": "find",
+        "query": "performance-budget"
+      },
+      "samples_ms": [0.476209, 0.8495, 0.44825000000000004, 0.494083, 0.83725, 0.498042, 0.448666, 0.5335840000000001, 0.48075, 0.555292, 0.47862499999999997, 0.438583, 0.451125, 0.5600419999999999, 0.5475420000000001, 0.727834, 0.596, 0.592541, 0.574167, 0.5639580000000001, 0.557291, 0.49537500000000007, 0.45079199999999997, 0.47404100000000005, 0.458708, 0.46575, 0.454541, 0.49850000000000005, 0.7214160000000001, 0.442958, 0.509584, 0.650958, 0.500333, 0.5013329999999999, 0.459875, 0.442792, 0.445625, 0.487125, 0.875167, 0.590375, 0.705291, 0.48725, 0.455042, 0.45879200000000003, 0.46087500000000003, 0.47725, 0.442375, 0.442959, 0.528916, 0.599542]
+    },
+    {
+      "example": {
+        "paths": [
+          "personal/drafts/book-highlights-05011.md",
+          "work/reference/book-highlights-09951.md",
+          "archive/daily/book-highlights-03771.md"
+        ],
+        "total_matched": 500,
+        "returned_paths": 50
+      },
+      "max_ms": 0.585291,
+      "p50_ms": 0.278916,
+      "p95_ms": 0.432542,
+      "request": {
+        "expected_slug": "book-highlights",
+        "kind": "find",
+        "query": "book-highlights"
+      },
+      "samples_ms": [0.27570900000000004, 0.360875, 0.287291, 0.289417, 0.448125, 0.26825, 0.2825, 0.275416, 0.281083, 0.270667, 0.2775, 0.285208, 0.27995800000000004, 0.29258399999999996, 0.273875, 0.363, 0.279166, 0.269625, 0.2845, 0.260125, 0.275083, 0.26920900000000003, 0.282666, 0.266209, 0.26933300000000004, 0.273625, 0.281083, 0.301375, 0.432542, 0.28041699999999997, 0.272875, 0.3, 0.273833, 0.26733300000000004, 0.278916, 0.266667, 0.269167, 0.28850000000000003, 0.585291, 0.300208, 0.28075, 0.269958, 0.27425000000000005, 0.27712499999999995, 0.270167, 0.29258300000000004, 0.266625, 0.300709, 0.318666, 0.26625]
+    },
+    {
+      "example": {
+        "paths": [
+          "personal/reviews/garden-log-05012.md",
+          "work/meetings/garden-log-09992.md",
+          "archive/plans/garden-log-03772.md"
+        ],
+        "total_matched": 500,
+        "returned_paths": 50
+      },
+      "max_ms": 0.334167,
+      "p50_ms": 0.1875,
+      "p95_ms": 0.282333,
+      "request": {
+        "expected_slug": "garden-log",
+        "kind": "find",
+        "query": "garden-log"
+      },
+      "samples_ms": [0.18025, 0.248416, 0.183375, 0.1875, 0.282333, 0.18775, 0.18325, 0.19037500000000002, 0.179875, 0.177292, 0.202875, 0.17375, 0.184083, 0.202959, 0.185333, 0.25166700000000003, 0.194166, 0.19037500000000002, 0.190917, 0.18745900000000001, 0.19175, 0.199666, 0.1815, 0.17725, 0.179583, 0.195167, 0.179417, 0.18170799999999998, 0.28412499999999996, 0.1815, 0.255625, 0.18775, 0.1795, 0.182542, 0.189042, 0.177875, 0.180667, 0.207625, 0.334167, 0.244042, 0.192958, 0.18229199999999998, 0.181666, 0.18929200000000002, 0.184334, 0.193958, 0.183583, 0.183583, 0.192, 0.200375]
+    },
+    {
+      "example": {
+        "paths": [
+          "personal/ideas/invoice-audit-05053.md",
+          "work/reviews/invoice-audit-09953.md",
+          "archive/drafts/invoice-audit-03733.md"
+        ],
+        "total_matched": 500,
+        "returned_paths": 50
+      },
+      "max_ms": 0.703708,
+      "p50_ms": 0.327791,
+      "p95_ms": 0.512208,
+      "request": {
+        "expected_slug": "invoice-audit",
+        "kind": "find",
+        "query": "invoice-audit"
+      },
+      "samples_ms": [0.324291, 0.397166, 0.37062500000000004, 0.312834, 0.512208, 0.32345799999999997, 0.31283299999999997, 0.326542, 0.33837500000000004, 0.32008299999999995, 0.3085, 0.305875, 0.331167, 0.373916, 0.30845900000000004, 0.32087499999999997, 0.36458399999999996, 0.322542, 0.37687499999999996, 0.359875, 0.316542, 0.330042, 0.380583, 0.317416, 0.309667, 0.314542, 0.31024999999999997, 0.33175, 0.524459, 0.32458299999999995, 0.46099999999999997, 0.358209, 0.31954200000000005, 0.32879200000000003, 0.33325, 0.324417, 0.326459, 0.310583, 0.703708, 0.35258300000000004, 0.338792, 0.31416700000000003, 0.340791, 0.343375, 0.330708, 0.368, 0.327791, 0.31391600000000003, 0.35375, 0.321541]
+    },
+    {
+      "example": {
+        "paths": [
+          "personal/reviews/macos-watcher-04697.md",
+          "work/meetings/macos-watcher-09857.md",
+          "archive/plans/macos-watcher-03637.md"
+        ],
+        "total_matched": 500,
+        "returned_paths": 50
+      },
+      "max_ms": 1.865958,
+      "p50_ms": 0.317625,
+      "p95_ms": 0.48220799999999997,
+      "request": {
+        "expected_slug": "macos-watcher",
+        "kind": "find",
+        "query": "macos-watcher"
+      },
+      "samples_ms": [0.298042, 1.865958, 0.32079199999999997, 0.310625, 0.407208, 0.29725, 0.295042, 0.325959, 0.300334, 0.32625, 0.306583, 0.29704200000000003, 0.32675, 0.361084, 0.326458, 0.35225, 0.35779099999999997, 0.318791, 0.310792, 0.31024999999999997, 0.326958, 0.298584, 0.347875, 0.311834, 0.297292, 0.306541, 0.292958, 0.30737499999999995, 0.48220799999999997, 0.29091700000000004, 0.415667, 0.33366599999999996, 0.310291, 0.34025, 0.306041, 0.31066699999999997, 0.317625, 0.292541, 0.679166, 0.351958, 0.34925, 0.316833, 0.31125, 0.348458, 0.306916, 0.357916, 0.314458, 0.34287500000000004, 0.356, 0.337166]
+    },
+    {
+      "example": {
+        "paths": [
+          "personal/ideas/two-character-ui-04558.md",
+          "work/reviews/two-character-ui-09638.md",
+          "archive/drafts/two-character-ui-03778.md"
+        ],
+        "total_matched": 10000,
+        "returned_paths": 50
+      },
+      "max_ms": 1.511792,
+      "p50_ms": 0.5616669999999999,
+      "p95_ms": 1.150125,
+      "request": {
+        "expected_slug": "two-character-ui",
+        "kind": "find",
+        "query": "ui"
+      },
+      "samples_ms": [0.5682079999999999, 1.511792, 0.537583, 0.565083, 1.13725, 0.551625, 0.563541, 0.5527909999999999, 0.557458, 0.5682079999999999, 0.5695840000000001, 0.5616669999999999, 0.561041, 0.55475, 0.5602079999999999, 0.5576249999999999, 0.6557499999999999, 0.575042, 0.586583, 0.5632499999999999, 0.5666249999999999, 0.55325, 0.5682079999999999, 0.536875, 0.561291, 0.550584, 0.563833, 0.5732079999999999, 1.150125, 0.5609999999999999, 0.59275, 0.550708, 0.5525420000000001, 0.564292, 0.545958, 0.5515840000000001, 0.575333, 0.563042, 1.2991249999999999, 0.567375, 0.579542, 0.548916, 0.554708, 0.556583, 0.540834, 0.595083, 0.5727920000000001, 0.546791, 0.559292, 0.557542]
+    },
+    {
+      "example": {
+        "paths": [
+          "personal/daily/db-backup-09009.md",
+          "archive/reading/db-backup-03909.md",
+          "archive/reading/db-backup-04089.md"
+        ],
+        "total_matched": 10000,
+        "returned_paths": 50
+      },
+      "max_ms": 0.927792,
+      "p50_ms": 0.4605,
+      "p95_ms": 0.5569999999999999,
+      "request": {
+        "expected_slug": "db-backup",
+        "kind": "find",
+        "query": "db"
+      },
+      "samples_ms": [0.521, 0.507208, 0.453667, 0.46495800000000004, 0.912083, 0.459416, 0.4575, 0.454459, 0.45525, 0.461875, 0.464041, 0.441666, 0.469584, 0.46708299999999997, 0.462625, 0.481167, 0.513042, 0.514125, 0.458167, 0.4515, 0.4605, 0.47187500000000004, 0.45691699999999996, 0.444625, 0.463375, 0.45175, 0.459583, 0.461042, 0.5569999999999999, 0.45379200000000003, 0.467584, 0.528709, 0.46549999999999997, 0.445583, 0.464292, 0.45575, 0.454792, 0.4904589999999999, 0.927792, 0.470541, 0.47475, 0.452625, 0.45670900000000003, 0.455416, 0.448333, 0.451625, 0.464292, 0.450209, 0.457292, 0.459625]
+    },
+    {
+      "example": {
+        "paths": [],
+        "total_matched": 0,
+        "returned_paths": 0
+      },
+      "max_ms": 0.217333,
+      "p50_ms": 0.151125,
+      "p95_ms": 0.19908299999999998,
+      "request": {
+        "expected_slug": null,
+        "kind": "find",
+        "query": "zzzzunfindable999"
+      },
+      "samples_ms": [0.157166, 0.184792, 0.148625, 0.155833, 0.19783299999999998, 0.14825, 0.137667, 0.16658299999999998, 0.15079199999999998, 0.14825, 0.153542, 0.152167, 0.154916, 0.14720799999999998, 0.15604200000000001, 0.162166, 0.211625, 0.175375, 0.150834, 0.15479099999999998, 0.149542, 0.148, 0.15304199999999998, 0.14162499999999997, 0.141459, 0.147125, 0.152917, 0.146584, 0.19908299999999998, 0.146625, 0.156542, 0.19808299999999998, 0.149167, 0.150667, 0.14141600000000001, 0.155708, 0.182334, 0.151125, 0.217333, 0.152375, 0.148834, 0.14225, 0.149125, 0.14475, 0.154792, 0.17320899999999997, 0.142667, 0.146375, 0.15937500000000002, 0.149208]
+    },
+    {
+      "example": {
+        "files_searched": 22,
+        "fuzzy_fallback": false,
+        "matches": [
+          {
+            "line": 13,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Next action: Keep schema changes backward compatible until every reader has moved. Discuss database migration with group 71 in week 14. See [[api-design-02376]] for context."
+          },
+          {
+            "line": 59,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "- Follow up: Keep schema changes backward compatible until every reader has moved. Discuss database migration with group 58 in week 12. See [[weekly-review-07185]] for context."
+          },
+          {
+            "line": 90,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "- Follow up: Keep schema changes backward compatible until every reader has moved. Discuss database migration with group 0 in week 31. See [[weekly-review-06697]] for context."
+          }
+        ],
+        "next_file_offset": 22,
+        "regex_error": null,
+        "returned_matches": 51
+      },
+      "max_ms": 0.961458,
+      "p50_ms": 0.649625,
+      "p95_ms": 0.943375,
+      "request": {
+        "fallback": true,
+        "kind": "search",
+        "query": "database migration"
+      },
+      "samples_ms": [0.6327499999999999, 0.804, 0.619166, 0.709417, 0.854042, 0.6112920000000001, 0.6385409999999999, 0.611625, 0.6321249999999999, 0.581542, 0.584583, 0.736375, 0.646125, 0.803042, 0.6579170000000001, 0.836167, 0.961458, 0.739584, 0.7853330000000001, 0.851, 0.726166, 0.587292, 0.596, 0.626084, 0.635708, 0.649625, 0.613417, 0.61425, 0.943375, 0.5948340000000001, 0.751, 0.782792, 0.609792, 0.598666, 0.6145, 0.9488329999999999, 0.78025, 0.618792, 0.9217500000000001, 0.7811670000000001, 0.7142090000000001, 0.7942910000000001, 0.60525, 0.5769580000000001, 0.6154170000000001, 0.671583, 0.6636669999999999, 0.5665410000000001, 0.706916, 0.748209]
+    },
+    {
+      "example": {
+        "files_searched": 25,
+        "fuzzy_fallback": false,
+        "matches": [
+          {
+            "line": 28,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Next action: The team agreed to share decisions with the next review group. Discuss meeting agenda with group 88 in week 44. See [[macos-watcher-07267]] for context."
+          },
+          {
+            "line": 101,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Review: The team agreed to share decisions with the next review group. Discuss meeting agenda with group 76 in week 48. See [[book-highlights-08120]] for context."
+          },
+          {
+            "line": 22,
+            "path": "archive/daily/book-highlights-04131.md",
+            "text": "Review: The team agreed to share decisions with the next review group. Discuss meeting agenda with group 87 in week 52. See [[travel-itinerary-00087]] for context."
+          }
+        ],
+        "next_file_offset": 25,
+        "regex_error": null,
+        "returned_matches": 52
+      },
+      "max_ms": 1.373459,
+      "p50_ms": 0.583958,
+      "p95_ms": 0.800709,
+      "request": {
+        "fallback": true,
+        "kind": "search",
+        "query": "meeting agenda"
+      },
+      "samples_ms": [0.530459, 0.665875, 0.592584, 0.66425, 1.373459, 0.581375, 0.531833, 0.580584, 0.656917, 0.537667, 0.5517500000000001, 0.722292, 0.528791, 0.6987500000000001, 0.583958, 0.752708, 1.1408749999999999, 0.71875, 0.653459, 0.73475, 0.585375, 0.657583, 0.587209, 0.557959, 0.5231669999999999, 0.543959, 0.553291, 0.560625, 0.800709, 0.524334, 0.670792, 0.738292, 0.536333, 0.529334, 0.534041, 0.5616249999999999, 0.6847920000000001, 0.555791, 0.798667, 0.667666, 0.676666, 0.535084, 0.540709, 0.558541, 0.553666, 0.554375, 0.5753750000000001, 0.613417, 0.682292, 0.702708]
+    },
+    {
+      "example": {
+        "files_searched": 19,
+        "fuzzy_fallback": false,
+        "matches": [
+          {
+            "line": 44,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Review: Ship a small cohort first and keep the rollback procedure nearby. Discuss release checklist with group 22 in week 49. See [[travel-itinerary-02455]] for context."
+          },
+          {
+            "line": 53,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Next action: Ship a small cohort first and keep the rollback procedure nearby. Discuss release checklist with group 36 in week 36. See [[release-plan-07247]] for context."
+          },
+          {
+            "line": 134,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "- Follow up: Ship a small cohort first and keep the rollback procedure nearby. Discuss release checklist with group 1 in week 12. See [[incident-review-07395]] for context."
+          }
+        ],
+        "next_file_offset": 19,
+        "regex_error": null,
+        "returned_matches": 52
+      },
+      "max_ms": 0.6675840000000001,
+      "p50_ms": 0.503667,
+      "p95_ms": 0.634667,
+      "request": {
+        "fallback": true,
+        "kind": "search",
+        "query": "release checklist"
+      },
+      "samples_ms": [0.457125, 0.533208, 0.503667, 0.569125, 0.622542, 0.478708, 0.44204200000000005, 0.450417, 0.582125, 0.49037500000000006, 0.46408400000000005, 0.564667, 0.46287500000000004, 0.56625, 0.49387499999999995, 0.634667, 0.6120420000000001, 0.604083, 0.568292, 0.619583, 0.497667, 0.57975, 0.43358399999999997, 0.5207919999999999, 0.456125, 0.492334, 0.426916, 0.5460830000000001, 0.6675840000000001, 0.40695800000000004, 0.5509160000000001, 0.660958, 0.47475, 0.468417, 0.484958, 0.49270800000000003, 0.59625, 0.517875, 0.593417, 0.60675, 0.575458, 0.48270799999999997, 0.42362500000000003, 0.457459, 0.446959, 0.542125, 0.496084, 0.477875, 0.562, 0.537541]
+    },
+    {
+      "example": {
+        "files_searched": 15,
+        "fuzzy_fallback": false,
+        "matches": [
+          {
+            "line": 31,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Observation: The experiment compares independent observations against the baseline. Discuss research findings with group 19 in week 28. See [[archived-decision-00551]] for context."
+          },
+          {
+            "line": 112,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Observation: The experiment compares independent observations against the baseline. Discuss research findings with group 34 in week 11. See [[research-paper-04824]] for context."
+          },
+          {
+            "line": 132,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Review: The experiment compares independent observations against the baseline. Discuss research findings with group 74 in week 5. See [[project-orion-06177]] for context."
+          }
+        ],
+        "next_file_offset": 15,
+        "regex_error": null,
+        "returned_matches": 51
+      },
+      "max_ms": 0.379417,
+      "p50_ms": 0.257416,
+      "p95_ms": 0.34608399999999995,
+      "request": {
+        "fallback": true,
+        "kind": "search",
+        "query": "research findings"
+      },
+      "samples_ms": [0.265208, 0.283875, 0.259708, 0.27087500000000003, 0.31704200000000005, 0.253375, 0.27025, 0.235708, 0.29533400000000004, 0.214666, 0.224, 0.255125, 0.23366599999999998, 0.265125, 0.250667, 0.306375, 0.289625, 0.2705, 0.292959, 0.379417, 0.257416, 0.285959, 0.20987499999999998, 0.253125, 0.227583, 0.24504099999999998, 0.233875, 0.264459, 0.34608399999999995, 0.230917, 0.27225, 0.260125, 0.259958, 0.25091600000000003, 0.254917, 0.262459, 0.24966700000000003, 0.25870899999999997, 0.37062500000000004, 0.304791, 0.291917, 0.227792, 0.237042, 0.237584, 0.285167, 0.223208, 0.255375, 0.210417, 0.23550000000000001, 0.256333]
+    },
+    {
+      "example": {
+        "files_searched": 25,
+        "fuzzy_fallback": false,
+        "matches": [
+          {
+            "line": 33,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Review: Confirm the station and allow extra time for the connection. Discuss train reservation with group 49 in week 32. See [[performance-budget-01917]] for context."
+          },
+          {
+            "line": 68,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Next action: Confirm the station and allow extra time for the connection. Discuss train reservation with group 42 in week 7. See [[garden-log-02588]] for context."
+          },
+          {
+            "line": 28,
+            "path": "archive/daily/book-highlights-04131.md",
+            "text": "Observation: Confirm the station and allow extra time for the connection. Discuss train reservation with group 74 in week 31. See [[macos-watcher-04081]] for context."
+          }
+        ],
+        "next_file_offset": 25,
+        "regex_error": null,
+        "returned_matches": 52
+      },
+      "max_ms": 0.8679169999999999,
+      "p50_ms": 0.6207079999999999,
+      "p95_ms": 0.772458,
+      "request": {
+        "fallback": true,
+        "kind": "search",
+        "query": "train reservation"
+      },
+      "samples_ms": [0.574459, 0.6547919999999999, 0.572666, 0.6653749999999999, 0.728, 0.653291, 0.763167, 0.5501250000000001, 0.638083, 0.585542, 0.5632499999999999, 0.521459, 0.5362910000000001, 0.673917, 0.628917, 0.689125, 0.845541, 0.716834, 0.635917, 0.7405419999999999, 0.6207079999999999, 0.710583, 0.6514169999999999, 0.5805, 0.594625, 0.5069589999999999, 0.581334, 0.562667, 0.72075, 0.5825, 0.8679169999999999, 0.6361249999999999, 0.5299579999999999, 0.54525, 0.6604169999999999, 0.559959, 0.6785, 0.536667, 0.772458, 0.6827909999999999, 0.7667919999999999, 0.559083, 0.5467920000000001, 0.5531670000000001, 0.5673330000000001, 0.5445, 0.520541, 0.5690409999999999, 0.6786249999999999, 0.686042]
+    },
+    {
+      "example": {
+        "files_searched": 18,
+        "fuzzy_fallback": false,
+        "matches": [
+          {
+            "line": 24,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Next action: Rest the dough overnight before shaping and baking the next morning. Discuss bread fermentation with group 79 in week 42. See [[db-backup-06413]] for context."
+          },
+          {
+            "line": 70,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Review: Rest the dough overnight before shaping and baking the next morning. Discuss bread fermentation with group 77 in week 21. See [[travel-itinerary-02620]] for context."
+          },
+          {
+            "line": 119,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Observation: Rest the dough overnight before shaping and baking the next morning. Discuss bread fermentation with group 61 in week 23. See [[book-highlights-06403]] for context."
+          }
+        ],
+        "next_file_offset": 18,
+        "regex_error": null,
+        "returned_matches": 50
+      },
+      "max_ms": 1.3578329999999998,
+      "p50_ms": 0.516625,
+      "p95_ms": 0.7053330000000001,
+      "request": {
+        "fallback": true,
+        "kind": "search",
+        "query": "bread fermentation"
+      },
+      "samples_ms": [0.541958, 0.582833, 0.458333, 0.569458, 0.702542, 0.49191700000000005, 0.560292, 0.511833, 0.431541, 0.483458, 0.466542, 0.516625, 0.45608299999999996, 0.631, 0.5557500000000001, 0.581666, 0.7011660000000001, 0.640584, 0.592292, 0.691334, 0.5928329999999999, 0.5828749999999999, 0.5002500000000001, 0.454583, 0.47516600000000003, 0.522583, 0.48579199999999995, 0.44575000000000004, 0.7053330000000001, 0.501334, 1.3578329999999998, 0.648542, 0.480917, 0.458, 0.470417, 0.48262499999999997, 0.532542, 0.45366599999999996, 0.9241250000000001, 0.612458, 0.625792, 0.471792, 0.508083, 0.48404200000000003, 0.516625, 0.579042, 0.465, 0.465542, 0.522875, 0.6377079999999999]
+    },
+    {
+      "example": {
+        "files_searched": 20,
+        "fuzzy_fallback": false,
+        "matches": [
+          {
+            "line": 22,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Observation: The next milestone joins the local editor with the resident service. Discuss Orion launch with group 75 in week 47. See [[macos-watcher-01952]] for context."
+          },
+          {
+            "line": 92,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "- Follow up: The next milestone joins the local editor with the resident service. Discuss Orion launch with group 41 in week 27. See [[research-paper-02364]] for context."
+          },
+          {
+            "line": 15,
+            "path": "archive/daily/book-highlights-03951.md",
+            "text": "Next action: The next milestone joins the local editor with the resident service. Discuss Orion launch with group 55 in week 52. See [[api-design-07841]] for context."
+          }
+        ],
+        "next_file_offset": 20,
+        "regex_error": null,
+        "returned_matches": 52
+      },
+      "max_ms": 1.389125,
+      "p50_ms": 0.5419999999999999,
+      "p95_ms": 0.7254590000000001,
+      "request": {
+        "fallback": true,
+        "kind": "search",
+        "query": "Orion launch"
+      },
+      "samples_ms": [0.5095419999999999, 0.604166, 0.525333, 0.605666, 0.71825, 0.504584, 0.6408330000000001, 0.5658329999999999, 0.481, 0.587292, 0.476541, 0.5325, 0.5323749999999999, 0.5995, 0.5522090000000001, 0.56875, 0.693417, 0.620583, 0.673542, 0.7254590000000001, 0.474333, 0.5932080000000001, 0.576375, 0.523458, 0.503792, 0.532166, 0.535042, 0.566041, 0.714542, 0.485917, 1.389125, 0.632542, 0.47108300000000003, 0.46, 0.49333299999999997, 0.488042, 0.720834, 0.498209, 0.839708, 0.5912499999999999, 0.612917, 0.507833, 0.49074999999999996, 0.556458, 0.49025, 0.475416, 0.506625, 0.47308300000000003, 0.5419999999999999, 0.606625]
+    },
+    {
+      "example": {
+        "files_searched": 16,
+        "fuzzy_fallback": false,
+        "matches": [
+          {
+            "line": 15,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Next action: Carry unfinished actions into the next planning session. Discuss weekly retrospective with group 50 in week 38. See [[api-design-00972]] for context."
+          },
+          {
+            "line": 57,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Review: Carry unfinished actions into the next planning session. Discuss weekly retrospective with group 17 in week 37. See [[performance-budget-08020]] for context."
+          },
+          {
+            "line": 44,
+            "path": "archive/daily/book-highlights-04131.md",
+            "text": "Next action: Carry unfinished actions into the next planning session. Discuss weekly retrospective with group 88 in week 28. See [[rust-ownership-0"
+          }
+        ],
+        "next_file_offset": 16,
+        "regex_error": null,
+        "returned_matches": 54
+      },
+      "max_ms": 0.545584,
+      "p50_ms": 0.28629099999999996,
+      "p95_ms": 0.415459,
+      "request": {
+        "fallback": true,
+        "kind": "search",
+        "query": "weekly retrospective"
+      },
+      "samples_ms": [0.262708, 0.328042, 0.302666, 0.323583, 0.312667, 0.274333, 0.302208, 0.28629099999999996, 0.25670800000000005, 0.338042, 0.283333, 0.301041, 0.28858300000000003, 0.36604200000000003, 0.28883400000000004, 0.312042, 0.355209, 0.319791, 0.271084, 0.35525, 0.324416, 0.319833, 0.33125, 0.249917, 0.28487500000000004, 0.274625, 0.256166, 0.276208, 0.359834, 0.277291, 0.545584, 0.336125, 0.26066700000000004, 0.27775, 0.253125, 0.267375, 0.307166, 0.254333, 0.484833, 0.250417, 0.27633300000000005, 0.268416, 0.277333, 0.291083, 0.258417, 0.2695, 0.25583300000000003, 0.26825, 0.415459, 0.36633299999999996]
+    },
+    {
+      "example": {
+        "files_searched": 22,
+        "fuzzy_fallback": false,
+        "matches": [
+          {
+            "line": 11,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Review: Clients send one JSON object per line and receive an explicit version. Discuss API contract with group 55 in week 16. See [[api-design-07595]] for context."
+          },
+          {
+            "line": 39,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Next action: Clients send one JSON object per line and receive an explicit version. Discuss API contract with group 83 in week 45. See [[research-paper-05994]] for context."
+          },
+          {
+            "line": 88,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Next action: Clients send one JSON object per line and receive an explicit version. Discuss API contract with group 10 in week 49. See [[meeting-notes-01596]] for context."
+          }
+        ],
+        "next_file_offset": 22,
+        "regex_error": null,
+        "returned_matches": 50
+      },
+      "max_ms": 3.9169169999999998,
+      "p50_ms": 0.569792,
+      "p95_ms": 0.772,
+      "request": {
+        "fallback": true,
+        "kind": "search",
+        "query": "API contract"
+      },
+      "samples_ms": [0.58575, 0.772, 0.585417, 0.6835, 0.7016249999999999, 0.675666, 0.616125, 0.5655840000000001, 0.533833, 0.592958, 0.569792, 0.522333, 0.603875, 0.633042, 0.539875, 0.685458, 0.763833, 0.697333, 0.638916, 0.731334, 0.547917, 0.642167, 0.558083, 0.641625, 0.55, 0.5291669999999999, 0.52375, 0.530583, 0.512333, 0.56375, 1.0222499999999999, 0.711375, 0.5957920000000001, 0.56225, 0.583125, 0.545333, 0.698375, 0.528917, 0.753583, 0.534083, 0.565084, 0.5521659999999999, 0.537291, 0.559042, 0.548041, 0.5303340000000001, 0.558834, 0.488, 3.9169169999999998, 0.760625]
+    },
+    {
+      "example": {
+        "files_searched": 22,
+        "fuzzy_fallback": false,
+        "matches": [
+          {
+            "line": 83,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Review: Restore a recent snapshot into a separate directory before checking it. Discuss backup recovery with group 40 in week 44. See [[macos-watcher-01796]] for context."
+          },
+          {
+            "line": 94,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Observation: Restore a recent snapshot into a separate directory before checking it. Discuss backup recovery with group 28 in week 48. See [[archived-decision-08624]] for context."
+          },
+          {
+            "line": 105,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Next action: Restore a recent snapshot into a separate directory before checking it. Discuss backup recovery with group 56 in week 41. See [[performance-budget-01952]] for context."
+          }
+        ],
+        "next_file_offset": 22,
+        "regex_error": null,
+        "returned_matches": 52
+      },
+      "max_ms": 2.0875,
+      "p50_ms": 0.545875,
+      "p95_ms": 0.802542,
+      "request": {
+        "fallback": true,
+        "kind": "search",
+        "query": "backup recovery"
+      },
+      "samples_ms": [0.484375, 0.605375, 0.528833, 0.7175830000000001, 0.667084, 0.5171250000000001, 0.583584, 0.510916, 0.54225, 0.465333, 0.5107090000000001, 0.564333, 0.545875, 0.6842499999999999, 0.586542, 0.6596249999999999, 0.702042, 0.63975, 0.6115419999999999, 0.6898749999999999, 0.617625, 0.612583, 0.52725, 0.530583, 0.538333, 0.503208, 0.476583, 0.585708, 0.498417, 0.747834, 0.802542, 0.670958, 0.557125, 0.487125, 0.514167, 0.525209, 0.6794169999999999, 0.48904099999999995, 0.8089590000000001, 0.517208, 0.49870800000000004, 0.528541, 0.521417, 0.548042, 0.479916, 0.5615420000000001, 0.525, 0.485458, 2.0875, 0.6654169999999999]
+    },
+    {
+      "example": {
+        "files_searched": 18,
+        "fuzzy_fallback": false,
+        "matches": [
+          {
+            "line": 20,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Next action: Separate indexing work from the latency experienced by an interactive search. Discuss latency budget with group 6 in week 10. See [[macos-watcher-05099]] for context."
+          },
+          {
+            "line": 103,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Observation: Separate indexing work from the latency experienced by an interactive search. Discuss latency budget with group 87 in week 10. See [[release-plan-08533]] for context."
+          },
+          {
+            "line": 108,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Observation: Separate indexing work from the latency experienced by an interactive search. Discuss latency budget with group 66 in week 38. See [[travel-itinerary-03709]] for context."
+          }
+        ],
+        "next_file_offset": 18,
+        "regex_error": null,
+        "returned_matches": 52
+      },
+      "max_ms": 1.045,
+      "p50_ms": 0.531542,
+      "p95_ms": 0.7555,
+      "request": {
+        "fallback": true,
+        "kind": "search",
+        "query": "latency budget"
+      },
+      "samples_ms": [0.516208, 0.737459, 0.599333, 0.6054590000000001, 0.617625, 0.5957910000000001, 0.4775, 0.521666, 0.585417, 0.49620899999999996, 0.527416, 0.598834, 0.531542, 0.6369579999999999, 0.524417, 0.5958330000000001, 0.6565, 0.626542, 0.5900420000000001, 0.6994170000000001, 0.642541, 0.5867920000000001, 0.45233300000000004, 0.475042, 0.543042, 0.5172920000000001, 0.553708, 0.522041, 0.481541, 0.683458, 0.483542, 0.65125, 0.493375, 0.49145799999999995, 0.513042, 0.504125, 0.7555, 0.45375, 0.767833, 0.469041, 0.588042, 0.49574999999999997, 0.509875, 0.512958, 0.588083, 0.51425, 0.5175, 0.47825, 1.045, 0.7035830000000001]
+    },
+    {
+      "example": {
+        "files_searched": 5318,
+        "fuzzy_fallback": false,
+        "matches": [
+          {
+            "line": 3,
+            "path": "personal/daily/archived-decision-09999.md",
+            "text": "Note identity: noteidentity09999"
+          }
+        ],
+        "next_file_offset": 0,
+        "regex_error": null,
+        "returned_matches": 1
+      },
+      "max_ms": 52.637291000000005,
+      "p50_ms": 33.822458,
+      "p95_ms": 48.183875,
+      "request": {
+        "fallback": true,
+        "kind": "search",
+        "query": "noteidentity09999"
+      },
+      "samples_ms": [33.822458, 35.875125000000004, 33.409124999999996, 34.485167, 38.065000000000005, 32.879417000000004, 32.533708000000004, 37.695792, 32.895125, 33.976, 32.615125, 33.140916, 37.05945800000001, 40.079375, 35.221208, 36.160667000000004, 39.812208, 41.327541000000004, 39.809041, 40.559583, 35.860125, 38.108458, 34.364082999999994, 32.081790999999996, 32.370083, 32.452083, 32.796, 32.198291, 32.541124999999994, 39.0205, 33.220416, 48.183875, 32.175916, 32.644625, 33.025583999999995, 48.330625000000005, 43.181584, 32.32899999999999, 43.111042000000005, 36.083084, 32.983042, 39.930042, 32.223957999999996, 32.85725, 33.009084, 32.209375, 32.715333, 31.881874999999997, 52.637291000000005, 42.497292]
+    },
+    {
+      "example": {
+        "files_searched": 16,
+        "fuzzy_fallback": false,
+        "matches": [
+          {
+            "line": 17,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Review: Check the soil before watering and record when the first shoots appear. Discuss seed germination with group 74 in week 25. See [[api-design-05711]] for context."
+          },
+          {
+            "line": 35,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Next action: Check the soil before watering and record when the first shoots appear. Discuss seed germination with group 18 in week 29. See [[meeting-notes-04961]] for context."
+          },
+          {
+            "line": 61,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Next action: Check the soil before watering and record when the first shoots appear. Discuss seed germination with group 67 in week 33. See [[design-sketch-05588]] for context."
+          }
+        ],
+        "next_file_offset": 16,
+        "regex_error": null,
+        "returned_matches": 53
+      },
+      "max_ms": 0.566333,
+      "p50_ms": 0.30383299999999996,
+      "p95_ms": 0.44816700000000004,
+      "request": {
+        "fallback": true,
+        "kind": "search",
+        "query": "seed germination"
+      },
+      "samples_ms": [0.274833, 0.293167, 0.350042, 0.25925, 0.30362500000000003, 0.30737499999999995, 0.26899999999999996, 0.487708, 0.320625, 0.278917, 0.31837499999999996, 0.30254099999999995, 0.34125, 0.32808400000000004, 0.310291, 0.329584, 0.346042, 0.31083299999999997, 0.364458, 0.342292, 0.331584, 0.366458, 0.44816700000000004, 0.274375, 0.24266700000000002, 0.310083, 0.25975, 0.2995, 0.2525, 0.294625, 0.30174999999999996, 0.566333, 0.364209, 0.28808300000000003, 0.300583, 0.250041, 0.337416, 0.295375, 0.42216699999999996, 0.337416, 0.306417, 0.30383299999999996, 0.29712500000000003, 0.244791, 0.26899999999999996, 0.288792, 0.27475, 0.263417, 0.38129199999999996, 0.326458]
+    },
+    {
+      "example": {
+        "files_searched": 25,
+        "fuzzy_fallback": false,
+        "matches": [
+          {
+            "line": 37,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Review: Compare the receipt against the purchase order and the monthly statement. Discuss invoice reconciliation with group 55 in week 11. See [[rust-ownership-00516]] for context."
+          },
+          {
+            "line": 123,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Review: Compare the receipt against the purchase order and the monthly statement. Discuss invoice reconciliation with group 27 in week 8. See [[database-migration-04284]] for context."
+          },
+          {
+            "line": 22,
+            "path": "archive/daily/book-highlights-04311.md",
+            "text": "- Follow up: Compare the receipt against the purchase order and the monthly statement. Discuss invoice reconciliation with group 28 in week 23. See [[db-backup-00639]] for context."
+          }
+        ],
+        "next_file_offset": 25,
+        "regex_error": null,
+        "returned_matches": 53
+      },
+      "max_ms": 0.879167,
+      "p50_ms": 0.6074999999999999,
+      "p95_ms": 0.8261660000000001,
+      "request": {
+        "fallback": true,
+        "kind": "search",
+        "query": "invoice reconciliation"
+      },
+      "samples_ms": [0.656333, 0.56625, 0.5918749999999999, 0.620916, 0.58275, 0.664042, 0.582125, 0.8261660000000001, 0.594, 0.6620830000000001, 0.56625, 0.641875, 0.649583, 0.622541, 0.583167, 0.68025, 0.753625, 0.637333, 0.698959, 0.6823330000000001, 0.630416, 0.7035840000000001, 0.751208, 0.544791, 0.6000829999999999, 0.57975, 0.577959, 0.549208, 0.579792, 0.730333, 0.56925, 0.605, 0.655709, 0.644667, 0.585708, 0.598709, 0.642542, 0.6187910000000001, 0.841458, 0.7028340000000001, 0.590666, 0.604583, 0.555625, 0.6074999999999999, 0.570166, 0.558666, 0.562416, 0.5559160000000001, 0.879167, 0.706125]
+    },
+    {
+      "example": {
+        "files_searched": 7,
+        "fuzzy_fallback": false,
+        "matches": [
+          {
+            "line": 8,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "## Observation 0"
+          },
+          {
+            "line": 19,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "## Observation 5"
+          },
+          {
+            "line": 30,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "## Observation 10"
+          }
+        ],
+        "next_file_offset": 7,
+        "regex_error": null,
+        "returned_matches": 69
+      },
+      "max_ms": 0.774625,
+      "p50_ms": 0.409791,
+      "p95_ms": 0.7022499999999999,
+      "request": {
+        "fallback": true,
+        "kind": "search",
+        "query": "Observation\\s+[0-9]+"
+      },
+      "samples_ms": [0.426417, 0.390083, 0.3955, 0.372875, 0.39475000000000005, 0.45408299999999996, 0.429833, 0.7053330000000001, 0.433625, 0.396167, 0.39087500000000003, 0.37775, 0.462333, 0.429459, 0.455083, 0.44820899999999997, 0.409791, 0.408125, 0.5010830000000001, 0.46375000000000005, 0.420958, 0.43520800000000004, 0.774625, 0.426625, 0.38, 0.38975000000000004, 0.400916, 0.38875, 0.354209, 0.432542, 0.402167, 0.44004200000000004, 0.394958, 0.369416, 0.40775, 0.422416, 0.415833, 0.368583, 0.7022499999999999, 0.41775, 0.40275, 0.412375, 0.380167, 0.416958, 0.393166, 0.379125, 0.400625, 0.375917, 0.659291, 0.457125]
+    },
+    {
+      "example": {
+        "files_searched": 19,
+        "fuzzy_fallback": false,
+        "matches": [
+          {
+            "line": 9,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Next action: Keep ownership at the boundary and pass borrowed values through the hot path. Discuss borrow checker with group 42 in week 45. See [[database-migration-09405]] for context."
+          },
+          {
+            "line": 46,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Next action: Keep ownership at the boundary and pass borrowed values through the hot path. Discuss borrow checker with group 51 in week 19. See [[rust-ownership-06171]] for context."
+          },
+          {
+            "line": 50,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Review: Keep ownership at the boundary and pass borrowed values through the hot path. Discuss borrow checker with group 54 in week 21. See [[invoice-audit-09547]] for context."
+          }
+        ],
+        "next_file_offset": 19,
+        "regex_error": null,
+        "returned_matches": 50
+      },
+      "max_ms": 0.8460409999999999,
+      "p50_ms": 0.5337500000000001,
+      "p95_ms": 0.773583,
+      "request": {
+        "fallback": true,
+        "kind": "search",
+        "query": "borrow checker"
+      },
+      "samples_ms": [0.52825, 0.541625, 0.506667, 0.49624999999999997, 0.617, 0.578125, 0.513, 0.751458, 0.56025, 0.5224160000000001, 0.541542, 0.527875, 0.650958, 0.571917, 0.521958, 0.589708, 0.5566669999999999, 0.5786250000000001, 0.57275, 0.689834, 0.500459, 0.5942500000000001, 0.773583, 0.5283749999999999, 0.481417, 0.502, 0.5315, 0.47154199999999996, 0.450083, 0.6629579999999999, 0.5061249999999999, 0.517041, 0.577625, 0.488375, 0.536333, 0.5166660000000001, 0.63, 0.5337500000000001, 0.76925, 0.59375, 0.579333, 0.501708, 0.520625, 0.512834, 0.5995, 0.483875, 0.502209, 0.508792, 0.8460409999999999, 0.781083]
+    },
+    {
+      "example": {
+        "files_searched": 24,
+        "fuzzy_fallback": true,
+        "matches": [
+          {
+            "line": 24,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Next action: Rest the dough overnight before shaping and baking the next morning. Discuss bread fermentation with group 79 in week 42. See [[db-backup-06413]] for context."
+          },
+          {
+            "line": 70,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Review: Rest the dough overnight before shaping and baking the next morning. Discuss bread fermentation with group 77 in week 21. See [[travel-itinerary-02620]] for context."
+          },
+          {
+            "line": 119,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Observation: Rest the dough overnight before shaping and baking the next morning. Discuss bread fermentation with group 61 in week 23. See [[book-highlights-06403]] for context."
+          }
+        ],
+        "next_file_offset": 24,
+        "regex_error": null,
+        "returned_matches": 50
+      },
+      "max_ms": 89.621583,
+      "p50_ms": 63.914625,
+      "p95_ms": 84.52033300000001,
+      "request": {
+        "fallback": true,
+        "kind": "search",
+        "query": "fermenttaion"
+      },
+      "samples_ms": [62.597249999999995, 63.949417, 63.098749999999995, 65.39225, 63.125875, 63.619542, 63.914625, 77.7755, 65.078333, 65.236042, 67.914333, 61.983375, 74.171083, 83.845, 68.409209, 74.25316699999999, 89.621583, 66.655833, 73.373833, 86.66987499999999, 66.44175, 74.567875, 83.72270900000001, 62.924125, 63.027625, 62.21875, 61.937082999999994, 62.076375000000006, 62.027709, 61.670500000000004, 61.958583, 62.77525000000001, 84.52033300000001, 61.856458, 62.971916, 61.703167, 71.131125, 62.275375000000004, 65.241834, 76.072834, 65.46225, 76.217417, 62.096582999999995, 61.997625, 62.039291000000006, 61.301792, 61.073707999999996, 62.592917, 79.985042, 84.396125]
+    },
+    {
+      "example": {
+        "files_searched": 25,
+        "fuzzy_fallback": false,
+        "matches": [
+          {
+            "line": 125,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Next action: Small title rows leave enough room to scan the folder hierarchy. Discuss UI navigation with group 66 in week 26. See [[travel-itinerary-04436]] for context."
+          },
+          {
+            "line": 33,
+            "path": "archive/daily/book-highlights-04131.md",
+            "text": "Review: Small title rows leave enough room to scan the folder hierarchy. Discuss UI navigation with group 81 in week 43. See [[release-plan-03626]] for context."
+          },
+          {
+            "line": 9,
+            "path": "archive/daily/book-highlights-04311.md",
+            "text": "Observation: Small title rows leave enough room to scan the folder hierarchy. Discuss UI navigation with group 33 in week 12. See [[project-orion-07002]] for context."
+          }
+        ],
+        "next_file_offset": 25,
+        "regex_error": null,
+        "returned_matches": 52
+      },
+      "max_ms": 1.094584,
+      "p50_ms": 0.582541,
+      "p95_ms": 0.955084,
+      "request": {
+        "fallback": true,
+        "kind": "search",
+        "query": "UI"
+      },
+      "samples_ms": [0.539083, 0.66075, 0.549625, 0.62425, 0.5670000000000001, 0.588375, 0.5722919999999999, 0.627042, 0.604209, 0.562958, 1.094584, 0.566125, 0.603625, 0.955084, 0.571125, 0.608917, 1.0380420000000001, 0.6733750000000001, 0.641042, 0.823625, 0.582541, 0.6587500000000001, 0.684625, 0.537125, 0.6348750000000001, 0.556083, 0.5327500000000001, 0.518958, 0.539875, 0.5886669999999999, 0.534708, 0.5413749999999999, 0.626583, 0.535083, 0.560583, 0.537291, 0.577959, 0.7088329999999999, 0.628375, 0.626834, 0.5591250000000001, 0.773791, 0.576375, 0.567792, 0.566708, 0.595708, 0.564083, 0.57, 0.6563749999999999, 0.840709]
+    },
+    {
+      "example": {
+        "files_searched": 18,
+        "fuzzy_fallback": false,
+        "matches": [
+          {
+            "line": 24,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Next action: Rest the dough overnight before shaping and baking the next morning. Discuss bread fermentation with group 79 in week 42. See [[db-backup-06413]] for context."
+          },
+          {
+            "line": 81,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Observation: Preserve the timeline and identify which change restored service. Discuss incident response with group 21 in week 9. See [[db-backup-00802]] for context."
+          },
+          {
+            "line": 143,
+            "path": "archive/daily/book-highlights-03771.md",
+            "text": "Observation: Write down the argument and connect it to one concrete example. Discuss reading journal with group 35 in week 39. See [[db-backup-05207]] for context."
+          }
+        ],
+        "next_file_offset": 18,
+        "regex_error": null,
+        "returned_matches": 57
+      },
+      "max_ms": 0.853792,
+      "p50_ms": 0.5121249999999999,
+      "p95_ms": 0.7232080000000001,
+      "request": {
+        "fallback": true,
+        "kind": "search",
+        "query": "db"
+      },
+      "samples_ms": [0.511417, 0.584167, 0.507042, 0.587292, 0.49287500000000006, 0.485125, 0.6292920000000001, 0.49137499999999995, 0.55675, 0.46508299999999997, 0.853792, 0.5180830000000001, 0.49566699999999997, 0.8498330000000001, 0.5198750000000001, 0.5443330000000001, 0.683125, 0.676916, 0.568875, 0.7232080000000001, 0.539416, 0.618417, 0.615583, 0.45845800000000003, 0.489208, 0.505792, 0.504458, 0.459375, 0.481167, 0.5121249999999999, 0.47591700000000003, 0.50225, 0.589625, 0.47266600000000003, 0.483417, 0.47595899999999997, 0.466958, 0.6067089999999999, 0.592958, 0.642917, 0.493042, 0.719041, 0.46920799999999996, 0.5206660000000001, 0.474334, 0.512, 0.488292, 0.519791, 0.52925, 0.657666]
+    },
+    {
+      "example": {
+        "files_searched": 10000,
+        "fuzzy_fallback": true,
+        "matches": [],
+        "next_file_offset": 0,
+        "regex_error": null,
+        "returned_matches": 0
+      },
+      "max_ms": 144.605042,
+      "p50_ms": 114.65050000000001,
+      "p95_ms": 137.8705,
+      "request": {
+        "fallback": true,
+        "kind": "search",
+        "query": "zzzzunfindable999"
+      },
+      "samples_ms": [137.8705, 113.053042, 107.883083, 122.424458, 106.887625, 109.620834, 109.937833, 109.315916, 111.35995899999999, 106.76745899999999, 124.309375, 106.451209, 131.13387500000002, 144.605042, 118.100666, 126.616334, 141.37075, 117.55320800000001, 129.088875, 133.30949999999999, 121.375667, 115.497042, 108.607, 110.195292, 107.60208300000001, 126.2395, 106.361334, 106.697166, 116.08162499999999, 107.698375, 118.496958, 108.678709, 113.303584, 108.11533299999999, 107.084916, 136.54425, 107.63737499999999, 123.151334, 117.035583, 117.28875, 131.985416, 118.91766700000001, 114.65050000000001, 107.90112500000001, 125.069084, 106.58825, 107.07891699999999, 112.758917, 126.865708, 135.96645900000001]
+    }
+  ],
+  "rounds": 50
+}

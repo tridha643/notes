@@ -1,0 +1,12 @@
+USER               PID   TT   %CPU STAT PRI     STIME     UTIME COMMAND
+tridhatri-composio 37409   ??    0.0 S    31T   0:00.23   0:00.28 /Users/tridhatri-composio/dev/notes-gpui/.worktrees/codex-core/target/release/fff-check /private/var/folders/v7/vj4zpn1j3v7dmndpw2dtrldw0000gn/T/notes-fff-check-q1xd7s36/vault /private/var/folders/v7/vj4zpn1j3v7dmndpw2dtrldw0000gn/T/notes-fff-check-q1xd7s36/state
+                 37409         0.0 S    31T   0:00.09   0:00.03
+                 37409         0.0 S    31T   0:00.09   0:00.03
+                 37409         0.0 S    31T   0:00.09   0:00.03
+                 37409         0.0 S    31T   0:00.08   0:00.02
+                 37409         0.0 S    31T   0:00.09   0:00.02
+                 37409         0.0 S    31T   0:00.70   0:01.32
+                 37409         0.0 S    31T   0:08.67   0:00.79
+                 37409         0.0 S    31T   0:08.56   0:00.70
+                 37409         0.0 S    31T   0:08.53   0:00.70
+                 37409         0.0 S    31T   0:08.54   0:00.69
