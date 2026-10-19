@@ -19,7 +19,7 @@ use clap::{Parser, Subcommand};
 use notes_proto::{
     default_socket_path, to_line, AppendArgs, BatchArgs, DeleteArgs, DiffArgs, DiffResult,
     DoctorResult, EditArgs, ErrorBody, ErrorCode, FindArgs, FindHit, FolderArgs, HistoryArgs,
-    HistoryEntry, LineRange, ListArgs, ListResult, ListSort, MoveArgs, NewArgs, Note, NoteArgs,
+    HistoryEntry, LineRange, ListArgs, ListEntry, ListSort, MoveArgs, NewArgs, Note, NoteArgs,
     PrependArgs, ReadArgs, Replacement, Request, Response, RevertArgs, SearchArgs, SearchHit,
     Verb, WatchArgs, WriteArgs, WriteResult, PROTOCOL_VERSION,
 };
@@ -308,6 +308,7 @@ fn call(sock: &Path, request: &Request, json: bool, quiet: bool, number: bool) -
 }
 
 fn render(verb: &Verb, result: Value, json: bool, number: bool) -> String {
+    // `batch` is NDJSON either way: one `BatchOutcome` per op.
     if json || matches!(verb, Verb::Batch(_)) {
         let items = match result {
             Value::Array(items) => items,
@@ -323,12 +324,11 @@ fn text(verb: &Verb, result: &Value, number: bool) -> Option<String> {
     let mut out = String::new();
     match verb {
         Verb::List(_) => {
-            let list: ListResult = serde_json::from_value(result.clone()).ok()?;
-            for folder in &list.folders {
-                _ = writeln!(out, "{folder}/");
-            }
-            for note in &list.notes {
-                _ = writeln!(out, "{}", note.path);
+            for entry in serde_json::from_value::<Vec<ListEntry>>(result.clone()).ok()? {
+                match entry {
+                    ListEntry::Folder { folder } => _ = writeln!(out, "{folder}/"),
+                    ListEntry::Note(note) => _ = writeln!(out, "{}", note.path),
+                }
             }
         }
         Verb::Find(_) => {
@@ -412,7 +412,8 @@ fn report(error: &ErrorBody, json: bool) -> u8 {
     if json {
         let _ = writeln!(io::stdout(), "{}", serde_json::to_string(error).expect("error serializes"));
     }
-    let hint = error.hint.as_deref().unwrap_or(match error.code {
+    let retry = error.current_version().map(|n| format!("current version is {n}; re-read the note, or retry with --if-version {n}"));
+    let hint = retry.as_deref().or(error.hint.as_deref()).unwrap_or(match error.code {
         ErrorCode::Usage => "run `notes help`",
         ErrorCode::NotFound => "run `notes find <query>` to look up the path",
         ErrorCode::Ambiguous => "use the full vault path, or add surrounding text to --old",

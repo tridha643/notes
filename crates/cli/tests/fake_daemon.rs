@@ -101,10 +101,10 @@ fn error_response_goes_to_stderr_with_hint_and_exit_code() {
     assert_eq!(stderr(&run), "notes: \"foo\" matches 3 times (lines 4, 9, 30)\nhint: add surrounding text or pass --all\n");
     assert_eq!(run.out.status.code(), Some(4));
 
-    let conflict = r#"{"id":1,"ok":false,"error":{"code":"version_conflict","message":"plan.md is at version 9"}}"#;
-    let run = notes(&["write", "plan", "-", "--if-version", "8", "--json"], "body", &[conflict]);
-    assert_eq!(stdout(&run), "{\"code\":\"version_conflict\",\"message\":\"plan.md is at version 9\"}\n");
-    assert_eq!(stderr(&run), "notes: plan.md is at version 9\nhint: run `notes read --json <ref>` for the current version, then retry\n");
+    let conflict = r#"{"code":"version_conflict","message":"plan.md is at version 9, not 8","details":{"current_version":9}}"#;
+    let run = notes(&["write", "plan", "-", "--if-version", "8", "--json"], "body", &[&format!(r#"{{"id":1,"ok":false,"error":{conflict}}}"#)]);
+    assert_eq!(stdout(&run), format!("{conflict}\n"));
+    assert_eq!(stderr(&run), "notes: plan.md is at version 9, not 8\nhint: current version is 9; re-read the note, or retry with --if-version 9\n");
     assert_eq!(run.out.status.code(), Some(5));
 }
 
@@ -129,13 +129,22 @@ fn watch_streams_events_as_ndjson() {
 #[test]
 fn batch_sends_stdin_ops_and_prints_one_line_per_result() {
     let ops = "{\"verb\":\"mkdir\",\"args\":{\"folder\":\"w\"}}\n{\"verb\":\"new\",\"args\":{\"path\":\"w/a\"}}\n";
-    let run = notes(&["batch", "--atomic"], ops, &[r#"{"id":1,"ok":true,"result":[null,{"path":"w/a.md","version":1}]}"#]);
+    let outcomes = [r#"{"ok":true,"result":null}"#, r#"{"ok":false,"error":{"code":"not_found","message":"w missing"}}"#];
+    let run = notes(&["batch", "--atomic"], ops, &[&format!(r#"{{"id":1,"ok":true,"result":[{}]}}"#, outcomes.join(","))]);
     assert!(
         run.request.contains(r#""verb":"batch","args":{"ops":[{"verb":"mkdir","args":{"folder":"w"}},{"verb":"new","args":{"path":"w/a","body":""}}],"atomic":true}"#),
         "{}",
         run.request
     );
-    assert_eq!(stdout(&run), "null\n{\"path\":\"w/a.md\",\"version\":1}\n");
+    assert_eq!(stdout(&run), format!("{}\n{}\n", outcomes[0], outcomes[1]));
+}
+
+#[test]
+fn list_prints_folders_then_notes() {
+    let entries = [r#"{"folder":"work"}"#, r#"{"path":"a.md","title":"a","version":1,"updated_at":0}"#];
+    let response = format!(r#"{{"id":1,"ok":true,"result":[{}]}}"#, entries.join(","));
+    assert_eq!(stdout(&notes(&["list"], "", &[&response])), "work/\na.md\n");
+    assert_eq!(stdout(&notes(&["list", "--json"], "", &[&response])), format!("{}\n{}\n", entries[0], entries[1]));
 }
 
 #[test]
