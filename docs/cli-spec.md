@@ -30,14 +30,14 @@ sideshow's CLI verbs (`docs/ref/sideshow/bin/sideshow.js`).
 One JSON object per line, UTF-8, both directions.
 
 ```
-→ {"v":1,"id":7,"verb":"edit","args":{"ref":"12","old":"foo","new":"bar"},"cwd":"/path"}
-← {"id":7,"ok":true,"result":{"id":"12","version":43}}
-← {"id":7,"ok":false,"error":{"code":"ambiguous_match","message":"\"foo\" matches 3 times (lines 4, 9, 30)","hint":"add surrounding text or pass --all"}}
+→ {"v":1,"id":7,"verb":"edit","args":{"note":"work/plan","edits":[{"old":"foo","new":"bar"}]},"cwd":"/path"}
+← {"id":7,"ok":true,"result":{"path":"work/plan.md","version":43}}
+← {"id":7,"ok":false,"error":{"code":"ambiguous","message":"\"foo\" matches 3 times (lines 4, 9, 30)","hint":"add surrounding text or pass --all"}}
 ```
 
 Streaming verbs (`watch`, `wait`) send `{"id":7,"event":{...}}` lines until
 closed. The CLI turns `result` into text, or prints it as-is with `--json`.
-Other tools may speak the protocol directly (e.g. `socat`).
+Other tools may speak the protocol directly (e.g. `socat`). The Rust types live in `crates/proto` (`notes-proto`); they are the source of truth for field names.
 
 ## Global flags
 
