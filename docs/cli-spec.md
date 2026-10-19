@@ -79,7 +79,7 @@ With `--json`, the error object is printed to stdout as well.
 | `notes list [FOLDER] [-r] [--sort updated\|created\|title] [--limit N]` | List notes and subfolders in a folder (vault root by default); `-r` recurses |
 | `notes find <query> [--limit N]` | fff fuzzy path search: typo-tolerant, ranked by how often and how recently you open notes |
 | `notes read <ref> [--lines A:B] [-n]` | Print the body; `--lines` slices, `-n` prefixes line numbers like `cat -n` |
-| `notes search <query> [FOLDER] [-C N] [--case] [--limit N]` | fff content grep, results `path:line: text`. Smart case, regex detected automatically, fuzzy fallback when nothing matches exactly, ranked by fff's frecency; `-C` adds context lines |
+| `notes search <query> [FOLDER] [-C N] [--case] [--fuzzy] [--limit N]` | fff content grep, results `path:line: text`. Smart case, regex detected automatically, ranked by fff's frecency; `--fuzzy` turns on typo-tolerant matching (off by default, so a miss stays a miss); `-C` adds context lines |
 | `notes links <ref>` / `notes backlinks <ref>` | Outgoing `[[links]]` and notes linking here |
 
 `list --json` prints one line per entry, folders first: `{"folder":"work"}` or a note summary `{path, title, version, updated_at}`.
@@ -138,7 +138,8 @@ Sideshow's verbs live under `post` so they don't collide with note verbs.
 
 `notes batch [--atomic] < ops.ndjson` runs one `{"verb":…,"args":…}` per line
 in a single process and connection. `--atomic` runs them in one transaction and
-rolls back on the first failure. Output is one line per op, in order:
+rolls back on the first failure. The exit code is the first failed op's, or 0.
+Output is one line per op, in order:
 `{"ok":true,"result":…}` or `{"ok":false,"error":…}`; an atomic batch stops
 at its first error.
 
@@ -164,7 +165,9 @@ at its first error.
 
 - Folders only, no tags.
 - Trash keeps notes 30 days.
-- Search and find use fff's ranking (fuzzy, typo-tolerant, frecency).
+- Search and find use fff's ranking (frecency). fff runs with its own watcher off (`watch: false`); `notesd` feeds it changes from its writes and its own watcher, so fff adds no idle timer. See docs/fff-check.md on codex/core.
+- Search budget: median ≤20 ms. Searches always run to completion; a rare word or a miss reads the whole vault (~30–60 ms on a 103 MB vault, scaling with size).
+- `batch` exits with the first failed op's exit code, after printing every op's result.
 
 ## Open questions
 

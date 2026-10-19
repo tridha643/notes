@@ -127,6 +127,9 @@ pub struct SearchArgs {
     /// Force case-sensitive matching (default is smart case).
     #[serde(default)]
     pub case_sensitive: bool,
+    /// Typo-tolerant fuzzy matching. Off by default: a plain miss stays a miss.
+    #[serde(default)]
+    pub fuzzy: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
