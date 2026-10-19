@@ -1,0 +1,31 @@
+{
+  "files": 10000,
+  "folders": 50,
+  "leaf_folders": 45,
+  "bytes": 108509770,
+  "min_bytes": 1025,
+  "max_bytes": 20480,
+  "seed": 249,
+  "first_paths": [
+    "work/daily/database-migration-00000.md",
+    "work/plans/meeting-notes-00001.md",
+    "work/meetings/release-plan-00002.md",
+    "work/reading/research-paper-00003.md",
+    "work/ideas/travel-itinerary-00004.md",
+    "work/logs/recipe-sourdough-00005.md",
+    "work/reference/project-orion-00006.md",
+    "work/drafts/weekly-review-00007.md",
+    "work/reviews/api-design-00008.md",
+    "personal/daily/db-backup-00009.md",
+    "personal/plans/performance-budget-00010.md",
+    "personal/meetings/book-highlights-00011.md",
+    "personal/reading/garden-log-00012.md",
+    "personal/ideas/invoice-audit-00013.md",
+    "personal/logs/incident-review-00014.md",
+    "personal/reference/design-sketch-00015.md",
+    "personal/drafts/rust-ownership-00016.md",
+    "personal/reviews/macos-watcher-00017.md",
+    "learning/daily/two-character-ui-00018.md",
+    "learning/plans/archived-decision-00019.md"
+  ]
+}
