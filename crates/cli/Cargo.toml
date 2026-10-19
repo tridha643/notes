@@ -10,5 +10,6 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
+clap_complete = "4.6.11"
 notes-proto = { path = "../proto" }
 serde_json = { version = "1", features = ["preserve_order"] }

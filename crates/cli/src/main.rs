@@ -15,18 +15,23 @@ use std::{
     process::ExitCode,
 };
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use notes_proto::{
-    default_socket_path, to_line, AppendArgs, BatchArgs, DeleteArgs, DiffArgs, DiffResult,
-    DoctorResult, EditArgs, ErrorBody, ErrorCode, FindArgs, FindHit, FolderArgs, HistoryArgs,
-    HistoryEntry, LineRange, ListArgs, ListEntry, ListSort, MoveArgs, NewArgs, Note, NoteArgs,
-    PrependArgs, ReadArgs, Replacement, Request, Response, RevertArgs, SearchArgs, SearchHit,
-    Verb, WatchArgs, WriteArgs, WriteResult, PROTOCOL_VERSION,
+    default_socket_path, to_line, AppendArgs, BatchArgs, BatchOutcome, DeleteArgs, DiffArgs,
+    DiffResult, DoctorResult, EditArgs, ErrorBody, ErrorCode, FindArgs, FindHit, FolderArgs,
+    HistoryArgs, HistoryEntry, LineRange, ListArgs, ListEntry, ListSort, MoveArgs, NewArgs, Note,
+    NoteArgs, PrependArgs, ReadArgs, Replacement, Request, Response, RevertArgs, SearchArgs,
+    SearchHit, Verb, WatchArgs, WriteArgs, WriteResult, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 
 #[derive(Debug, Parser)]
-#[command(name = "notes", version, about = "Plain markdown notes, served by notesd")]
+#[command(
+    name = "notes",
+    version,
+    about = "Plain markdown notes, served by notesd"
+)]
 struct Cli {
     /// Print the raw result; lists print one JSON object per line
     #[arg(long, global = true)]
@@ -73,6 +78,9 @@ enum Cmd {
         /// Case-sensitive (default is smart case)
         #[arg(long)]
         case: bool,
+        /// Typo-tolerant matching (off by default, so a miss stays a miss)
+        #[arg(long)]
+        fuzzy: bool,
         #[arg(long)]
         limit: Option<u32>,
     },
@@ -176,7 +184,33 @@ enum Cmd {
     Manifest,
     /// Socket and database paths, daemon reachable, versions
     Doctor,
+    /// Short usage guide to paste into an agent's AGENTS.md
+    AgentHowto,
+    /// Shell completion script
+    Completions { shell: Shell },
 }
+
+const AGENT_HOWTO: &str = r#"## Notes (`notes` CLI)
+
+Notes are plain `.md` files in folders under one vault (`~/Notes`). Change them
+through `notes`, not by editing files: writes are atomic, versioned and checked.
+
+- A `<ref>` is `folder/title` (with or without `.md`), a unique bare title, or `@last`.
+- Find: `notes find <query>` (paths), `notes search <query> [FOLDER] [-C N]`
+  (content, `path:line: text`; add `--fuzzy` for typo-tolerant matching).
+- Read: `notes read <ref> [--lines A:B] [-n]`; `--json` adds `version`.
+- Edit: `notes edit <ref> --old S --new S` (exact text, must match once unless
+  `--all`), or several at once with `--from edits.json` (`[{"old":…,"new":…}]`).
+- Add: `notes new <path> TEXT|-`, `notes append <ref> TEXT|- [--under HEADING]`,
+  `notes prepend <ref> TEXT|-`.
+- Replace: `notes write <ref> - --if-version N` (N from `read --json`).
+- Many ops, one call: `notes batch [--atomic] < ops.ndjson`, one
+  `{"verb":…,"args":…}` per line.
+- `--json` prints machine output (NDJSON for lists). Exit codes: 0 ok, 2 usage,
+  3 not found, 4 ambiguous (be more specific), 5 version conflict (re-read, retry),
+  6 notesd unreachable. Errors print a `hint:` line on stderr.
+- Set `NOTES_AGENT=<your name>` so history records you as the author.
+"#;
 
 fn parse_sort(s: &str) -> Result<ListSort, String> {
     serde_json::from_value(Value::from(s)).map_err(|_| "expected updated, created or title".into())
@@ -185,11 +219,19 @@ fn parse_sort(s: &str) -> Result<ListSort, String> {
 fn parse_lines(s: &str) -> Result<LineRange, String> {
     let (start, end) = s.split_once(':').ok_or("expected A:B")?;
     let num = |n: &str| n.parse::<u32>().map_err(|e| format!("{n:?}: {e}"));
-    Ok(LineRange { start: num(start)?, end: num(end)? })
+    Ok(LineRange {
+        start: num(start)?,
+        end: num(end)?,
+    })
 }
 
 fn fail(code: ErrorCode, message: impl Into<String>, hint: &str) -> ErrorBody {
-    ErrorBody { code, message: message.into(), hint: Some(hint.into()), details: None }
+    ErrorBody {
+        code,
+        message: message.into(),
+        hint: Some(hint.into()),
+        details: None,
+    }
 }
 
 fn read_all(source: &str, stdin: &mut dyn Read) -> Result<String, ErrorBody> {
@@ -199,46 +241,129 @@ fn read_all(source: &str, stdin: &mut dyn Read) -> Result<String, ErrorBody> {
     } else {
         fs::read_to_string(source)
     };
-    text.map_err(|e| fail(ErrorCode::Other, format!("can't read {source}: {e}"), "check the path, or pass - and pipe the text in"))
+    text.map_err(|e| {
+        fail(
+            ErrorCode::Other,
+            format!("can't read {source}: {e}"),
+            "check the path, or pass - and pipe the text in",
+        )
+    })
 }
 
 /// `TEXT|-` arguments: literal text, or stdin when it's `-`.
 fn text_arg(arg: String, stdin: &mut dyn Read) -> Result<String, ErrorBody> {
-    if arg == "-" { read_all("-", stdin) } else { Ok(arg) }
+    if arg == "-" {
+        read_all("-", stdin)
+    } else {
+        Ok(arg)
+    }
 }
 
 fn to_verb(cmd: Cmd, if_version: Option<u64>, stdin: &mut dyn Read) -> Result<Verb, ErrorBody> {
-    if if_version.is_some() && !matches!(cmd, Cmd::Edit { .. } | Cmd::Append { .. } | Cmd::Prepend { .. } | Cmd::Write { .. }) {
-        return Err(fail(ErrorCode::Usage, "--if-version only applies to edit, append, prepend and write", "drop --if-version"));
+    if if_version.is_some()
+        && !matches!(
+            cmd,
+            Cmd::Edit { .. } | Cmd::Append { .. } | Cmd::Prepend { .. } | Cmd::Write { .. }
+        )
+    {
+        return Err(fail(
+            ErrorCode::Usage,
+            "--if-version only applies to edit, append, prepend and write",
+            "drop --if-version",
+        ));
     }
     Ok(match cmd {
-        Cmd::List { folder, recursive, sort, limit } => Verb::List(ListArgs { folder, recursive, sort, limit }),
+        Cmd::List {
+            folder,
+            recursive,
+            sort,
+            limit,
+        } => Verb::List(ListArgs {
+            folder,
+            recursive,
+            sort,
+            limit,
+        }),
         Cmd::Find { query, limit } => Verb::Find(FindArgs { query, limit }),
-        Cmd::Search { query, folder, context, case, limit } => {
-            Verb::Search(SearchArgs { query, folder, context, case_sensitive: case, fuzzy: false, limit })
-        }
+        Cmd::Search {
+            query,
+            folder,
+            context,
+            case,
+            fuzzy,
+            limit,
+        } => Verb::Search(SearchArgs {
+            query,
+            folder,
+            context,
+            case_sensitive: case,
+            fuzzy,
+            limit,
+        }),
         Cmd::Read { note, lines, .. } => Verb::Read(ReadArgs { note, lines }),
         Cmd::New { path, text } => {
-            let body = text.map(|t| text_arg(t, stdin)).transpose()?.unwrap_or_default();
+            let body = text
+                .map(|t| text_arg(t, stdin))
+                .transpose()?
+                .unwrap_or_default();
             Verb::New(NewArgs { path, body })
         }
-        Cmd::Edit { note, old, new, all, from } => {
+        Cmd::Edit {
+            note,
+            old,
+            new,
+            all,
+            from,
+        } => {
             let edits = match (old, new, from) {
                 (Some(old), Some(new), None) => vec![Replacement { old, new, all }],
-                (None, None, Some(source)) => serde_json::from_str(&read_all(&source, stdin)?).map_err(|e| {
-                    fail(ErrorCode::Usage, format!("bad edits JSON: {e}"), r#"pass a JSON array like [{"old":"foo","new":"bar"}]"#)
-                })?,
-                _ => return Err(fail(ErrorCode::Usage, "edit needs --old and --new, or --from", "run `notes help edit`")),
+                (None, None, Some(source)) => serde_json::from_str(&read_all(&source, stdin)?)
+                    .map_err(|e| {
+                        fail(
+                            ErrorCode::Usage,
+                            format!("bad edits JSON: {e}"),
+                            r#"pass a JSON array like [{"old":"foo","new":"bar"}]"#,
+                        )
+                    })?,
+                _ => {
+                    return Err(fail(
+                        ErrorCode::Usage,
+                        "edit needs --old and --new, or --from",
+                        "run `notes help edit`",
+                    ))
+                }
             };
-            Verb::Edit(EditArgs { note, edits, if_version })
+            Verb::Edit(EditArgs {
+                note,
+                edits,
+                if_version,
+            })
         }
-        Cmd::Append { note, text, under } => Verb::Append(AppendArgs { note, text: text_arg(text, stdin)?, under, if_version }),
-        Cmd::Prepend { note, text } => Verb::Prepend(PrependArgs { note, text: text_arg(text, stdin)?, if_version }),
+        Cmd::Append { note, text, under } => Verb::Append(AppendArgs {
+            note,
+            text: text_arg(text, stdin)?,
+            under,
+            if_version,
+        }),
+        Cmd::Prepend { note, text } => Verb::Prepend(PrependArgs {
+            note,
+            text: text_arg(text, stdin)?,
+            if_version,
+        }),
         Cmd::Write { note, text, force } => {
             if if_version.is_none() && !force {
-                return Err(fail(ErrorCode::Usage, "write replaces the whole note", "pass --if-version N (from `notes read --json`) or --force"));
+                return Err(fail(
+                    ErrorCode::Usage,
+                    "write replaces the whole note",
+                    "pass --if-version N (from `notes read --json`) or --force",
+                ));
             }
-            Verb::Write(WriteArgs { note, body: text_arg(text, stdin)?, if_version, force })
+            Verb::Write(WriteArgs {
+                note,
+                body: text_arg(text, stdin)?,
+                if_version,
+                force,
+            })
         }
         Cmd::Move { note, to } => Verb::Move(MoveArgs { note, to }),
         Cmd::Mkdir { folder } => Verb::Mkdir(FolderArgs { folder }),
@@ -257,7 +382,11 @@ fn to_verb(cmd: Cmd, if_version: Option<u64>, stdin: &mut dyn Read) -> Result<Ve
                 .filter(|(_, line)| !line.trim().is_empty())
                 .map(|(i, line)| {
                     serde_json::from_str(line).map_err(|e| {
-                        fail(ErrorCode::Usage, format!("batch line {}: {e}", i + 1), r#"each stdin line is one {"verb":…,"args":…} op"#)
+                        fail(
+                            ErrorCode::Usage,
+                            format!("batch line {}: {e}", i + 1),
+                            r#"each stdin line is one {"verb":…,"args":…} op"#,
+                        )
                     })
                 })
                 .collect::<Result<_, _>>()?;
@@ -265,16 +394,37 @@ fn to_verb(cmd: Cmd, if_version: Option<u64>, stdin: &mut dyn Read) -> Result<Ve
         }
         Cmd::Manifest => Verb::Manifest,
         Cmd::Doctor => Verb::Doctor,
+        Cmd::AgentHowto | Cmd::Completions { .. } => {
+            unreachable!("offline verbs are handled in main")
+        }
     })
 }
 
 /// Send one request and print what comes back; events stream until the daemon closes.
-fn call(sock: &Path, request: &Request, json: bool, quiet: bool, number: bool) -> Result<(), ErrorBody> {
+/// Returns the exit code: 0, or the first failed batch op's.
+fn call(
+    sock: &Path,
+    request: &Request,
+    json: bool,
+    quiet: bool,
+    number: bool,
+) -> Result<u8, ErrorBody> {
     let unreachable = |e: io::Error| {
-        fail(ErrorCode::DaemonUnreachable, format!("notesd unreachable at {}: {e}", sock.display()), "start notesd, or point --sock / NOTES_SOCK at its socket")
+        let hint = match e.kind() {
+            io::ErrorKind::NotFound => "no socket, so notesd isn't running: start `notesd` (or check its launchd job with `launchctl list | grep notesd`), or point --sock / NOTES_SOCK at its socket",
+            io::ErrorKind::ConnectionRefused => "stale socket, nothing is listening: restart notesd (`launchctl list | grep notesd` shows its job)",
+            _ => "start notesd, or point --sock / NOTES_SOCK at its socket",
+        };
+        fail(
+            ErrorCode::DaemonUnreachable,
+            format!("notesd unreachable at {}: {e}", sock.display()),
+            hint,
+        )
     };
     let mut stream = UnixStream::connect(sock).map_err(unreachable)?;
-    stream.write_all(to_line(request).as_bytes()).map_err(unreachable)?;
+    stream
+        .write_all(to_line(request).as_bytes())
+        .map_err(unreachable)?;
     let mut reader = BufReader::new(stream);
     let mut out = io::stdout().lock();
     let mut line = String::new();
@@ -282,25 +432,59 @@ fn call(sock: &Path, request: &Request, json: bool, quiet: bool, number: bool) -
         line.clear();
         if reader.read_line(&mut line).map_err(unreachable)? == 0 {
             if matches!(request.verb, Verb::Watch(_)) {
-                return Ok(());
+                return Ok(0);
             }
-            return Err(fail(ErrorCode::Other, "notesd closed the connection without a response", "run `notes doctor`"));
+            return Err(fail(
+                ErrorCode::Other,
+                "notesd closed the connection without a response",
+                "run `notes doctor`",
+            ));
         }
-        let response = serde_json::from_str(&line).map_err(|e| {
-            fail(ErrorCode::Other, format!("bad response from notesd: {e}"), "the CLI and notesd may speak different protocol versions; run `notes doctor`")
-        })?;
+        let bad = |e: serde_json::Error| {
+            fail(
+                ErrorCode::Other,
+                format!("bad response from notesd: {e}"),
+                "the CLI and notesd may speak different protocol versions; run `notes doctor`",
+            )
+        };
+        let response = serde_json::from_str(&line).map_err(bad)?;
         match response {
             Response::Event { event, .. } => {
                 // A closed stdout (e.g. `notes watch | head`) ends the stream quietly.
-                if !quiet && writeln!(out, "{}", serde_json::to_string(&event).expect("event serializes")).is_err() {
-                    return Ok(());
+                if !quiet
+                    && writeln!(
+                        out,
+                        "{}",
+                        serde_json::to_string(&event).expect("event serializes")
+                    )
+                    .is_err()
+                {
+                    return Ok(0);
                 }
             }
             Response::Ok { result, .. } => {
+                let outcomes: Vec<BatchOutcome> = if matches!(request.verb, Verb::Batch(_)) {
+                    serde_json::from_value(result.clone()).map_err(bad)?
+                } else {
+                    Vec::new()
+                };
                 if !quiet {
                     let _ = out.write_all(render(&request.verb, result, json, number).as_bytes());
+                    let _ = out.flush();
                 }
-                return Ok(());
+                // Every op's line is printed first; the exit code is the first failed op's.
+                let failed =
+                    outcomes
+                        .into_iter()
+                        .enumerate()
+                        .find_map(|(i, outcome)| match outcome {
+                            BatchOutcome::Err { error, .. } => Some(ErrorBody {
+                                message: format!("batch op {}: {}", i + 1, error.message),
+                                ..error
+                            }),
+                            BatchOutcome::Ok { .. } => None,
+                        });
+                return Ok(failed.map_or(0, |error| report(&error, false)));
             }
             Response::Err { error, .. } => return Err(error),
         }
@@ -364,18 +548,40 @@ fn text(verb: &Verb, result: &Value, number: bool) -> Option<String> {
                 }
             }
         }
-        Verb::New(_) => _ = writeln!(out, "{}", serde_json::from_value::<WriteResult>(result.clone()).ok()?.path),
+        Verb::New(_) => {
+            _ = writeln!(
+                out,
+                "{}",
+                serde_json::from_value::<WriteResult>(result.clone())
+                    .ok()?
+                    .path
+            )
+        }
         Verb::History(_) => {
             let entries: Vec<HistoryEntry> = serde_json::from_value(result.clone()).ok()?;
             for entry in &entries {
-                _ = writeln!(out, "v{}\t{}\t{}", entry.version, utc(entry.at), entry.author);
+                _ = writeln!(
+                    out,
+                    "v{}\t{}\t{}",
+                    entry.version,
+                    utc(entry.at),
+                    entry.author
+                );
             }
         }
-        Verb::Diff(_) => out = serde_json::from_value::<DiffResult>(result.clone()).ok()?.unified,
+        Verb::Diff(_) => {
+            out = serde_json::from_value::<DiffResult>(result.clone())
+                .ok()?
+                .unified
+        }
         Verb::Doctor => {
             let d: DoctorResult = serde_json::from_value(result.clone()).ok()?;
             _ = writeln!(out, "cli       {}", env!("CARGO_PKG_VERSION"));
-            _ = writeln!(out, "notesd    {} (protocol {})", d.daemon_version, d.protocol);
+            _ = writeln!(
+                out,
+                "notesd    {} (protocol {})",
+                d.daemon_version, d.protocol
+            );
             _ = writeln!(out, "socket    {}", d.socket.display());
             _ = writeln!(out, "vault     {}", d.vault.display());
             _ = writeln!(out, "database  {}", d.database.display());
@@ -405,28 +611,56 @@ fn utc(secs: i64) -> String {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
-    format!("{year:04}-{month:02}-{day:02} {:02}:{:02}Z", rem / 3600, rem % 3600 / 60)
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60
+    )
 }
 
 fn report(error: &ErrorBody, json: bool) -> u8 {
     if json {
-        let _ = writeln!(io::stdout(), "{}", serde_json::to_string(error).expect("error serializes"));
+        let _ = writeln!(
+            io::stdout(),
+            "{}",
+            serde_json::to_string(error).expect("error serializes")
+        );
     }
-    let retry = error.current_version().map(|n| format!("current version is {n}; re-read the note, or retry with --if-version {n}"));
-    let hint = retry.as_deref().or(error.hint.as_deref()).unwrap_or(match error.code {
-        ErrorCode::Usage => "run `notes help`",
-        ErrorCode::NotFound => "run `notes find <query>` to look up the path",
-        ErrorCode::Ambiguous => "use the full vault path, or add surrounding text to --old",
-        ErrorCode::VersionConflict => "run `notes read --json <ref>` for the current version, then retry",
-        ErrorCode::DaemonUnreachable => "start notesd, or point --sock / NOTES_SOCK at its socket",
-        ErrorCode::Other => "run `notes doctor`",
+    let retry = error.current_version().map(|n| {
+        format!("current version is {n}; re-read the note, or retry with --if-version {n}")
     });
+    let hint = retry
+        .as_deref()
+        .or(error.hint.as_deref())
+        .unwrap_or(match error.code {
+            ErrorCode::Usage => "run `notes help`",
+            ErrorCode::NotFound => "run `notes find <query>` to look up the path",
+            ErrorCode::Ambiguous => "use the full vault path, or add surrounding text to --old",
+            ErrorCode::VersionConflict => {
+                "run `notes read --json <ref>` for the current version, then retry"
+            }
+            ErrorCode::DaemonUnreachable => {
+                "start notesd, or point --sock / NOTES_SOCK at its socket"
+            }
+            ErrorCode::Other => "run `notes doctor`",
+        });
     eprintln!("notes: {}\nhint: {hint}", error.message);
     error.code.exit_code()
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    match cli.cmd {
+        Cmd::AgentHowto => {
+            let _ = io::stdout().write_all(AGENT_HOWTO.as_bytes());
+            return ExitCode::SUCCESS;
+        }
+        Cmd::Completions { shell } => {
+            clap_complete::generate(shell, &mut Cli::command(), "notes", &mut io::stdout());
+            return ExitCode::SUCCESS;
+        }
+        _ => {}
+    }
     let number = matches!(cli.cmd, Cmd::Read { number: true, .. });
     let sock = cli.sock.unwrap_or_else(default_socket_path);
     let outcome = to_verb(cli.cmd, cli.if_version, &mut io::stdin()).and_then(|verb| {
@@ -440,7 +674,7 @@ fn main() -> ExitCode {
         call(&sock, &request, cli.json, cli.quiet, number)
     });
     match outcome {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
         Err(error) => ExitCode::from(report(&error, cli.json)),
     }
 }
@@ -450,7 +684,8 @@ mod tests {
     use super::*;
 
     fn verb(args: &[&str], stdin: &str) -> Result<Verb, ErrorBody> {
-        let cli = Cli::try_parse_from(std::iter::once("notes").chain(args.iter().copied())).unwrap();
+        let cli =
+            Cli::try_parse_from(std::iter::once("notes").chain(args.iter().copied())).unwrap();
         to_verb(cli.cmd, cli.if_version, &mut stdin.as_bytes())
     }
 
@@ -461,18 +696,45 @@ mod tests {
     #[test]
     fn read_and_list_args() {
         assert_eq!(
-            verb(&["list", "work", "-r", "--sort", "title", "--limit", "5"], "").unwrap(),
-            Verb::List(ListArgs { folder: Some("work".into()), recursive: true, sort: ListSort::Title, limit: Some(5) })
+            verb(
+                &["list", "work", "-r", "--sort", "title", "--limit", "5"],
+                ""
+            )
+            .unwrap(),
+            Verb::List(ListArgs {
+                folder: Some("work".into()),
+                recursive: true,
+                sort: ListSort::Title,
+                limit: Some(5)
+            })
         );
-        assert_eq!(verb(&["list"], "").unwrap(), Verb::List(ListArgs::default()));
+        assert_eq!(
+            verb(&["list"], "").unwrap(),
+            Verb::List(ListArgs::default())
+        );
         assert_eq!(
             verb(&["show", "plan", "--lines", "2:5", "-n"], "").unwrap(),
-            Verb::Read(ReadArgs { note: "plan".into(), lines: Some(LineRange { start: 2, end: 5 }) })
+            Verb::Read(ReadArgs {
+                note: "plan".into(),
+                lines: Some(LineRange { start: 2, end: 5 })
+            })
         );
         assert_eq!(
             verb(&["search", "todo", "work", "-C", "2", "--case"], "").unwrap(),
-            Verb::Search(SearchArgs { query: "todo".into(), folder: Some("work".into()), context: 2, case_sensitive: true, fuzzy: false, limit: None })
+            Verb::Search(SearchArgs {
+                query: "todo".into(),
+                folder: Some("work".into()),
+                context: 2,
+                case_sensitive: true,
+                fuzzy: false,
+                limit: None
+            })
         );
+        let Verb::Search(args) = verb(&["search", "todo", "--fuzzy", "--limit", "3"], "").unwrap()
+        else {
+            panic!("expected search")
+        };
+        assert!(args.fuzzy && args.limit == Some(3));
         assert!(Cli::try_parse_from(["notes", "read", "x", "--lines", "5"]).is_err());
         assert!(Cli::try_parse_from(["notes", "list", "--sort", "size"]).is_err());
     }
@@ -480,46 +742,125 @@ mod tests {
     #[test]
     fn edit_args() {
         assert_eq!(
-            verb(&["edit", "plan", "--old", "a", "--new", "b", "--all", "--if-version", "3"], "").unwrap(),
-            Verb::Edit(EditArgs { note: "plan".into(), edits: vec![Replacement { old: "a".into(), new: "b".into(), all: true }], if_version: Some(3) })
+            verb(
+                &[
+                    "edit",
+                    "plan",
+                    "--old",
+                    "a",
+                    "--new",
+                    "b",
+                    "--all",
+                    "--if-version",
+                    "3"
+                ],
+                ""
+            )
+            .unwrap(),
+            Verb::Edit(EditArgs {
+                note: "plan".into(),
+                edits: vec![Replacement {
+                    old: "a".into(),
+                    new: "b".into(),
+                    all: true
+                }],
+                if_version: Some(3)
+            })
         );
-        let from_stdin = verb(&["edit", "plan", "--from", "-"], r#"[{"old":"a","new":"b"},{"old":"c","new":"d","all":true}]"#).unwrap();
-        let Verb::Edit(EditArgs { edits, .. }) = from_stdin else { panic!("expected edit") };
+        let from_stdin = verb(
+            &["edit", "plan", "--from", "-"],
+            r#"[{"old":"a","new":"b"},{"old":"c","new":"d","all":true}]"#,
+        )
+        .unwrap();
+        let Verb::Edit(EditArgs { edits, .. }) = from_stdin else {
+            panic!("expected edit")
+        };
         assert_eq!(edits.len(), 2);
         assert!(edits[1].all);
-        assert_eq!(verb(&["edit", "plan", "--from", "-"], "{oops").unwrap_err().code, ErrorCode::Usage);
+        assert_eq!(
+            verb(&["edit", "plan", "--from", "-"], "{oops")
+                .unwrap_err()
+                .code,
+            ErrorCode::Usage
+        );
         assert!(Cli::try_parse_from(["notes", "edit", "plan"]).is_err());
         assert!(Cli::try_parse_from(["notes", "edit", "plan", "--old", "a"]).is_err());
-        assert!(Cli::try_parse_from(["notes", "edit", "plan", "--old", "a", "--new", "b", "--from", "-"]).is_err());
+        assert!(Cli::try_parse_from([
+            "notes", "edit", "plan", "--old", "a", "--new", "b", "--from", "-"
+        ])
+        .is_err());
     }
 
     #[test]
     fn write_family_args() {
         assert_eq!(
             verb(&["append", "plan", "-", "--under", "Todo"], "- milk\n").unwrap(),
-            Verb::Append(AppendArgs { note: "plan".into(), text: "- milk\n".into(), under: Some("Todo".into()), if_version: None })
+            Verb::Append(AppendArgs {
+                note: "plan".into(),
+                text: "- milk\n".into(),
+                under: Some("Todo".into()),
+                if_version: None
+            })
         );
-        assert_eq!(verb(&["new", "work/plan"], "").unwrap(), Verb::New(NewArgs { path: "work/plan".into(), body: String::new() }));
+        assert_eq!(
+            verb(&["new", "work/plan"], "").unwrap(),
+            Verb::New(NewArgs {
+                path: "work/plan".into(),
+                body: String::new()
+            })
+        );
         assert_eq!(usage_code(&["write", "plan", "-"]), ErrorCode::Usage);
         assert_eq!(
             verb(&["write", "plan", "-", "--if-version", "7"], "new body").unwrap(),
-            Verb::Write(WriteArgs { note: "plan".into(), body: "new body".into(), if_version: Some(7), force: false })
+            Verb::Write(WriteArgs {
+                note: "plan".into(),
+                body: "new body".into(),
+                if_version: Some(7),
+                force: false
+            })
         );
-        assert_eq!(usage_code(&["move", "a", "b", "--if-version", "1"]), ErrorCode::Usage);
-        assert_eq!(verb(&["delete", "a", "--purge"], "").unwrap(), Verb::Delete(DeleteArgs { note: "a".into(), purge: true }));
-        assert_eq!(verb(&["revert", "a", "--to", "4"], "").unwrap(), Verb::Revert(RevertArgs { note: "a".into(), to: 4 }));
+        assert_eq!(
+            usage_code(&["move", "a", "b", "--if-version", "1"]),
+            ErrorCode::Usage
+        );
+        assert_eq!(
+            verb(&["delete", "a", "--purge"], "").unwrap(),
+            Verb::Delete(DeleteArgs {
+                note: "a".into(),
+                purge: true
+            })
+        );
+        assert_eq!(
+            verb(&["revert", "a", "--to", "4"], "").unwrap(),
+            Verb::Revert(RevertArgs {
+                note: "a".into(),
+                to: 4
+            })
+        );
     }
 
     #[test]
     fn watch_and_batch_args() {
         assert_eq!(
             verb(&["watch", "--since", "12", "--kind", "note,post"], "").unwrap(),
-            Verb::Watch(WatchArgs { since: Some(12), kinds: vec!["note".into(), "post".into()] })
+            Verb::Watch(WatchArgs {
+                since: Some(12),
+                kinds: vec!["note".into(), "post".into()]
+            })
         );
         let ops = "{\"verb\":\"read\",\"args\":{\"note\":\"a\"}}\n\n{\"verb\":\"doctor\"}\n";
         assert_eq!(
             verb(&["batch", "--atomic"], ops).unwrap(),
-            Verb::Batch(BatchArgs { ops: vec![Verb::Read(ReadArgs { note: "a".into(), lines: None }), Verb::Doctor], atomic: true })
+            Verb::Batch(BatchArgs {
+                ops: vec![
+                    Verb::Read(ReadArgs {
+                        note: "a".into(),
+                        lines: None
+                    }),
+                    Verb::Doctor
+                ],
+                atomic: true
+            })
         );
         let err = verb(&["batch"], "{\"verb\":\"doctor\"}\nnope\n").unwrap_err();
         assert!(err.message.starts_with("batch line 2:"), "{}", err.message);
