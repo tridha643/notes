@@ -64,7 +64,7 @@ paths.
 | 2 | Usage error |
 | 3 | Not found |
 | 4 | Ambiguous (bare title or edit match) |
-| 5 | Version conflict (`--if-version` mismatch); stderr carries the current version |
+| 5 | Version conflict (`--if-version` mismatch); the error's `details` carry `{"current_version": N}` |
 | 6 | Daemon unreachable |
 
 Errors go to stderr as one line plus a `hint:` line saying how to fix it.
@@ -81,6 +81,8 @@ With `--json`, the error object is printed to stdout as well.
 | `notes read <ref> [--lines A:B] [-n]` | Print the body; `--lines` slices, `-n` prefixes line numbers like `cat -n` |
 | `notes search <query> [FOLDER] [-C N] [--case] [--limit N]` | fff content grep, results `path:line: text`. Smart case, regex detected automatically, fuzzy fallback when nothing matches exactly, ranked by fff's frecency; `-C` adds context lines |
 | `notes links <ref>` / `notes backlinks <ref>` | Outgoing `[[links]]` and notes linking here |
+
+`list --json` prints one line per entry, folders first: `{"folder":"work"}` or a note summary `{path, title, version, updated_at}`.
 
 `read --json` returns `{path, title, version, body, line_count, created_at, updated_at}`.
 
@@ -136,7 +138,9 @@ Sideshow's verbs live under `post` so they don't collide with note verbs.
 
 `notes batch [--atomic] < ops.ndjson` runs one `{"verb":…,"args":…}` per line
 in a single process and connection. `--atomic` runs them in one transaction and
-rolls back on the first failure. Output is one result line per op.
+rolls back on the first failure. Output is one line per op, in order:
+`{"ok":true,"result":…}` or `{"ok":false,"error":…}`; an atomic batch stops
+at its first error.
 
 ### Files and meta
 
