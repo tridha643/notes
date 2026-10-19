@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Sample LaunchAgent: launchd owns the socket and starts notesd on the first connect
+  (notesd picks it up with launch_activate_socket("Listeners")). No RunAtLoad, no KeepAlive,
+  no StartInterval: nothing starts or wakes notesd except a client connecting.
+
+  Install (replace USER and the binary path first; launchd doesn't expand ~):
+    cp dev.notes.notesd.plist ~/Library/LaunchAgents/
+    mkdir -p ~/Library/Application\ Support/Notes
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.notes.notesd.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.notes.notesd</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/notesd</string>
+    </array>
+    <key>Sockets</key>
+    <dict>
+        <key>Listeners</key>
+        <dict>
+            <key>SockPathName</key>
+            <string>/Users/USER/Library/Application Support/Notes/notesd.sock</string>
+            <!-- 0600 (decimal 384): only this user can connect. -->
+            <key>SockPathMode</key>
+            <integer>384</integer>
+        </dict>
+    </dict>
+    <!-- Background: launchd applies background CPU and I/O policy to the daemon. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+    <!-- No timers in notesd, and none here: launchd must never restart it on a schedule. -->
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardErrorPath</key>
+    <string>/Users/USER/Library/Logs/notesd.log</string>
+</dict>
+</plist>

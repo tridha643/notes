@@ -3379,6 +3379,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "notesd"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "fff-search",
+ "libc",
+ "notes-proto",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "similar",
+]
+
+[[package]]
 name = "notify"
 version = "9.0.0-rc.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
