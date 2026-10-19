@@ -215,7 +215,7 @@ fn to_verb(cmd: Cmd, if_version: Option<u64>, stdin: &mut dyn Read) -> Result<Ve
         Cmd::List { folder, recursive, sort, limit } => Verb::List(ListArgs { folder, recursive, sort, limit }),
         Cmd::Find { query, limit } => Verb::Find(FindArgs { query, limit }),
         Cmd::Search { query, folder, context, case, limit } => {
-            Verb::Search(SearchArgs { query, folder, context, case_sensitive: case, limit })
+            Verb::Search(SearchArgs { query, folder, context, case_sensitive: case, fuzzy: false, limit })
         }
         Cmd::Read { note, lines, .. } => Verb::Read(ReadArgs { note, lines }),
         Cmd::New { path, text } => {
