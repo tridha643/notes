@@ -1,0 +1,18 @@
+autoreview clean: no accepted/actionable findings reported
+overall: patch is correct (0.82)
+The API usage is correct. With `watch: false`, the spike makes one `grep` call with `time_budget_ms: 8`. `enforce_time_budget` is set per request, there is no automatic fuzzy retry, and `GrepMode::Fuzzy` runs only when the request asks for it explicitly. Updates go through the public `handle_create_or_modify` and `remove_file_by_path` methods, from both the kqueue thread and the explicit `update` op. The kqueue thread blocks in `kevent` with a NULL timeout, and stop wakes it with `EVFILT_USER`/`NOTE_TRIGGER` and joins it. That drops the thread's handles and the queue before the fff-only control runs.
+
+I checked the report's claims against the fff-search 0.11.0 source and the raw artifacts:
+- **Budget condition.** In `grep.rs:597` the budget only applies when `enforce_time_budget || all_matches.len() > 1`, and it's re-evaluated once per chunk, with the clock checked every 8th file. That matches the report's "more than one match" and "batched/cooperative" wording.
+- **Primary runs.** The identifier matched in all 50 calls with offset 0, and both misses returned 0 matches with offset 0.
+- **Enforced runs.** All 50 calls were partial (nonzero `next_file_offset`) for each of the three cohorts, and p50/max agree with the doc tables.
+- **Idle windows.** All four windows show unchanged user_time, 0 interrupt and package-idle wakeups, and every capture exited 0.
+- **Thread inventory.** The fff-only stacks list exactly the 10 threads the report names (main, `fff-bg-0..4`, `fff-search-0..3`).
+- **Manual updates.** The update replies return `created_or_modified` or `removed` as expected for each action.
+
+The sentinel chaining for manual edits is consistent: the kqueue phase leaves `editidentity`, and the manual phase moves it to `doneidentity`. Query and enforced phases run before any mutation, and the profilers run outside the rusage brackets. The report already states its known limits, so I didn't count them as defects:
+- the doc says live grep can see edited bytes before the watcher updates its metadata, so the edit trials don't prove propagation;
+- the kqueue thread exits on a snapshot race, which counts as production watcher robustness and is out of scope here;
+- the enforced-budget correctness checks don't affect the driver's exit code.
+
+I found no actionable defects in the code, the measurement method or the report's conclusions.

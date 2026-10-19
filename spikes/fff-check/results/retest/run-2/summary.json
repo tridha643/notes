@@ -1,0 +1,1061 @@
+{
+  "ready": {
+    "automatic_fuzzy_retry": false,
+    "event": "ready",
+    "files": 10000,
+    "grep_budget_ms": 8,
+    "index_complete_ms": 155.352125,
+    "pid": 37409,
+    "ready_ms": 339.561875,
+    "scan_ms": 46.283416,
+    "watch": false,
+    "exec_to_ready_ms": 356.3918749999999
+  },
+  "summary": {
+    "find": {
+      "samples": 1000,
+      "p50_ms": 0.381166,
+      "p95_ms": 0.649292,
+      "max_ms": 1.280375
+    },
+    "search": {
+      "samples": 1000,
+      "p50_ms": 0.33391699999999996,
+      "p95_ms": 42.195209,
+      "max_ms": 85.38925
+    }
+  },
+  "correctness": [
+    {
+      "kind": "find",
+      "query": "database-migration",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "databse-migrtion",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "meeting-notes",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "meting-notes",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "release-plan",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "research-paper",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "travel-itinerary",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "recipe-sourdough",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "project-orion",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "weekly-review",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "api-design",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "db-backup",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "performance-budget",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "book-highlights",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "garden-log",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "invoice-audit",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "macos-watcher",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "ui",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "db",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "zzzzunfindable999",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "database migration",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "meeting agenda",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "release checklist",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "research findings",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "train reservation",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "bread fermentation",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "Orion launch",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "weekly retrospective",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "API contract",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "backup recovery",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "latency budget",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "noteidentity09999",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "seed germination",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "invoice reconciliation",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "Observation\\s+[0-9]+",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "borrow checker",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "fermenttaion",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "UI",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "db",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "zzzzunfindable999",
+      "passed": true
+    }
+  ],
+  "watcher": [
+    {
+      "trial": 0,
+      "action": "create",
+      "mutation_ms": 0.22404100000095184,
+      "path_ms": 98.34866600000147,
+      "content_ms": 98.71645800000017,
+      "event_ms": 110.14875000000046,
+      "event_kinds": [
+        "created_or_modified"
+      ],
+      "polls": 3,
+      "manual_update": null,
+      "passed": true
+    },
+    {
+      "trial": 0,
+      "action": "edit",
+      "mutation_ms": 0.3087910000001415,
+      "path_ms": 1.1608330000001388,
+      "content_ms": 1.5610830000003517,
+      "event_ms": 42.731500000000366,
+      "event_kinds": [
+        "created_or_modified"
+      ],
+      "polls": 4,
+      "manual_update": null,
+      "passed": true
+    },
+    {
+      "trial": 0,
+      "action": "delete",
+      "mutation_ms": 0.07362500000063221,
+      "path_ms": 40.10825000000118,
+      "content_ms": 0.7769159999995168,
+      "event_ms": 214.87345799999957,
+      "event_kinds": [
+        "removed"
+      ],
+      "polls": 4,
+      "manual_update": null,
+      "passed": true
+    },
+    {
+      "trial": 1,
+      "action": "create",
+      "mutation_ms": 0.194207999999918,
+      "path_ms": 97.19404199999992,
+      "content_ms": 97.53549999999933,
+      "event_ms": 97.55437499999964,
+      "event_kinds": [
+        "created_or_modified"
+      ],
+      "polls": 2,
+      "manual_update": null,
+      "passed": true
+    },
+    {
+      "trial": 1,
+      "action": "edit",
+      "mutation_ms": 0.30308300000037036,
+      "path_ms": 0.8957079999998285,
+      "content_ms": 1.2971670000005986,
+      "event_ms": 53.493000000001345,
+      "event_kinds": [
+        "created_or_modified"
+      ],
+      "polls": 5,
+      "manual_update": null,
+      "passed": true
+    },
+    {
+      "trial": 1,
+      "action": "delete",
+      "mutation_ms": 0.0627089999998276,
+      "path_ms": 36.287916999999226,
+      "content_ms": 0.7217920000002209,
+      "event_ms": 213.82341699999864,
+      "event_kinds": [
+        "removed"
+      ],
+      "polls": 4,
+      "manual_update": null,
+      "passed": true
+    },
+    {
+      "trial": 2,
+      "action": "create",
+      "mutation_ms": 0.17966600000107746,
+      "path_ms": 108.07670800000047,
+      "content_ms": 108.42195800000098,
+      "event_ms": 108.4439580000005,
+      "event_kinds": [
+        "created_or_modified"
+      ],
+      "polls": 2,
+      "manual_update": null,
+      "passed": true
+    },
+    {
+      "trial": 2,
+      "action": "edit",
+      "mutation_ms": 0.27620800000072165,
+      "path_ms": 0.9350829999998922,
+      "content_ms": 1.3453329999997266,
+      "event_ms": 55.655333000000695,
+      "event_kinds": [
+        "created_or_modified"
+      ],
+      "polls": 5,
+      "manual_update": null,
+      "passed": true
+    },
+    {
+      "trial": 2,
+      "action": "delete",
+      "mutation_ms": 0.07554199999937339,
+      "path_ms": 39.95033300000017,
+      "content_ms": 0.7729169999990404,
+      "event_ms": 239.19466699999958,
+      "event_kinds": [
+        "removed"
+      ],
+      "polls": 4,
+      "manual_update": null,
+      "passed": true
+    },
+    {
+      "trial": 3,
+      "action": "create",
+      "mutation_ms": 0.17941700000001504,
+      "path_ms": 97.6230840000003,
+      "content_ms": 97.98891700000034,
+      "event_ms": 98.0087919999999,
+      "event_kinds": [
+        "created_or_modified"
+      ],
+      "polls": 2,
+      "manual_update": null,
+      "passed": true
+    },
+    {
+      "trial": 3,
+      "action": "edit",
+      "mutation_ms": 0.2907079999996398,
+      "path_ms": 1.0913749999996725,
+      "content_ms": 1.4813330000009728,
+      "event_ms": 55.62150000000088,
+      "event_kinds": [
+        "created_or_modified"
+      ],
+      "polls": 5,
+      "manual_update": null,
+      "passed": true
+    },
+    {
+      "trial": 3,
+      "action": "delete",
+      "mutation_ms": 0.06283300000120562,
+      "path_ms": 37.07208299999998,
+      "content_ms": 0.7456250000004161,
+      "event_ms": 216.16425000000027,
+      "event_kinds": [
+        "removed"
+      ],
+      "polls": 4,
+      "manual_update": null,
+      "passed": true
+    },
+    {
+      "trial": 4,
+      "action": "create",
+      "mutation_ms": 0.18070900000033419,
+      "path_ms": 104.29575000000035,
+      "content_ms": 104.6409999999991,
+      "event_ms": 104.66566699999902,
+      "event_kinds": [
+        "created_or_modified"
+      ],
+      "polls": 2,
+      "manual_update": null,
+      "passed": true
+    },
+    {
+      "trial": 4,
+      "action": "edit",
+      "mutation_ms": 0.27658299999977487,
+      "path_ms": 1.1342499999997813,
+      "content_ms": 1.5131250000006702,
+      "event_ms": 55.59720800000001,
+      "event_kinds": [
+        "created_or_modified"
+      ],
+      "polls": 5,
+      "manual_update": null,
+      "passed": true
+    },
+    {
+      "trial": 4,
+      "action": "delete",
+      "mutation_ms": 0.061125000000217256,
+      "path_ms": 40.02820800000073,
+      "content_ms": 0.7403749999994602,
+      "event_ms": 217.3307080000004,
+      "event_kinds": [
+        "removed"
+      ],
+      "polls": 4,
+      "manual_update": null,
+      "passed": true
+    }
+  ],
+  "manual_updates": [
+    {
+      "trial": 0,
+      "action": "create",
+      "mutation_ms": 0.2518330000000901,
+      "path_ms": 0.7639580000002866,
+      "content_ms": 1.1721249999965266,
+      "event_ms": 0.35591700000026094,
+      "event_kinds": [],
+      "polls": 1,
+      "manual_update": {
+        "manual_update": "created_or_modified",
+        "path": "/private/var/folders/v7/vj4zpn1j3v7dmndpw2dtrldw0000gn/T/notes-fff-check-q1xd7s36/vault/work/daily/manualprobeunique000.md"
+      },
+      "passed": true
+    },
+    {
+      "trial": 0,
+      "action": "edit",
+      "mutation_ms": 0.292665999999997,
+      "path_ms": 1.0638330000034557,
+      "content_ms": 1.472208000002695,
+      "event_ms": 0.3802909999990334,
+      "event_kinds": [],
+      "polls": 1,
+      "manual_update": {
+        "manual_update": "created_or_modified",
+        "path": "/private/var/folders/v7/vj4zpn1j3v7dmndpw2dtrldw0000gn/T/notes-fff-check-q1xd7s36/vault/work/daily/database-migration-00000.md"
+      },
+      "passed": true
+    },
+    {
+      "trial": 0,
+      "action": "delete",
+      "mutation_ms": 0.06066699999962566,
+      "path_ms": 0.4102919999979804,
+      "content_ms": 194.14725000000033,
+      "event_ms": 0.08670799999777046,
+      "event_kinds": [],
+      "polls": 1,
+      "manual_update": {
+        "manual_update": "removed",
+        "path": "/private/var/folders/v7/vj4zpn1j3v7dmndpw2dtrldw0000gn/T/notes-fff-check-q1xd7s36/vault/work/daily/manualprobeunique000.md"
+      },
+      "passed": true
+    },
+    {
+      "trial": 1,
+      "action": "create",
+      "mutation_ms": 0.17916699999886987,
+      "path_ms": 0.8355000000008772,
+      "content_ms": 1.2012090000013131,
+      "event_ms": 0.3684590000005983,
+      "event_kinds": [],
+      "polls": 1,
+      "manual_update": {
+        "manual_update": "created_or_modified",
+        "path": "/private/var/folders/v7/vj4zpn1j3v7dmndpw2dtrldw0000gn/T/notes-fff-check-q1xd7s36/vault/work/daily/manualprobeunique001.md"
+      },
+      "passed": true
+    },
+    {
+      "trial": 1,
+      "action": "edit",
+      "mutation_ms": 0.26295900000405936,
+      "path_ms": 1.366084000004264,
+      "content_ms": 1.8798340000003577,
+      "event_ms": 0.3280840000030594,
+      "event_kinds": [],
+      "polls": 1,
+      "manual_update": {
+        "manual_update": "created_or_modified",
+        "path": "/private/var/folders/v7/vj4zpn1j3v7dmndpw2dtrldw0000gn/T/notes-fff-check-q1xd7s36/vault/work/plans/meeting-notes-00001.md"
+      },
+      "passed": true
+    },
+    {
+      "trial": 1,
+      "action": "delete",
+      "mutation_ms": 0.05762499999661941,
+      "path_ms": 0.6517079999994735,
+      "content_ms": 184.86079200000205,
+      "event_ms": 0.08516700000171795,
+      "event_kinds": [],
+      "polls": 1,
+      "manual_update": {
+        "manual_update": "removed",
+        "path": "/private/var/folders/v7/vj4zpn1j3v7dmndpw2dtrldw0000gn/T/notes-fff-check-q1xd7s36/vault/work/daily/manualprobeunique001.md"
+      },
+      "passed": true
+    },
+    {
+      "trial": 2,
+      "action": "create",
+      "mutation_ms": 0.18295899999998255,
+      "path_ms": 0.7823750000000018,
+      "content_ms": 1.139750000000106,
+      "event_ms": 0.36458399999617086,
+      "event_kinds": [],
+      "polls": 1,
+      "manual_update": {
+        "manual_update": "created_or_modified",
+        "path": "/private/var/folders/v7/vj4zpn1j3v7dmndpw2dtrldw0000gn/T/notes-fff-check-q1xd7s36/vault/work/daily/manualprobeunique002.md"
+      },
+      "passed": true
+    },
+    {
+      "trial": 2,
+      "action": "edit",
+      "mutation_ms": 0.2582919999980504,
+      "path_ms": 0.9787500000015825,
+      "content_ms": 1.3780000000025439,
+      "event_ms": 0.3248340000041594,
+      "event_kinds": [],
+      "polls": 1,
+      "manual_update": {
+        "manual_update": "created_or_modified",
+        "path": "/private/var/folders/v7/vj4zpn1j3v7dmndpw2dtrldw0000gn/T/notes-fff-check-q1xd7s36/vault/work/meetings/release-plan-00002.md"
+      },
+      "passed": true
+    },
+    {
+      "trial": 2,
+      "action": "delete",
+      "mutation_ms": 0.057540999996774644,
+      "path_ms": 0.42783299999626934,
+      "content_ms": 170.00387499999903,
+      "event_ms": 0.08416600000060726,
+      "event_kinds": [],
+      "polls": 1,
+      "manual_update": {
+        "manual_update": "removed",
+        "path": "/private/var/folders/v7/vj4zpn1j3v7dmndpw2dtrldw0000gn/T/notes-fff-check-q1xd7s36/vault/work/daily/manualprobeunique002.md"
+      },
+      "passed": true
+    },
+    {
+      "trial": 3,
+      "action": "create",
+      "mutation_ms": 0.1822910000015554,
+      "path_ms": 0.7282500000016512,
+      "content_ms": 1.0831250000009618,
+      "event_ms": 0.36370800000185,
+      "event_kinds": [],
+      "polls": 1,
+      "manual_update": {
+        "manual_update": "created_or_modified",
+        "path": "/private/var/folders/v7/vj4zpn1j3v7dmndpw2dtrldw0000gn/T/notes-fff-check-q1xd7s36/vault/work/daily/manualprobeunique003.md"
+      },
+      "passed": true
+    },
+    {
+      "trial": 3,
+      "action": "edit",
+      "mutation_ms": 0.2550000000027808,
+      "path_ms": 1.0865419999959158,
+      "content_ms": 1.4889999999994075,
+      "event_ms": 0.32958399999927224,
+      "event_kinds": [],
+      "polls": 1,
+      "manual_update": {
+        "manual_update": "created_or_modified",
+        "path": "/private/var/folders/v7/vj4zpn1j3v7dmndpw2dtrldw0000gn/T/notes-fff-check-q1xd7s36/vault/work/reading/research-paper-00003.md"
+      },
+      "passed": true
+    },
+    {
+      "trial": 3,
+      "action": "delete",
+      "mutation_ms": 0.05883400000072925,
+      "path_ms": 0.4145840000049361,
+      "content_ms": 172.19170900000336,
+      "event_ms": 0.08050000000281443,
+      "event_kinds": [],
+      "polls": 1,
+      "manual_update": {
+        "manual_update": "removed",
+        "path": "/private/var/folders/v7/vj4zpn1j3v7dmndpw2dtrldw0000gn/T/notes-fff-check-q1xd7s36/vault/work/daily/manualprobeunique003.md"
+      },
+      "passed": true
+    },
+    {
+      "trial": 4,
+      "action": "create",
+      "mutation_ms": 0.17225000000564705,
+      "path_ms": 0.7275419999999144,
+      "content_ms": 1.0884170000053928,
+      "event_ms": 0.35762499999947295,
+      "event_kinds": [],
+      "polls": 1,
+      "manual_update": {
+        "manual_update": "created_or_modified",
+        "path": "/private/var/folders/v7/vj4zpn1j3v7dmndpw2dtrldw0000gn/T/notes-fff-check-q1xd7s36/vault/work/daily/manualprobeunique004.md"
+      },
+      "passed": true
+    },
+    {
+      "trial": 4,
+      "action": "edit",
+      "mutation_ms": 0.25845799999757446,
+      "path_ms": 1.0794579999995335,
+      "content_ms": 1.4833330000030287,
+      "event_ms": 0.33845800000165127,
+      "event_kinds": [],
+      "polls": 1,
+      "manual_update": {
+        "manual_update": "created_or_modified",
+        "path": "/private/var/folders/v7/vj4zpn1j3v7dmndpw2dtrldw0000gn/T/notes-fff-check-q1xd7s36/vault/work/ideas/travel-itinerary-00004.md"
+      },
+      "passed": true
+    },
+    {
+      "trial": 4,
+      "action": "delete",
+      "mutation_ms": 0.05124999999850388,
+      "path_ms": 0.4002499999984366,
+      "content_ms": 171.4572500000031,
+      "event_ms": 0.07345800000280178,
+      "event_kinds": [],
+      "polls": 1,
+      "manual_update": {
+        "manual_update": "removed",
+        "path": "/private/var/folders/v7/vj4zpn1j3v7dmndpw2dtrldw0000gn/T/notes-fff-check-q1xd7s36/vault/work/daily/manualprobeunique004.md"
+      },
+      "passed": true
+    }
+  ],
+  "idle_active": {
+    "seconds": 30.715887833,
+    "before": {
+      "user_time": 157386452,
+      "system_time": 859226218,
+      "pkg_idle_wkups": 0,
+      "interrupt_wkups": 26,
+      "pageins": 16,
+      "wired_size": 0,
+      "resident_size": 107249664,
+      "phys_footprint": 28180960,
+      "proc_start_abstime": 7077659974299,
+      "proc_exit_abstime": 0,
+      "child_user_time": 0,
+      "child_system_time": 0,
+      "child_pkg_idle_wkups": 0,
+      "child_interrupt_wkups": 0,
+      "child_pageins": 0,
+      "child_elapsed_abstime": 0,
+      "diskio_bytesread": 16384,
+      "diskio_byteswritten": 163840,
+      "ns_per_tick": 41.666666666666664
+    },
+    "after": {
+      "user_time": 157386452,
+      "system_time": 859226218,
+      "pkg_idle_wkups": 0,
+      "interrupt_wkups": 26,
+      "pageins": 16,
+      "wired_size": 0,
+      "resident_size": 107249664,
+      "phys_footprint": 28180960,
+      "proc_start_abstime": 7077659974299,
+      "proc_exit_abstime": 0,
+      "child_user_time": 0,
+      "child_system_time": 0,
+      "child_pkg_idle_wkups": 0,
+      "child_interrupt_wkups": 0,
+      "child_pageins": 0,
+      "child_elapsed_abstime": 0,
+      "diskio_bytesread": 16384,
+      "diskio_byteswritten": 163840,
+      "ns_per_tick": 41.666666666666664
+    },
+    "captures": [
+      {
+        "command": [
+          "top",
+          "-l",
+          "2",
+          "-s",
+          "30",
+          "-stats",
+          "pid,cpu,idlew",
+          "-pid",
+          "37409"
+        ],
+        "exit_code": 0,
+        "artifact": "watcher-active-top-30s.txt"
+      },
+      {
+        "command": [
+          "ps",
+          "-M",
+          "-p",
+          "37409"
+        ],
+        "exit_code": 0,
+        "artifact": "watcher-active-threads.txt"
+      },
+      {
+        "command": [
+          "sample",
+          "37409",
+          "3",
+          "10",
+          "-file",
+          "/tmp/fff-retest-final-2/watcher-active-stacks.txt"
+        ],
+        "exit_code": 0,
+        "artifact": "watcher-active-sample.txt"
+      }
+    ],
+    "cpu_ms": 0.0,
+    "package_idle_wakeups": 0,
+    "interrupt_wakeups": 0
+  },
+  "idle_control": {
+    "seconds": 30.705892208,
+    "before": {
+      "user_time": 170534699,
+      "system_time": 929033384,
+      "pkg_idle_wkups": 0,
+      "interrupt_wkups": 26,
+      "pageins": 16,
+      "wired_size": 0,
+      "resident_size": 107233280,
+      "phys_footprint": 23527904,
+      "proc_start_abstime": 7077659974299,
+      "proc_exit_abstime": 0,
+      "child_user_time": 0,
+      "child_system_time": 0,
+      "child_pkg_idle_wkups": 0,
+      "child_interrupt_wkups": 0,
+      "child_pageins": 0,
+      "child_elapsed_abstime": 0,
+      "diskio_bytesread": 16384,
+      "diskio_byteswritten": 163840,
+      "ns_per_tick": 41.666666666666664
+    },
+    "after": {
+      "user_time": 170534699,
+      "system_time": 929033384,
+      "pkg_idle_wkups": 0,
+      "interrupt_wkups": 26,
+      "pageins": 16,
+      "wired_size": 0,
+      "resident_size": 107233280,
+      "phys_footprint": 21283296,
+      "proc_start_abstime": 7077659974299,
+      "proc_exit_abstime": 0,
+      "child_user_time": 0,
+      "child_system_time": 0,
+      "child_pkg_idle_wkups": 0,
+      "child_interrupt_wkups": 0,
+      "child_pageins": 0,
+      "child_elapsed_abstime": 0,
+      "diskio_bytesread": 16384,
+      "diskio_byteswritten": 163840,
+      "ns_per_tick": 41.666666666666664
+    },
+    "captures": [
+      {
+        "command": [
+          "top",
+          "-l",
+          "2",
+          "-s",
+          "30",
+          "-stats",
+          "pid,cpu,idlew",
+          "-pid",
+          "37409"
+        ],
+        "exit_code": 0,
+        "artifact": "fff-only-top-30s.txt"
+      },
+      {
+        "command": [
+          "ps",
+          "-M",
+          "-p",
+          "37409"
+        ],
+        "exit_code": 0,
+        "artifact": "fff-only-threads.txt"
+      },
+      {
+        "command": [
+          "sample",
+          "37409",
+          "3",
+          "10",
+          "-file",
+          "/tmp/fff-retest-final-2/fff-only-stacks.txt"
+        ],
+        "exit_code": 0,
+        "artifact": "fff-only-sample.txt"
+      }
+    ],
+    "cpu_ms": 0.0,
+    "package_idle_wakeups": 0,
+    "interrupt_wakeups": 0
+  },
+  "enforced_summary": {
+    "find": {
+      "samples": 1000,
+      "p50_ms": 0.366792,
+      "p95_ms": 0.620333,
+      "max_ms": 1.239625
+    },
+    "search": {
+      "samples": 1000,
+      "p50_ms": 0.30608399999999997,
+      "p95_ms": 8.547832999999999,
+      "max_ms": 8.994
+    }
+  },
+  "enforced_correctness": [
+    {
+      "kind": "find",
+      "query": "database-migration",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "databse-migrtion",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "meeting-notes",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "meting-notes",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "release-plan",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "research-paper",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "travel-itinerary",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "recipe-sourdough",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "project-orion",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "weekly-review",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "api-design",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "db-backup",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "performance-budget",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "book-highlights",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "garden-log",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "invoice-audit",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "macos-watcher",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "ui",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "db",
+      "passed": true
+    },
+    {
+      "kind": "find",
+      "query": "zzzzunfindable999",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "database migration",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "meeting agenda",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "release checklist",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "research findings",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "train reservation",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "bread fermentation",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "Orion launch",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "weekly retrospective",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "API contract",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "backup recovery",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "latency budget",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "noteidentity09999",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "seed germination",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "invoice reconciliation",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "Observation\\s+[0-9]+",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "borrow checker",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "fermenttaion",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "UI",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "db",
+      "passed": true
+    },
+    {
+      "kind": "search",
+      "query": "zzzzunfindable999",
+      "passed": true
+    }
+  ],
+  "rounds": 50,
+  "fff_search": "0.11.0"
+}

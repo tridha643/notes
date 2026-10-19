@@ -2,13 +2,14 @@
 use fff_search::{
     Casing, Constraint, FFFMode, FilePicker, FilePickerOptions, FrecencyTracker,
     FuzzySearchOptions, GrepConfig, GrepMode, GrepSearchOptions, PaginationArgs, QueryParser,
-    QueryTracker, SharedFilePicker, SharedFrecency, WatchOptions,
+    QueryTracker, SharedFilePicker, SharedFrecency,
 };
+mod vault_watcher;
+
 use serde_json::{Value, json};
 use std::error::Error;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 type ProbeResult<T> = Result<T, Box<dyn Error>>;
@@ -66,24 +67,22 @@ fn execute_query(
     if let Some(scope) = request["scope"].as_str() {
         query.constraints.push(Constraint::FilePath(scope));
     }
-    let mut options = GrepSearchOptions {
+    let options = GrepSearchOptions {
         page_limit: 50,
         casing: Some(Casing::Smart),
-        mode: if fff_search::has_regex_metacharacters(text) {
+        mode: if request["fuzzy"] == true {
+            GrepMode::Fuzzy
+        } else if fff_search::has_regex_metacharacters(text) {
             GrepMode::Regex
         } else {
             GrepMode::PlainText
         },
-        // No deadline: don't hide slow or no-match searches as fast partial success.
-        time_budget_ms: 0,
+        // Default budget semantics and enforced deadlines are measured separately.
+        time_budget_ms: 8,
+        enforce_time_budget: request["enforce_budget"] == true,
         ..Default::default()
     };
-    let mut found = picker.grep(&query, &options);
-    let fallback = found.matches.is_empty() && request["fallback"] == true;
-    if fallback {
-        options.mode = GrepMode::Fuzzy;
-        found = picker.grep(&query, &options);
-    }
+    let found = picker.grep(&query, &options);
     let matches: Vec<_> = found
         .matches
         .iter()
@@ -96,7 +95,7 @@ fn execute_query(
         })
         .collect();
     Ok(json!({
-        "matches": matches, "fuzzy_fallback": fallback,
+        "matches": matches, "explicit_fuzzy": request["fuzzy"] == true,
         "files_searched": found.total_files_searched,
         "next_file_offset": found.next_file_offset,
         "regex_error": found.regex_fallback_error,
@@ -126,7 +125,7 @@ fn main() -> ProbeResult<()> {
             enable_mmap_cache: true,
             enable_content_indexing: true,
             mode: FFFMode::Ai,
-            watch: true,
+            watch: false,
             ..Default::default()
         },
     )?;
@@ -138,20 +137,11 @@ fn main() -> ProbeResult<()> {
         return Err("fff-check: content indexing timed out".into());
     }
     let index_ms = init_started.elapsed().as_secs_f64() * 1000.0;
-    if !shared.wait_for_watcher(STARTUP_TIMEOUT) {
-        return Err("fff-check: watcher startup timed out".into());
-    }
-    let watch_events = Arc::new(Mutex::new(Vec::<Value>::new()));
-    let event_queue = watch_events.clone();
-    let watch_id = shared.watch("", WatchOptions::default(), move |_, events| {
-        let mut queue = event_queue.lock().unwrap();
-        for event in events {
-            queue.push(json!({"path": event.path, "kind": event.kind.as_str()}));
-        }
-    })?;
+    let mut watcher = Some(vault_watcher::VaultWatcher::start(&vault, shared.clone())?);
     let file_count = shared.read()?.as_ref().unwrap().live_file_count();
     emit_json(&json!({
         "event": "ready", "pid": std::process::id(), "files": file_count,
+        "watch": false, "grep_budget_ms": 8, "automatic_fuzzy_retry": false,
         "scan_ms": scan_ms, "index_complete_ms": index_ms,
         "ready_ms": started.elapsed().as_secs_f64() * 1000.0,
     }))?;
@@ -161,8 +151,26 @@ fn main() -> ProbeResult<()> {
         let request: Value = serde_json::from_str(&line?)?;
         match request["op"].as_str() {
             Some("events") => {
-                let events = std::mem::take(&mut *watch_events.lock().unwrap());
+                let events = watcher
+                    .as_ref()
+                    .ok_or("fff-check: watcher stopped")?
+                    .drain_events();
                 emit_json(&json!({"events": events}))?;
+            }
+            Some("stop_watcher") => {
+                if let Some(watcher) = watcher.take() {
+                    watcher.stop()?;
+                }
+                emit_json(&json!({"watcher_stopped": true}))?;
+            }
+            Some("update") => {
+                let path = vault.join(
+                    request["path"]
+                        .as_str()
+                        .ok_or("fff-check: missing update path")?,
+                );
+                let action = vault_watcher::apply_vault_update(&shared, &path)?;
+                emit_json(&json!({"manual_update": action, "path": path}))?;
             }
             Some("query") => emit_json(&execute_query(&shared, &tracker, &request)?)?,
             Some("bench") => {
@@ -177,6 +185,7 @@ fn main() -> ProbeResult<()> {
                     .ok_or("fff-check: missing queries")?;
                 let mut samples = vec![Vec::new(); queries.len()];
                 let mut examples = Vec::new();
+                let mut outcomes = vec![Vec::new(); queries.len()];
                 for query in queries {
                     // Two excluded warmups per query, including first lazy engine work.
                     execute_query(&shared, &tracker, query)?;
@@ -190,6 +199,11 @@ fn main() -> ProbeResult<()> {
                         let result = execute_query(&shared, &tracker, &queries[i])?;
                         std::hint::black_box(&result);
                         samples[i].push(start.elapsed().as_secs_f64() * 1000.0);
+                        outcomes[i].push(
+                            json!({"matches": result["matches"].as_array().map(Vec::len),
+                            "next_file_offset": result["next_file_offset"],
+                            "files_searched": result["files_searched"]}),
+                        );
                     }
                 }
                 let rows: Vec<_> = queries
@@ -200,7 +214,7 @@ fn main() -> ProbeResult<()> {
                             "request": query, "p50_ms": percentile_ms(&samples[i], 0.50),
                             "p95_ms": percentile_ms(&samples[i], 0.95),
                             "max_ms": percentile_ms(&samples[i], 1.0), "samples_ms": samples[i],
-                            "example": examples[i],
+                            "example": examples[i], "outcomes": outcomes[i],
                         })
                     })
                     .collect();
@@ -211,8 +225,9 @@ fn main() -> ProbeResult<()> {
         }
     }
     // Take ownership out of the guard before stopping watcher threads that need that lock.
-    shared.unwatch(watch_id);
-    shared.shutdown_watches_and_wait();
+    if let Some(watcher) = watcher.take() {
+        watcher.stop()?;
+    }
     let picker = shared.write()?.take();
     if let Some(mut picker) = picker {
         picker.stop_background_monitor();

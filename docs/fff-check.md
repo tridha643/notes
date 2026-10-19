@@ -260,3 +260,162 @@ cargo build
 The driver prints the resident PID, retains all raw samples, invokes the requested OS tools and exits unsuccessfully if an expected match, watcher transition or callback fails. In the Codex execution sandbox, `top` was denied, so these recorded runs were launched in Rex's host terminal with `rex run -s "$REX_SESSION" -c "$PWD" -- …`; the measured binary remained the same local release build. Don't run compilation concurrently with the benchmark. Output directories should be fresh. The results cover only this synthetic 10k-note workload and a short indexed-idle interval, not cold-disk startup, a long battery soak, crash recovery or a full daemon/CLI round trip.
 
 Keep fff out of the daemon integration for now. Reconsider after an event-driven debounce implementation (or using `watch: false` behind the daemon's own watcher) demonstrates zero idle timers, and the intended selective/typo search contract fits the warm-call budget or explicitly revises it. Neither mitigation was implemented or benchmarked here. `crates/core` and `crates/ui` source files were untouched; both the release spike build and workspace `cargo build` passed. As requested, the spike is a root workspace member: default workspace builds now include fff and its 76 added packages, and shared dependency features may be unified. No pre-existing locked package version was removed. The spike also passes `cargo fmt -p fff-check --check` and `cargo clippy -p fff-check -- -D warnings`. A read-only Claude CLI review checked the implementation and evidence; the report narrows the identifier and wakeup attribution claims accordingly.
+
+
+---
+
+# Retest — watch off, manual updates, 8 ms grep budget
+
+**Revised verdict: NO-GO for the requested unmodified 0.11.0 configuration against the current ≤10 ms warm-call target; the idle-timer objection is cleared.** `watch: false` removes the debouncer entirely, and both fff-only controls recorded zero CPU-time growth and zero wakeups. Manual updates work. But `time_budget_ms: 8` alone does not bound the identifier or miss cases, which still exceed 10 ms inside the library. The separate `enforce_time_budget: true` experiment returns partial pages at roughly the budget; that is a different completion contract and still excludes CLI startup and IPC.
+
+## Retest setup and exact configuration
+
+Measured on the same M5/macOS/toolchain as the first check, 2026-10-18. The first section and its result directories are preserved verbatim from `aac5d28`. The current spike reproduces this retest; use that commit's harness to reproduce the first check. The corpus generator is unchanged: seed 249, exactly 10,000 files and 108,509,770 bytes. The same 20 find and 20 content queries each receive two excluded warmups and 50 timed samples, rotating order. Percentiles are nearest rank over raw samples, with 1,000 samples per verb per run and 50 per individual query. All measurements are sequential resident-library calls on warm OS file caches, including parsing, locking and copying returned paths/lines, excluding serialization, pipes, CLI startup and UI rendering. These remain first-page measurements, not full retrieval or CLI round trips.
+
+Both final runs used `rex run` in the existing session, sequentially, with no compilation alongside either run. The primary query phase runs first on the original corpus; the supplementary enforced-budget phase runs second, also before mutations. No profiler runs during queries. Complete samples, per-call match counts and resume offsets, correctness checks, thread stacks, `ps -M`, `top`, resource snapshots and `/usr/bin/time -l` are retained in [retest results](../spikes/fff-check/results/retest/). The fixed phase order and working developer Mac limit causal comparisons between budget variants.
+
+```rust
+FilePickerOptions {
+    watch: false,
+    enable_content_indexing: true,
+    enable_mmap_cache: true,
+    mode: FFFMode::Ai,
+    // same automatic cache budget and other defaults as the first check
+    ..Default::default()
+}
+GrepSearchOptions {
+    time_budget_ms: 8,
+    enforce_time_budget: false, // primary run: retain the library default
+    page_limit: 50,
+    casing: Some(Casing::Smart),
+    mode: GrepMode::PlainText, // or Regex, based on the original query
+    ..Default::default()
+}
+// One grep call. No zero-hit retry. GrepMode::Fuzzy only for {"fuzzy": true}.
+```
+
+The [0.11.0 option contract](https://docs.rs/crate/fff-search/0.11.0/source/src/grep/types.rs) exposes a separate `enforce_time_budget` switch. In [plain/regex execution](https://docs.rs/crate/fff-search/0.11.0/source/src/grep/grep.rs), the budget is enabled only when `enforce_time_budget || all_matches.len() > 1`. The comment says it starts after a match, but the actual condition is **more than one match**, so an exactly-one-result identifier and zero-result misses can scan to completion despite the 8 ms value. The timer starts inside grep execution, rather than around the entire library call, and checks are batched; even enforced budgets are cooperative, not hard wall-clock limits.
+
+## Warm query results
+
+| Primary configuration | Run | Samples | p50 ms | p95 ms | max ms |
+|---|---|---|---|---|---|
+| find | 1 | 1000 | 0.381 | 0.689 | 1.727 |
+| search | 1 | 1000 | 0.285 | 59.755 | 111.159 |
+| find | 2 | 1000 | 0.381 | 0.649 | 1.280 |
+| search | 2 | 1000 | 0.334 | 42.195 | 85.389 |
+
+| Primary cohort | Run | Samples | p50 ms | p95 ms | max ms |
+|---|---|---|---|---|---|
+| Common content hits | 1 | 850 | 0.239 | 0.595 | 11.937 |
+| Unique identifier `noteidentity09999` | 1 | 50 | 32.889 | 45.544 | 65.156 |
+| Literal typo miss `fermenttaion` | 1 | 50 | 63.148 | 102.798 | 111.159 |
+| Content miss `zzzzunfindable999` | 1 | 50 | 30.581 | 37.650 | 40.720 |
+| Path miss `zzzzunfindable999` | 1 | 50 | 0.146 | 0.226 | 0.271 |
+| Common content hits | 2 | 850 | 0.285 | 0.618 | 26.182 |
+| Unique identifier `noteidentity09999` | 2 | 50 | 31.920 | 40.227 | 42.095 |
+| Literal typo miss `fermenttaion` | 2 | 50 | 60.748 | 75.111 | 85.389 |
+| Content miss `zzzzunfindable999` | 2 | 50 | 29.826 | 37.041 | 42.195 |
+| Path miss `zzzzunfindable999` | 2 | 50 | 0.146 | 0.214 | 0.287 |
+
+All 40 primary query examples passed in each run. The identifier matched in all 50 timed calls per run. Both content miss cases returned zero matches in all 50 calls each, with resume offset 0 (completed); `fermenttaion` is now a literal miss, as required by the explicit-fuzzy policy, rather than a typo-hit via automatic retry. Both short path/content queries and both path typos still return relevant examples. The corpus and identifier-pattern caveats in the first section still apply.
+
+### Supplemental enforced-budget experiment
+
+Only `enforce_time_budget` changes to `true`; it is recorded in every request. The same 40-query suite is repeated before mutation tests. These are first-page latencies; a nonzero `next_file_offset` means more files remain and must not be treated as proof of absence.
+
+| Enforced configuration/cohort | Run | Samples | p50 ms | p95 ms | max ms |
+|---|---|---|---|---|---|
+| find | 1 | 1000 | 0.373 | 0.629 | 1.218 |
+| search | 1 | 1000 | 0.250 | 8.579 | 13.603 |
+| `noteidentity09999` | 1 | 50 | 8.448 | 8.752 | 8.877 |
+| `fermenttaion` | 1 | 50 | 8.655 | 8.986 | 9.202 |
+| `zzzzunfindable999` | 1 | 50 | 8.401 | 8.793 | 13.603 |
+| find | 2 | 1000 | 0.367 | 0.620 | 1.240 |
+| search | 2 | 1000 | 0.306 | 8.548 | 8.994 |
+| `noteidentity09999` | 2 | 50 | 8.429 | 8.663 | 8.750 |
+| `fermenttaion` | 2 | 50 | 8.657 | 8.924 | 8.987 |
+| `zzzzunfindable999` | 2 | 50 | 8.340 | 8.573 | 8.994 |
+
+| Enforced search outcome | Run | Calls with matches / 50 | Partial calls / 50 |
+|---|---|---|---|
+| `noteidentity09999` | 1 | 50 | 50 |
+| `fermenttaion` | 1 | 0 | 50 |
+| `zzzzunfindable999` | 1 | 0 | 50 |
+| `noteidentity09999` | 2 | 50 | 50 |
+| `fermenttaion` | 2 | 0 | 50 |
+| `zzzzunfindable999` | 2 | 0 | 50 |
+
+The identifier happens to appear in the first partial page in these runs; that does not establish complete retrieval, or success for arbitrary identifier placement. Empty partial pages on the two misses mean “no match yet,” not “absent.” No continuation pages are included in these timings. An additional, separately recorded `{"fuzzy": true}` request demonstrates that fuzzy mode is explicitly selectable; its results are in `explicit-fuzzy.json` and are outside the fixed 40-query timing population.
+
+## Update visibility: daemon knowledge and external writes
+
+The new [vault watcher](../spikes/fff-check/src/vault_watcher.rs) owns one kqueue thread, `notes-vault-kqueue`. It registers vnodes for every existing directory and Markdown file, then blocks in `kevent(..., timeout = NULL)`. A vnode event triggers a metadata snapshot and calls `handle_create_or_modify(path)` for additions/edits or `remove_file_by_path(path)` for removals under the shared write lock. Atomic replacements re-arm the vnode on the new inode. No fff watch subscription, fff rescan, debouncer or timed wait is used. `EVFILT_USER` wakes the watcher for shutdown, which joins the thread and closes its descriptors before the control.
+
+This is a bounded integration probe, not the production vault watcher: it uses roughly 10,050 vnode descriptors and scans vault metadata after an event, setting the process's soft fd limit to at most 20,000. It validates the required blocking/update path on this synthetic vault; rename storms, symlinks and deletion/recreation of watched directories need production handling. It performs no filesystem scans while idle.
+
+Each run checks five external creates, five atomic same-size edits of already-indexed notes, and five deletes. Every trial requires the exact path state, new/old sentinel state and an acknowledgment from the kqueue thread **after** its library update call. After the active-watcher idle capture, the driver stops and joins that thread, then repeats five create/edit/delete trials by sending an explicit known-write `update` request after each filesystem operation. That second phase has no watcher to make the manual API path pass accidentally. Both paths use the same two public library methods. All 30 mutation checks per run passed.
+
+| Update source | Run | Action | Driver-observed update acknowledgment p50 / p95 / max ms | Path visibility p50 / p95 / max ms | Content visibility p50 / p95 / max ms |
+|---|---|---|---|---|---|
+| kqueue | 1 | create | 99.282 / 102.161 / 102.161 | 98.902 / 101.763 / 101.763 | 99.267 / 102.135 / 102.135 |
+| kqueue | 1 | edit | 54.694 / 56.814 / 56.814 | 1.115 / 1.183 / 1.183 | 1.540 / 1.618 / 1.618 |
+| kqueue | 1 | delete | 217.454 / 230.050 / 230.050 | 40.067 / 164.556 / 164.556 | 0.798 / 0.839 / 0.839 |
+| known write; watcher stopped | 1 | create | 0.269 / 0.351 / 0.351 | 0.713 / 0.917 / 0.917 | 1.091 / 1.624 / 1.624 |
+| known write; watcher stopped | 1 | edit | 0.322 / 0.467 / 0.467 | 1.067 / 1.597 / 1.597 | 1.470 / 2.405 / 2.405 |
+| known write; watcher stopped | 1 | delete | 0.084 / 0.195 / 0.195 | 0.446 / 0.740 / 0.740 | 175.627 / 201.709 / 201.709 |
+| kqueue | 2 | create | 104.666 / 110.149 / 110.149 | 98.349 / 108.077 / 108.077 | 98.716 / 108.422 / 108.422 |
+| kqueue | 2 | edit | 55.597 / 55.655 / 55.655 | 1.091 / 1.161 / 1.161 | 1.481 / 1.561 / 1.561 |
+| kqueue | 2 | delete | 216.164 / 239.195 / 239.195 | 39.950 / 40.108 / 40.108 | 0.746 / 0.777 / 0.777 |
+| known write; watcher stopped | 2 | create | 0.364 / 0.368 / 0.368 | 0.764 / 0.836 / 0.836 | 1.140 / 1.201 / 1.201 |
+| known write; watcher stopped | 2 | edit | 0.330 / 0.380 / 0.380 | 1.079 / 1.366 / 1.366 | 1.483 / 1.880 / 1.880 |
+| known write; watcher stopped | 2 | delete | 0.084 / 0.087 / 0.087 | 0.415 / 0.652 / 0.652 | 172.192 / 194.147 / 194.147 |
+
+Times start before the filesystem operation. For kqueue rows, acknowledgment is observed only when the driver drains the event queue after a find query, two sentinel searches and any 10 ms probe sleeps; these are driver-observed upper bounds, not timestamps from the watcher or timings of the library update. Slow broad-fallback probes can inflate the acknowledgment column by hundreds of milliseconds. For known-write rows, acknowledgment includes filesystem I/O and the explicit update request/reply. Visibility also includes search/transport work and any probe sleeps. The table cannot compare kernel-event-to-update latency with synchronous manual update latency. Unchanged edit paths do not measure edit propagation; live grep may see bytes before the watcher updates its metadata. A deleted path constraint can fall back to a broad grep, so slow delete-content probes are search cost, not evidence that deletion took that long to apply. Five observations per action are descriptive, not stable tail estimates.
+
+## Indexed-idle controls and every retained thread
+
+Each run captures 30 seconds with our kqueue watcher active, then 30 seconds after it is joined and all known-write checks finish. In both windows main blocks in stdin, and the driver sends no requests or polls. `proc_pid_rusage(RUSAGE_INFO_V2)` brackets `top -l 2 -s 30`; `mach_timebase_info` converts CPU ticks to time. `ps -M` and 3-second `sample` captures follow the measured window, so sampling overhead is excluded. The fff-only control has no daemon/watcher/housekeeping thread of ours running; Python and `top` are separate observer processes.
+
+| Idle configuration | Run | Seconds | CPU growth ms | Interrupt wakeups | Package-idle wakeups | RSS at end bytes | Footprint at end bytes |
+|---|---|---|---|---|---|---|---|
+| kqueue active | 1 | 30.788 | 0.000 | 0 | 0 | 107,413,504 | 28,344,800 |
+| fff only | 1 | 30.700 | 0.000 | 0 | 0 | 107,380,736 | 19,890,656 |
+| kqueue active | 2 | 30.716 | 0.000 | 0 | 0 | 107,249,664 | 28,180,960 |
+| fff only | 2 | 30.706 | 0.000 | 0 | 0 | 107,233,280 | 21,283,296 |
+
+Both fff-only samples list exactly these ten threads; raw thread IDs differ by run and are retained in the stack artifacts:
+
+| Thread | Owner | Observed wait | Periodic timer? |
+|---|---|---|---|
+| main / `com.apple.main-thread` | harness | `read` on stdin | No |
+| `fff-bg-0` | fff/Rayon background pool | `_pthread_cond_wait` → `__psynch_cvwait` | No |
+| `fff-bg-1` | fff/Rayon background pool | same untimed condition-variable wait | No |
+| `fff-bg-2` | fff/Rayon background pool | same untimed condition-variable wait | No |
+| `fff-bg-3` | fff/Rayon background pool | same untimed condition-variable wait | No |
+| `fff-bg-4` | fff/Rayon background pool | same untimed condition-variable wait | No |
+| `fff-search-0` | fff/Rayon search pool | same untimed condition-variable wait | No |
+| `fff-search-1` | fff/Rayon search pool | same untimed condition-variable wait | No |
+| `fff-search-2` | fff/Rayon search pool | same untimed condition-variable wait | No |
+| `fff-search-3` | fff/Rayon search pool | same untimed condition-variable wait | No |
+
+The active-watcher samples contain one additional thread, `notes-vault-kqueue`, blocked in `kevent` with the null timeout verified in our source. No `fff-lmdb-gc`, debounce, watcher-owner or dispatch thread remains in the control. The GC helper is one-shot, rather than periodic. Source inspection agrees with the captures: [fff's named pools](https://docs.rs/crate/fff-search/0.11.0/source/src/parallelism.rs) use Rayon; [Rayon 1.13.0 worker sleep](https://docs.rs/rayon-core/1.13.0/src/rayon_core/sleep/mod.rs.html) calls `condvar.wait`, with no timeout; [fff LMDB GC](https://docs.rs/crate/fff-search/0.11.0/source/src/dbs/lmdb.rs) exits after its initialization work. **No periodically waking fff thread was found with watch off.** All four measured intervals had zero page-in and disk-byte counter growth as well. This clears the timer concern for this configuration/workload; a 30-second capture is not a long-duration battery test or a guarantee for other features such as Git-backed vaults.
+
+For USE, CPU/wakeup utilization and memory are measured above; no idle runnable backlog is visible in the samples. Mutation acknowledgments, query expectations and OS command exits check errors. Query scheduling and lock saturation are not profiled, so no specific CPU/kernel bottleneck is claimed for the slow grep cases. Vnode fd demand is a spike limitation, not a recommended production watcher design.
+
+## Reproduce and remaining decision
+
+```sh
+cargo build --release -p fff-check
+rex run -s "$REX_SESSION" -c "$PWD" --keep-open --wait -- \
+  python3 spikes/fff-check/run_check.py --output /tmp/fff-retest-1
+rex run -s "$REX_SESSION" -c "$PWD" --keep-open --wait -- \
+  python3 spikes/fff-check/run_check.py --output /tmp/fff-retest-2
+cargo fmt -p fff-check --check
+cargo clippy -p fff-check -- -D warnings
+cargo build
+```
+
+Use fresh output directories and never compile concurrently with either run. Both final Rex processes exited successfully. Release build, formatting, focused clippy and workspace `cargo build` passed. The only added dependency edge is the spike's direct use of the already-locked `libc`; core/UI sources are untouched. Read-only Claude CLI autoreview (`--mode local --engine claude --no-web-search --claude-allowed-tools Read,Grep,Glob`) recomputed the result tables and checked the source/API and idle controls. Its acknowledgment-label finding was corrected; the final review was clean and is retained in [review.txt](../spikes/fff-check/results/retest/review.txt).
+
+Keep the timer finding closed: an unmodified `fff-search 0.11.0` can be indexed and idle without periodic wakeups when its watcher is disabled. The remaining NO-GO is the latency/completion contract. Using `enforce_time_budget: true` requires exposing partial pages and continuation explicitly, and fitting their complete CLI operation into an agreed budget; `time_budget_ms: 8` alone does neither. The present evidence does not require a debounce fork and does not establish that another engine would be faster.

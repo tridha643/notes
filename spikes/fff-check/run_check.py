@@ -80,7 +80,7 @@ def query_cases():
     cases = [{"kind": "find", "query": q, "expected_slug": TOPICS[t][0] if t is not None else None}
              for q, t in zip(find, find_topics)]
     for q in search:
-        cases.append({"kind": "search", "query": q, "fallback": True})
+        cases.append({"kind": "search", "query": q, "enforce_budget": False})
     return cases
 
 
@@ -106,20 +106,21 @@ def capture_command(output, args):
     return {"command": args, "exit_code": result.returncode, "artifact": output.name}
 
 
-def check_watcher(process, vault, repeats, corpus):
+def check_watcher(process, vault, repeats, corpus, manual=False):
     observations = []
     for i in range(repeats):
-        created_relative = f"work/daily/watchprobeunique{i:03d}.md"
+        created_relative = f"work/daily/{'manual' if manual else 'watch'}probeunique{i:03d}.md"
         for action in ("create", "edit", "delete"):
             relative = corpus["first_paths"][i] if action == "edit" else created_relative
             path = vault / relative
-            old = f"noteidentity{i:05d}" if action == "edit" else f"watchsentineloldunique{i:03d}"
-            new = f"editidentity{i:05d}" if action == "edit" else f"watchsentinelnewunique{i:03d}"
+            old = f"{'edit' if manual else 'note'}identity{i:05d}" if action == "edit" else f"watchsentineloldunique{i:03d}"
+            new = f"{'done' if manual else 'edit'}identity{i:05d}" if action == "edit" else f"watchsentinelnewunique{i:03d}"
             if action == "edit":
                 original = path.read_text()
                 prime = request(process, {"op": "query", "kind": "search", "query": old, "scope": relative})
                 assert any(m["path"] == relative for m in prime["matches"]), prime
-            request(process, {"op": "events"})
+            if not manual:
+                request(process, {"op": "events"})
             start = time.perf_counter()
             if action == "create":
                 path.write_text(f"# Watch probe\n{old}\n")
@@ -131,7 +132,10 @@ def check_watcher(process, vault, repeats, corpus):
             else:
                 path.unlink()
             mutation_ms = (time.perf_counter() - start) * 1000
-            path_ms = content_ms = event_ms = None
+            update = request(process, {"op": "update", "path": relative}) if manual else None
+            update_ms = (time.perf_counter() - start) * 1000 if manual else None
+            path_ms = content_ms = None
+            event_ms = update_ms
             event_kinds = []
             polls = 0
             while time.perf_counter() - start < 10:
@@ -146,10 +150,10 @@ def check_watcher(process, vault, repeats, corpus):
                 expected = {"create": [True, False], "edit": [False, True], "delete": [False, False]}[action]
                 if content_ms is None and contents == expected:
                     content_ms = (time.perf_counter() - start) * 1000
-                events = request(process, {"op": "events"})["events"]
+                events = [] if manual else request(process, {"op": "events"})["events"]
                 for event in events:
                     if event["path"] == str(path) and event["kind"] in {
-                        "create": {"created", "modified"}, "edit": {"modified", "renamed", "created"},
+                        "create": {"created_or_modified"}, "edit": {"created_or_modified"},
                         "delete": {"removed"}}[action]:
                         event_kinds.append(event["kind"])
                         if event_ms is None:
@@ -160,7 +164,7 @@ def check_watcher(process, vault, repeats, corpus):
                 time.sleep(0.01)
             observations.append({"trial": i, "action": action, "mutation_ms": mutation_ms,
                                  "path_ms": path_ms, "content_ms": content_ms, "event_ms": event_ms,
-                                 "event_kinds": event_kinds, "polls": polls,
+                                 "event_kinds": event_kinds, "polls": polls, "manual_update": update,
                                  "passed": path_ms is not None and content_ms is not None and event_ms is not None})
     return observations
 
@@ -178,8 +182,8 @@ def summarize_bench(bench):
                 slug = q["expected_slug"]
                 passed = any(slug in p for p in example["paths"]) if slug else not example["paths"]
             else:
-                needle = "fermentation" if q["query"] == "fermenttaion" else q["query"]
-                if q["query"] == "zzzzunfindable999":
+                needle = q["query"]
+                if q["query"] in ("zzzzunfindable999", "fermenttaion"):
                     passed = not example["matches"]
                 else:
                     flags = 0 if any(c.isupper() for c in needle) else re.IGNORECASE
@@ -209,6 +213,25 @@ def process_resources(pid):
     if system.mach_timebase_info(ctypes.byref(timebase)) != 0:
         raise RuntimeError("fff-check driver: mach_timebase_info failed")
     return {**{n: getattr(info, n) for n in names}, "ns_per_tick": timebase.numer / timebase.denom}
+
+
+def capture_idle(pid, output, label, skip):
+    if skip:
+        return None
+    time.sleep(3)  # Outside the measured interval; let event work settle.
+    before = process_resources(pid)
+    started = time.perf_counter()
+    captures = [capture_command(output / f"{label}-top-30s.txt",
+                ["top", "-l", "2", "-s", "30", "-stats", "pid,cpu,idlew", "-pid", str(pid)])]
+    seconds = time.perf_counter() - started
+    after = process_resources(pid)
+    # Profilers run AFTER rusage's idle interval, never alongside query timing.
+    captures.append(capture_command(output / f"{label}-threads.txt", ["ps", "-M", "-p", str(pid)]))
+    captures.append(capture_command(output / f"{label}-sample.txt", ["sample", str(pid), "3", "10", "-file", str(output / f"{label}-stacks.txt")]))
+    return {"seconds": seconds, "before": before, "after": after, "captures": captures,
+            "cpu_ms": (after["user_time"] + after["system_time"] - before["user_time"] - before["system_time"]) * after["ns_per_tick"] / 1e6,
+            "package_idle_wakeups": after["pkg_idle_wkups"] - before["pkg_idle_wkups"],
+            "interrupt_wakeups": after["interrupt_wkups"] - before["interrupt_wkups"]}
 
 
 def main():
@@ -253,35 +276,32 @@ def main():
                                  lambda match: match[1] + json.dumps(json.loads(match[2])), encoded)
                 (args.output / "queries.json").write_text(encoded + "\n")
                 print(json.dumps({"event": "queries", **summary, "failed": [c for c in checks if not c["passed"]]}), flush=True)
+                # Supplemental run exposes the opt-in deadline's completeness tradeoff.
+                enforced_cases = query_cases()
+                for case in enforced_cases:
+                    case["enforce_budget"] = True
+                enforced = request(process, {"op": "bench", "rounds": args.rounds, "queries": enforced_cases})
+                (args.output / "enforced-queries.json").write_text(json.dumps(enforced, indent=2) + "\n")
+                enforced_summary, enforced_checks = summarize_bench(enforced)
+                explicit = request(process, {"op": "query", "kind": "search", "query": "fermenttaion", "fuzzy": True, "enforce_budget": True})
+                (args.output / "explicit-fuzzy.json").write_text(json.dumps(explicit, indent=2) + "\n")
                 watcher = check_watcher(process, vault, args.watch_trials, corpus)
                 print(json.dumps({"event": "watcher", "observations": watcher}), flush=True)
-                # No requests, active searches or driver polling during these captures.
-                time.sleep(3)
-                captures = []
-                if not args.skip_top:
-                    captures.append(capture_command(args.output / "top-1s.txt",
-                                    ["top", "-l", "2", "-stats", "pid,cpu,idlew", "-pid", str(ready["pid"])]))
-                    before = process_resources(ready["pid"])
-                    idle_start = time.perf_counter()
-                    captures.append(capture_command(args.output / "top-30s.txt",
-                                    ["top", "-l", "2", "-s", "30", "-stats", "pid,cpu,idlew", "-pid", str(ready["pid"])]))
-                    idle_seconds = time.perf_counter() - idle_start
-                    after = process_resources(ready["pid"])
-                    idle = {"seconds": idle_seconds, "before": before, "after": after,
-                            "cpu_ms": (after["user_time"] + after["system_time"] - before["user_time"] - before["system_time"]) * after["ns_per_tick"] / 1e6,
-                            "package_idle_wakeups": after["pkg_idle_wkups"] - before["pkg_idle_wkups"],
-                            "interrupt_wakeups": after["interrupt_wkups"] - before["interrupt_wkups"]}
-                else:
-                    idle = None
+                idle_active = capture_idle(ready["pid"], args.output, "watcher-active", args.skip_top)
+                assert request(process, {"op": "stop_watcher"})["watcher_stopped"]
+                manual = check_watcher(process, vault, args.watch_trials, corpus, manual=True)
+                print(json.dumps({"event": "manual_updates", "observations": manual}), flush=True)
+                idle_control = capture_idle(ready["pid"], args.output, "fff-only", args.skip_top)
                 result = {"ready": ready, "summary": summary, "correctness": checks, "watcher": watcher,
-                          "captures": captures, "idle": idle, "rounds": args.rounds, "fff_search": "0.11.0"}
+                          "manual_updates": manual, "idle_active": idle_active, "idle_control": idle_control,
+                          "enforced_summary": enforced_summary, "enforced_correctness": enforced_checks, "rounds": args.rounds, "fff_search": "0.11.0"}
                 (args.output / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
                 process.stdin.write('{"op":"quit"}\n')
                 process.stdin.flush()
                 if process.wait(timeout=15) != 0:
                     raise RuntimeError("fff-check driver: resident process failed; see time.txt")
                 print(json.dumps({"event": "complete", "output": str(args.output)}), flush=True)
-                if any(not c["passed"] for c in checks) or any(not w["passed"] for w in watcher):
+                if any(not c["passed"] for c in checks) or any(not w["passed"] for w in watcher + manual):
                     raise RuntimeError("fff-check driver: correctness check failed; see summary.json")
             finally:
                 if process.poll() is None:
