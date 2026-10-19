@@ -257,18 +257,83 @@ impl Tx<'_> {
                 vault: self.d.vault.clone(),
                 database: self.d.db_path.clone(),
                 notes: Daemon::note_count(self.db)?,
+                render_cache: Some(
+                    serde_json::to_value(self.d.render.stats()).expect("stats serialize"),
+                ),
             }),
             Verb::Manifest => Ok(manifest()),
-            Verb::Watch(_) => Err(fail(
+            Verb::Watch(_) | Verb::Wait(_) => Err(fail(
                 ErrorCode::Usage,
                 "watch can't run inside a batch",
                 Some("open its own connection"),
             )),
             Verb::Batch(_) => Err(fail(ErrorCode::Usage, "batches can't nest", None)),
+            sideshow => self.sideshow(sideshow),
         }
     }
 
     /// Clean a note path and add `.md` before canonicalizing, so case matches the file on disk.
+    /// Sideshow verbs: sessions, posts, comments, assets, traces, kits, settings.
+    fn sideshow(&mut self, verb: &Verb) -> R<Value> {
+        use notes_posts as p;
+        let db = self.db;
+        let agent = Some(self.author).filter(|a| *a != "human");
+        match verb {
+            Verb::SessionNew(a) => self.written_posts(p::session_new(db, a)),
+            Verb::SessionList => value(p::session_list(db).map_err(Fail)?),
+            Verb::SessionRename(a) => self.written_posts(p::session_rename(db, a)),
+            Verb::SessionDelete(a) => self.posts_events(p::session_delete(db, &a.id)),
+            Verb::PostNew(a) => {
+                let cwd = self.cwd.clone();
+                self.written_posts(p::post_new(db, a, agent, cwd.as_deref()))
+            }
+            Verb::PostUpdate(a) => self.written_posts(p::post_update(db, a)),
+            Verb::PostPart(a) => self.written_posts(p::post_part(db, a)),
+            Verb::PostList(a) => value(p::post_list(db, a).map_err(Fail)?),
+            Verb::PostShow(a) => value(p::post_show(db, a).map_err(Fail)?),
+            // ponytail: re-parses the cached JSON into a Value; splice the raw string into the
+            // response line if big renders show up in profiles.
+            Verb::PostRender(a) => Ok(serde_json::from_str(
+                &p::post_render_json(db, &self.d.render, a).map_err(Fail)?,
+            )
+            .expect("render JSON parses")),
+            Verb::PostDelete(a) => self.posts_events(p::post_delete(db, &a.id)),
+            Verb::CommentNew(a) => {
+                let r = self.written_posts(p::comment_new(db, a, agent))?;
+                self.commented = true;
+                Ok(r)
+            }
+            Verb::CommentList(a) => value(p::comment_list(db, a).map_err(Fail)?),
+            Verb::CommentDelete(a) => self.posts_events(p::comment_delete(db, &a.id)),
+            Verb::AssetPut(a) => value(p::asset_put(db, a).map_err(Fail)?),
+            Verb::AssetGet(a) => value(p::asset_get(db, &a.id).map_err(Fail)?),
+            Verb::TraceSet(a) => self.written_posts(p::trace_set(db, a)),
+            Verb::TraceList(a) => value(p::trace_list(db, &a.id).map_err(Fail)?),
+            Verb::Kits => value(p::kits()),
+            Verb::SettingGet(a) => value(p::setting_get(db, &a.key).map_err(Fail)?),
+            Verb::SettingSet(a) => self.posts_events(p::setting_set(db, a)),
+            other => Err(fail(
+                ErrorCode::Usage,
+                format!("{other:?} isn't handled here"),
+                None,
+            )),
+        }
+    }
+
+    fn written_posts<T: serde::Serialize>(
+        &mut self,
+        r: notes_posts::Result<notes_posts::Written<T>>,
+    ) -> R<Value> {
+        let (v, events) = r.map_err(Fail)?;
+        self.post_events(events)?;
+        value(v)
+    }
+
+    fn posts_events(&mut self, r: notes_posts::Result<Vec<notes_proto::Event>>) -> R<Value> {
+        self.post_events(r.map_err(Fail)?)?;
+        Ok(Value::Null)
+    }
+
     fn note_path(&self, input: &str) -> R<String> {
         let input = input.trim().trim_end_matches('/');
         let rel = self.clean(&if input.ends_with(".md") {

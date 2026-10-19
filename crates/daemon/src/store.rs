@@ -43,7 +43,9 @@ CREATE TABLE IF NOT EXISTS events(
   kind TEXT NOT NULL,
   path TEXT,
   version INTEGER,
-  at INTEGER NOT NULL);
+  at INTEGER NOT NULL,
+  ext_id TEXT,
+  session TEXT);
 ";
 
 pub const TRASH_DAYS: i64 = 30;
@@ -60,6 +62,10 @@ pub struct Daemon {
     pub search: Search,
     /// Latest committed event seq; watchers wait on the condvar.
     bus: (Mutex<u64>, Condvar),
+    /// Sideshow render output, keyed by content hash (see notes_posts::RenderCache).
+    pub render: notes_posts::RenderCache,
+    /// Wakes `wait` requests when a comment commits.
+    pub comments: notes_posts::CommentSignal,
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +96,10 @@ pub struct Tx<'a> {
     /// Absolute paths fff must re-read once the unit ends.
     touched: Vec<PathBuf>,
     events: bool,
+    /// Caller's working directory; picks the implicit sideshow session.
+    pub cwd: Option<String>,
+    /// A comment committed in this unit, so `wait`ers must re-check.
+    pub commented: bool,
 }
 
 pub fn now() -> i64 {
@@ -159,6 +169,11 @@ impl Daemon {
         let db = Connection::open(&db_path)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         db.execute_batch(SCHEMA)?;
+        // Databases from before sideshow events carried ids.
+        if !db.prepare("SELECT ext_id FROM events LIMIT 0").is_ok() {
+            db.execute_batch("ALTER TABLE events ADD COLUMN ext_id TEXT; ALTER TABLE events ADD COLUMN session TEXT;")?;
+        }
+        notes_posts::migrate(&db).map_err(Fail)?;
         let seq: Option<i64> = db.query_row("SELECT max(seq) FROM events", [], |r| r.get(0))?;
         let search = Search::open(&vault, &state.join("fff"))?;
         Ok(Daemon {
@@ -168,6 +183,8 @@ impl Daemon {
             db: Mutex::new(db),
             search,
             bus: (Mutex::new(seq.unwrap_or(0) as u64), Condvar::new()),
+            render: notes_posts::RenderCache::new(),
+            comments: notes_posts::CommentSignal::default(),
         })
     }
 
@@ -186,6 +203,8 @@ impl Daemon {
             undo: Vec::new(),
             touched: Vec::new(),
             events: false,
+            cwd: None,
+            commented: false,
         };
         let result = f(&mut tx).and_then(|v| Ok(db.execute_batch("COMMIT").map(|()| v)?));
         if result.is_err() {
@@ -198,6 +217,9 @@ impl Daemon {
             *self.bus.0.lock().unwrap_or_else(|e| e.into_inner()) = seq as u64;
             self.bus.1.notify_all();
         }
+        if tx.commented && result.is_ok() {
+            self.comments.notify();
+        }
         result
     }
 
@@ -205,7 +227,7 @@ impl Daemon {
     pub fn events_after(&self, since: u64, limit: u32) -> R<Vec<Event>> {
         let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = db.prepare_cached(
-            "SELECT seq, kind, path, version FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2",
+"SELECT seq, kind, path, version, ext_id, session FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![since as i64, limit], |r| {
             Ok(Event {
@@ -213,6 +235,8 @@ impl Daemon {
                 kind: r.get(1)?,
                 path: r.get(2)?,
                 version: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                id: r.get(4)?,
+                session: r.get(5)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -335,6 +359,17 @@ impl Tx<'_> {
         let mut stmt = self.db.prepare_cached("SELECT path FROM notes WHERE path IS NOT NULL AND title = ?1 COLLATE NOCASE ORDER BY path")?;
         let rows = stmt.query_map([title], |r| r.get(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Append events returned by notes_posts (their `seq` is assigned here).
+    pub fn post_events(&mut self, events: Vec<Event>) -> R<()> {
+        for e in events {
+            self.db
+                .prepare_cached("INSERT INTO events(kind, path, version, at, ext_id, session) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?
+                .execute(params![e.kind, e.path, e.version.map(|v| v as i64), self.now, e.id, e.session])?;
+            self.events = true;
+        }
+        Ok(())
     }
 
     pub fn event(&mut self, kind: &str, path: &str, version: Option<u64>) -> R<()> {

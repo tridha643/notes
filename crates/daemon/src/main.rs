@@ -69,8 +69,29 @@ impl From<rusqlite::Error> for Fail {
     }
 }
 
-fn call(d: &Daemon, verb: &Verb, author: &str) -> R<Value> {
+fn call(d: &Daemon, verb: &Verb, author: &str, cwd: Option<&str>) -> R<Value> {
     match verb {
+        // Blocks this connection's thread on the comment condvar, outside the write lock.
+        Verb::Wait(a) => {
+            let timeout =
+                (a.timeout_secs > 0).then(|| std::time::Duration::from_secs(a.timeout_secs));
+            let found = d
+                .comments
+                .wait_for(timeout, || {
+                    d.unit(author, |tx| {
+                        notes_posts::next_user_comment(
+                            tx.db,
+                            a.session.as_deref(),
+                            a.post.as_deref(),
+                            None,
+                        )
+                        .map_err(Fail)
+                    })
+                    .map_err(|Fail(e)| e)
+                })
+                .map_err(Fail)?;
+            Ok(serde_json::to_value(found).expect("comment serializes"))
+        }
         // Lock-free: fff has its own RwLock and these never touch SQLite.
         // (A folder-scoped search goes through the unit below, which validates the folder.)
         Verb::Find(a) => Ok(serde_json::to_value(d.search.find(a)?).expect("hits serialize")),
@@ -79,13 +100,16 @@ fn call(d: &Daemon, verb: &Verb, author: &str) -> R<Value> {
         }
         Verb::Manifest => Ok(ops::manifest()),
         Verb::Batch(b) => {
-            Ok(serde_json::to_value(batch(d, b, author)).expect("outcomes serialize"))
+            Ok(serde_json::to_value(batch(d, b, author, cwd)).expect("outcomes serialize"))
         }
-        _ => d.unit(author, |tx| tx.op(verb)),
+        _ => d.unit(author, |tx| {
+            tx.cwd = cwd.map(str::to_owned);
+            tx.op(verb)
+        }),
     }
 }
 
-fn batch(d: &Daemon, b: &BatchArgs, author: &str) -> Vec<BatchOutcome> {
+fn batch(d: &Daemon, b: &BatchArgs, author: &str, cwd: Option<&str>) -> Vec<BatchOutcome> {
     let ok = |result| BatchOutcome::Ok { ok: True, result };
     let err = |Fail(error)| BatchOutcome::Err { ok: False, error };
     if !b.atomic {
@@ -94,13 +118,14 @@ fn batch(d: &Daemon, b: &BatchArgs, author: &str) -> Vec<BatchOutcome> {
             .iter()
             .map(|op| match op {
                 Verb::Batch(_) => err(fail(ErrorCode::Usage, "batches can't nest", None)),
-                op => call(d, op, author).map_or_else(err, ok),
+                op => call(d, op, author, cwd).map_or_else(err, ok),
             })
             .collect();
     }
     // One SQLite transaction and one file journal for the whole batch.
     let mut outcomes = Vec::new();
     let result = d.unit(author, |tx| {
+        tx.cwd = cwd.map(str::to_owned);
         for op in &b.ops {
             match tx.op(op) {
                 Ok(v) => outcomes.push(ok(v)),
@@ -231,7 +256,8 @@ fn serve(d: Arc<Daemon>, stream: UnixStream) {
                     .as_deref()
                     .filter(|a| !a.trim().is_empty())
                     .unwrap_or("human");
-                match call(&d, &req.verb, author) {
+                let cwd = req.cwd.as_deref().and_then(|c| c.to_str());
+                match call(&d, &req.verb, author, cwd) {
                     Ok(result) => Response::Ok {
                         id: req.id,
                         ok: True,

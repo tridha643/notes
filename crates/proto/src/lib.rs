@@ -502,6 +502,9 @@ pub struct DoctorResult {
     pub vault: PathBuf,
     pub database: PathBuf,
     pub notes: u64,
+    /// Render cache counters `{hits, misses, entries, bytes}` (hit rate = hits / (hits + misses)).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_cache: Option<Value>,
 }
 
 /// Serialize one message as a protocol line (JSON + `\n`).

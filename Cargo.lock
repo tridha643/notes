@@ -3385,6 +3385,7 @@ dependencies = [
  "blake3",
  "fff-search",
  "libc",
+ "notes-posts",
  "notes-proto",
  "rusqlite",
  "serde",
