@@ -3,3 +3,5 @@ docs/ref/
 .worktrees/
 logs/
 .claude/
+build/
+apps/Notes/.build/
