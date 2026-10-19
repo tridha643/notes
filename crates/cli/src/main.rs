@@ -17,6 +17,12 @@ use std::{
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
+use notes_proto::posts::{
+    AssetInfo, AssetKind, AssetPutArgs, Comment, CommentAnchor, CommentListArgs, CommentNewArgs,
+    DiffLayout, IdArgs, Kit, Part, PartOp, Post, PostListArgs, PostNewArgs, PostPartArgs,
+    PostShowArgs, PostSummary, PostUpdateArgs, PostWriteResult, Session, SessionRenameArgs,
+    TraceSetArgs, TraceStep, WaitArgs,
+};
 use notes_proto::{
     default_socket_path, to_line, AppendArgs, BatchArgs, BatchOutcome, DeleteArgs, DiffArgs,
     DiffResult, DoctorResult, EditArgs, ErrorBody, ErrorCode, FindArgs, FindHit, FolderArgs,
@@ -24,6 +30,7 @@ use notes_proto::{
     NoteArgs, PrependArgs, ReadArgs, Replacement, Request, Response, RevertArgs, SearchArgs,
     SearchHit, Verb, WatchArgs, WriteArgs, WriteResult, PROTOCOL_VERSION,
 };
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 #[derive(Debug, Parser)]
@@ -57,7 +64,7 @@ enum Cmd {
         #[arg(short, long)]
         recursive: bool,
         /// updated, created or title
-        #[arg(long, default_value = "updated", value_parser = parse_sort)]
+        #[arg(long, default_value = "updated", value_parser = kebab::<ListSort>)]
         sort: ListSort,
         #[arg(long)]
         limit: Option<u32>,
@@ -180,6 +187,74 @@ enum Cmd {
         #[arg(long)]
         atomic: bool,
     },
+    /// Publish a sideshow post (`post <kind> <file|->`), or update, list and show posts
+    Post {
+        /// Post title
+        #[arg(long, global = true)]
+        title: Option<String>,
+        /// Session (default: this agent's session for the cwd)
+        #[arg(long, global = true)]
+        session: Option<String>,
+        #[command(subcommand)]
+        cmd: PostCmd,
+    },
+    /// Store a file as an asset; prints its id
+    Upload {
+        file: String,
+        /// image, trace or file (default: image for image files, else file)
+        #[arg(long, value_parser = kebab::<AssetKind>)]
+        kind: Option<AssetKind>,
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Reply on a post
+    Comment {
+        post: String,
+        /// Text, or - for stdin
+        text: String,
+        /// Anchor the comment to lines A:B of a part
+        #[arg(long, value_parser = parse_lines, value_name = "A:B")]
+        line: Option<LineRange>,
+        /// Part index the --line anchor points at (default 0)
+        #[arg(long, requires = "line")]
+        part: Option<u32>,
+    },
+    /// Comments in a session or on a post
+    Comments {
+        #[arg(long)]
+        post: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        /// Only comments after this seq
+        #[arg(long, value_name = "SEQ")]
+        after: Option<u64>,
+    },
+    /// Block until the user comments, then print it
+    Wait {
+        #[arg(long)]
+        post: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        /// Seconds to wait; 0 waits forever
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+    },
+    /// List agent sessions
+    Sessions,
+    /// Rename or delete a session
+    Session {
+        #[command(subcommand)]
+        cmd: SessionCmd,
+    },
+    /// Replace a session's step trace from JSON or JSONL steps
+    Trace {
+        /// [{"label":…}] array or one step per line, or - for stdin
+        file: String,
+        #[arg(long)]
+        session: String,
+    },
+    /// List the opt-in kits for html parts
+    Kits,
     /// Every verb, its args, output schema and exit codes, as JSON
     Manifest,
     /// Socket and database paths, daemon reachable, versions
@@ -189,6 +264,122 @@ enum Cmd {
     /// Shell completion script
     Completions { shell: Shell },
 }
+
+#[derive(Debug, Subcommand)]
+enum PostCmd {
+    #[command(flatten)]
+    New(PartKind),
+    /// New version of a post (same card): a new title and/or this one part
+    Update {
+        id: String,
+        #[command(subcommand)]
+        part: Option<PartKind>,
+    },
+    /// Add, replace or remove one part
+    Part {
+        id: String,
+        #[command(subcommand)]
+        op: PartCmd,
+    },
+    /// List posts
+    List {
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Show a post and its parts
+    Show {
+        id: String,
+        #[arg(long)]
+        version: Option<u64>,
+    },
+    /// Delete a post
+    Delete { id: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum PartCmd {
+    /// Insert a part (default: at the end)
+    Add {
+        /// Insert position: index or part id
+        #[arg(long, global = true, value_name = "N")]
+        at: Option<String>,
+        #[command(subcommand)]
+        part: PartKind,
+    },
+    /// Replace part N (index or part id)
+    Set {
+        target: String,
+        #[command(subcommand)]
+        part: PartKind,
+    },
+    /// Remove part N (index or part id)
+    Rm { target: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionCmd {
+    Rename { id: String, title: String },
+    Delete { id: String },
+}
+
+/// One post part read from a file, or - for stdin.
+#[derive(Debug, Subcommand)]
+enum PartKind {
+    /// Markdown prose
+    Markdown { file: String },
+    /// Source code; the language comes from the file extension
+    Code {
+        file: String,
+        #[arg(long)]
+        language: Option<String>,
+        /// Label in the code header (default: the file name)
+        #[arg(long)]
+        filename: Option<String>,
+        /// Line number the excerpt starts at
+        #[arg(long)]
+        line_start: Option<u32>,
+    },
+    /// A unified or git patch
+    Diff {
+        file: String,
+        /// unified or split
+        #[arg(long, default_value = "unified", value_parser = kebab::<DiffLayout>)]
+        layout: DiffLayout,
+    },
+    /// Terminal output; ANSI colors are kept
+    Terminal {
+        file: String,
+        #[arg(long)]
+        cols: Option<u32>,
+        /// Label in the terminal window chrome
+        #[arg(long)]
+        term_title: Option<String>,
+    },
+    /// Any JSON, shown as a collapsible tree
+    Json { file: String },
+    /// Mermaid diagram source
+    Mermaid { file: String },
+    /// An image file, uploaded as an asset first
+    Image {
+        file: String,
+        #[arg(long)]
+        caption: Option<String>,
+        #[arg(long)]
+        alt: Option<String>,
+    },
+    /// A trace file, uploaded as an asset first
+    Trace { file: String },
+    /// Sandboxed HTML
+    Html {
+        file: String,
+        /// Opt into a kit (repeatable; see `notes kits`)
+        #[arg(long, value_delimiter = ',')]
+        kit: Vec<String>,
+    },
+}
+
+/// Lets `to_verb` make a request whose result it needs (asset upload, post version).
+type Ask<'a> = dyn FnMut(Verb) -> Result<Value, ErrorBody> + 'a;
 
 const AGENT_HOWTO: &str = r#"## Notes (`notes` CLI)
 
@@ -209,11 +400,16 @@ through `notes`, not by editing files: writes are atomic, versioned and checked.
 - `--json` prints machine output (NDJSON for lists). Exit codes: 0 ok, 2 usage,
   3 not found, 4 ambiguous (be more specific), 5 version conflict (re-read, retry),
   6 notesd unreachable. Errors print a `hint:` line on stderr.
+- Show the user something: `notes post markdown|code|diff|terminal|json|mermaid|image|html
+  <file|-> [--title T]`; revise with `notes post update <id> <kind> <file|->`.
+  User replies print on stderr as `feedback:` lines after post writes; block
+  for the next one with `notes wait`.
 - Set `NOTES_AGENT=<your name>` so history records you as the author.
 "#;
 
-fn parse_sort(s: &str) -> Result<ListSort, String> {
-    serde_json::from_value(Value::from(s)).map_err(|_| "expected updated, created or title".into())
+/// Parse a flag value as one of a proto enum's kebab-case names.
+fn kebab<T: DeserializeOwned>(s: &str) -> Result<T, String> {
+    serde_json::from_value(Value::from(s)).map_err(|e| e.to_string())
 }
 
 fn parse_lines(s: &str) -> Result<LineRange, String> {
@@ -259,7 +455,229 @@ fn text_arg(arg: String, stdin: &mut dyn Read) -> Result<String, ErrorBody> {
     }
 }
 
-fn to_verb(cmd: Cmd, if_version: Option<u64>, stdin: &mut dyn Read) -> Result<Verb, ErrorBody> {
+/// Standard padded base64 (RFC 4648) for asset uploads.
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, &b)| n | (u32::from(b) << (16 - 8 * i)));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() {
+                ABC[((n >> (18 - 6 * i)) & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
+
+/// Language id for a code part, from the file extension (sideshow's table).
+fn language_for(file: &str) -> Option<String> {
+    let ext = Path::new(file).extension()?.to_str()?.to_ascii_lowercase();
+    let language = match ext.as_str() {
+        "ts" | "mts" | "cts" => "typescript",
+        "tsx" => "tsx",
+        "js" | "mjs" | "cjs" => "javascript",
+        "jsx" => "jsx",
+        "py" => "python",
+        "rb" => "ruby",
+        "go" => "go",
+        "rs" => "rust",
+        "java" => "java",
+        "kt" => "kotlin",
+        "swift" => "swift",
+        "c" | "h" => "c",
+        "cpp" | "cc" | "hpp" => "cpp",
+        "cs" => "csharp",
+        "php" => "php",
+        "sh" | "bash" | "zsh" | "fish" => "bash",
+        "yml" | "yaml" => "yaml",
+        "toml" => "toml",
+        "json" | "jsonl" => "json",
+        "html" | "htm" => "html",
+        "css" => "css",
+        "scss" => "scss",
+        "sql" => "sql",
+        "md" | "markdown" => "markdown",
+        "lua" => "lua",
+        _ => return None,
+    };
+    Some(language.into())
+}
+
+fn content_type_for(file: &str) -> &'static str {
+    let ext = Path::new(file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("json") => "application/json",
+        Some("jsonl" | "ndjson") => "application/x-ndjson",
+        Some("txt" | "log") => "text/plain",
+        Some("md") => "text/markdown",
+        Some("html" | "htm") => "text/html",
+        Some("pdf") => "application/pdf",
+        _ => "application/octet-stream",
+    }
+}
+
+fn asset_put(
+    file: &str,
+    kind: Option<AssetKind>,
+    session: Option<String>,
+) -> Result<Verb, ErrorBody> {
+    if file == "-" {
+        return Err(fail(
+            ErrorCode::Usage,
+            "uploads read a file, not stdin",
+            "save the bytes to a file and pass its path",
+        ));
+    }
+    let bytes = fs::read(file).map_err(|e| {
+        fail(
+            ErrorCode::Other,
+            format!("can't read {file}: {e}"),
+            "check the path",
+        )
+    })?;
+    let content_type = content_type_for(file);
+    let default_kind = if content_type.starts_with("image/") {
+        AssetKind::Image
+    } else {
+        AssetKind::File
+    };
+    Ok(Verb::AssetPut(AssetPutArgs {
+        session,
+        kind: kind.unwrap_or(default_kind),
+        content_type: content_type.into(),
+        filename: Path::new(file)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned()),
+        data_base64: base64(&bytes),
+    }))
+}
+
+/// Build one post part; image and trace files are uploaded as assets first.
+fn build_part(
+    kind: PartKind,
+    session: &Option<String>,
+    stdin: &mut dyn Read,
+    ask: &mut Ask<'_>,
+) -> Result<Part, ErrorBody> {
+    let mut upload = |file: &str, kind| -> Result<String, ErrorBody> {
+        let info = ask(asset_put(file, Some(kind), session.clone())?)?;
+        serde_json::from_value::<AssetInfo>(info)
+            .map(|info| info.id)
+            .map_err(bad)
+    };
+    Ok(match kind {
+        PartKind::Markdown { file } => Part::Markdown {
+            markdown: read_all(&file, stdin)?,
+            id: None,
+        },
+        PartKind::Code {
+            file,
+            language,
+            filename,
+            line_start,
+        } => Part::Code {
+            code: read_all(&file, stdin)?,
+            language: language.or_else(|| language_for(&file)),
+            title: filename.or_else(|| {
+                (file != "-")
+                    .then(|| Path::new(&file).file_name())
+                    .flatten()
+                    .map(|n| n.to_string_lossy().into_owned())
+            }),
+            line_start,
+            id: None,
+        },
+        PartKind::Diff { file, layout } => Part::Diff {
+            patch: Some(read_all(&file, stdin)?),
+            files: Vec::new(),
+            layout,
+            id: None,
+        },
+        PartKind::Terminal {
+            file,
+            cols,
+            term_title,
+        } => Part::Terminal {
+            text: read_all(&file, stdin)?,
+            cols,
+            title: term_title,
+            id: None,
+        },
+        PartKind::Json { file } => Part::Json {
+            data: serde_json::from_str(&read_all(&file, stdin)?).map_err(|e| {
+                fail(
+                    ErrorCode::Usage,
+                    format!("bad JSON in {file}: {e}"),
+                    "a json part takes any valid JSON value",
+                )
+            })?,
+            id: None,
+        },
+        PartKind::Mermaid { file } => Part::Mermaid {
+            mermaid: read_all(&file, stdin)?,
+            id: None,
+        },
+        PartKind::Image { file, caption, alt } => Part::Image {
+            asset_id: upload(&file, AssetKind::Image)?,
+            alt,
+            caption,
+            id: None,
+        },
+        PartKind::Trace { file } => Part::Trace {
+            steps: Vec::new(),
+            asset_id: Some(upload(&file, AssetKind::Trace)?),
+            title: None,
+            id: None,
+        },
+        PartKind::Html { file, kit } => Part::Html {
+            html: read_all(&file, stdin)?,
+            kits: kit,
+            id: None,
+        },
+    })
+}
+
+/// Trace steps from a JSON array, or JSONL with one step per line.
+fn trace_steps(input: &str) -> Result<Vec<TraceStep>, ErrorBody> {
+    if let Ok(steps) = serde_json::from_str(input) {
+        return Ok(steps);
+    }
+    input
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(i, line)| {
+            serde_json::from_str(line).map_err(|e| {
+                fail(
+                    ErrorCode::Usage,
+                    format!("trace line {}: {e}", i + 1),
+                    r#"pass a JSON array, or one {"label":…} step per line"#,
+                )
+            })
+        })
+        .collect()
+}
+
+fn to_verb(
+    cmd: Cmd,
+    if_version: Option<u64>,
+    stdin: &mut dyn Read,
+    ask: &mut Ask<'_>,
+) -> Result<Verb, ErrorBody> {
     if if_version.is_some()
         && !matches!(
             cmd,
@@ -392,12 +810,188 @@ fn to_verb(cmd: Cmd, if_version: Option<u64>, stdin: &mut dyn Read) -> Result<Ve
                 .collect::<Result<_, _>>()?;
             Verb::Batch(BatchArgs { ops, atomic })
         }
+        Cmd::Post {
+            title,
+            session,
+            cmd,
+        } => match cmd {
+            PostCmd::New(kind) => Verb::PostNew(PostNewArgs {
+                parts: vec![build_part(kind, &session, stdin, ask)?],
+                session,
+                title,
+            }),
+            PostCmd::Update { id, part } => Verb::PostUpdate(PostUpdateArgs {
+                id,
+                title,
+                parts: part
+                    .map(|p| build_part(p, &session, stdin, ask).map(|p| vec![p]))
+                    .transpose()?,
+            }),
+            PostCmd::Part { id, op } => {
+                let (op, target, part) = match op {
+                    PartCmd::Add { at, part } => (PartOp::Add, at, Some(part)),
+                    PartCmd::Set { target, part } => (PartOp::Set, Some(target), Some(part)),
+                    PartCmd::Rm { target } => (PartOp::Rm, Some(target), None),
+                };
+                let part = part
+                    .map(|p| build_part(p, &session, stdin, ask))
+                    .transpose()?;
+                Verb::PostPart(PostPartArgs {
+                    id,
+                    op,
+                    target,
+                    part,
+                })
+            }
+            PostCmd::List { limit } => Verb::PostList(PostListArgs { session, limit }),
+            PostCmd::Show { id, version } => Verb::PostShow(PostShowArgs { id, version }),
+            PostCmd::Delete { id } => Verb::PostDelete(IdArgs { id }),
+        },
+        Cmd::Upload {
+            file,
+            kind,
+            session,
+        } => asset_put(&file, kind, session)?,
+        Cmd::Comment {
+            post,
+            text,
+            line,
+            part,
+        } => {
+            let anchor = match line {
+                None => None,
+                Some(lines) => {
+                    // An anchor pins a post version, so look up the current one.
+                    let shown = ask(Verb::PostShow(PostShowArgs {
+                        id: post.clone(),
+                        version: None,
+                    }))?;
+                    let post_version = shown["version"]
+                        .as_u64()
+                        .ok_or_else(|| bad("post-show result has no version"))?;
+                    Some(CommentAnchor::LineRange {
+                        part: part.unwrap_or(0),
+                        post_version,
+                        start_line: lines.start,
+                        end_line: lines.end,
+                        file: None,
+                    })
+                }
+            };
+            Verb::CommentNew(CommentNewArgs {
+                post: Some(post),
+                session: None,
+                text: text_arg(text, stdin)?,
+                anchor,
+                author: None,
+            })
+        }
+        Cmd::Comments {
+            post,
+            session,
+            after,
+        } => Verb::CommentList(CommentListArgs {
+            session,
+            post,
+            after_seq: after,
+        }),
+        Cmd::Wait {
+            post,
+            session,
+            timeout,
+        } => Verb::Wait(WaitArgs {
+            session,
+            post,
+            timeout_secs: timeout,
+        }),
+        Cmd::Sessions => Verb::SessionList,
+        Cmd::Session {
+            cmd: SessionCmd::Rename { id, title },
+        } => Verb::SessionRename(SessionRenameArgs { id, title }),
+        Cmd::Session {
+            cmd: SessionCmd::Delete { id },
+        } => Verb::SessionDelete(IdArgs { id }),
+        Cmd::Trace { file, session } => Verb::TraceSet(TraceSetArgs {
+            session,
+            steps: trace_steps(&read_all(&file, stdin)?)?,
+        }),
+        Cmd::Kits => Verb::Kits,
         Cmd::Manifest => Verb::Manifest,
         Cmd::Doctor => Verb::Doctor,
         Cmd::AgentHowto | Cmd::Completions { .. } => {
             unreachable!("offline verbs are handled in main")
         }
     })
+}
+
+fn unreachable(sock: &Path, e: io::Error) -> ErrorBody {
+    let hint = match e.kind() {
+        io::ErrorKind::NotFound => "no socket, so notesd isn't running: start `notesd` (or check its launchd job with `launchctl list | grep notesd`), or point --sock / NOTES_SOCK at its socket",
+        io::ErrorKind::ConnectionRefused => "stale socket, nothing is listening: restart notesd (`launchctl list | grep notesd` shows its job)",
+        _ => "start notesd, or point --sock / NOTES_SOCK at its socket",
+    };
+    fail(
+        ErrorCode::DaemonUnreachable,
+        format!("notesd unreachable at {}: {e}", sock.display()),
+        hint,
+    )
+}
+
+fn bad(e: impl std::fmt::Display) -> ErrorBody {
+    fail(
+        ErrorCode::Other,
+        format!("bad response from notesd: {e}"),
+        "the CLI and notesd may speak different protocol versions; run `notes doctor`",
+    )
+}
+
+fn closed() -> ErrorBody {
+    fail(
+        ErrorCode::Other,
+        "notesd closed the connection without a response",
+        "run `notes doctor`",
+    )
+}
+
+/// Connect and send one request line.
+fn send(sock: &Path, request: &Request) -> Result<BufReader<UnixStream>, ErrorBody> {
+    let mut stream = UnixStream::connect(sock).map_err(|e| unreachable(sock, e))?;
+    stream
+        .write_all(to_line(request).as_bytes())
+        .map_err(|e| unreachable(sock, e))?;
+    Ok(BufReader::new(stream))
+}
+
+/// Read one response line; `None` once the daemon closes the connection.
+fn receive(
+    reader: &mut BufReader<UnixStream>,
+    sock: &Path,
+    line: &mut String,
+) -> Result<Option<Response>, ErrorBody> {
+    line.clear();
+    if reader.read_line(line).map_err(|e| unreachable(sock, e))? == 0 {
+        return Ok(None);
+    }
+    serde_json::from_str(line).map(Some).map_err(bad)
+}
+
+/// One request whose result the CLI needs before the main one.
+fn ask(sock: &Path, request: &Request) -> Result<Value, ErrorBody> {
+    match receive(&mut send(sock, request)?, sock, &mut String::new())? {
+        Some(Response::Ok { result, .. }) => Ok(result),
+        Some(Response::Err { error, .. }) => Err(error),
+        Some(Response::Event { .. }) | None => Err(closed()),
+    }
+}
+
+/// One comment on one line: `#seq author on post ID: text`.
+fn comment_line(c: &Comment) -> String {
+    let text = c.text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let on = c
+        .post
+        .as_deref()
+        .map_or_else(|| "the session".into(), |p| format!("post {p}"));
+    format!("#{} {} on {on}: {text}", c.seq, c.author)
 }
 
 /// Send one request and print what comes back; events stream until the daemon closes.
@@ -409,45 +1003,16 @@ fn call(
     quiet: bool,
     number: bool,
 ) -> Result<u8, ErrorBody> {
-    let unreachable = |e: io::Error| {
-        let hint = match e.kind() {
-            io::ErrorKind::NotFound => "no socket, so notesd isn't running: start `notesd` (or check its launchd job with `launchctl list | grep notesd`), or point --sock / NOTES_SOCK at its socket",
-            io::ErrorKind::ConnectionRefused => "stale socket, nothing is listening: restart notesd (`launchctl list | grep notesd` shows its job)",
-            _ => "start notesd, or point --sock / NOTES_SOCK at its socket",
-        };
-        fail(
-            ErrorCode::DaemonUnreachable,
-            format!("notesd unreachable at {}: {e}", sock.display()),
-            hint,
-        )
-    };
-    let mut stream = UnixStream::connect(sock).map_err(unreachable)?;
-    stream
-        .write_all(to_line(request).as_bytes())
-        .map_err(unreachable)?;
-    let mut reader = BufReader::new(stream);
+    let mut reader = send(sock, request)?;
     let mut out = io::stdout().lock();
     let mut line = String::new();
     loop {
-        line.clear();
-        if reader.read_line(&mut line).map_err(unreachable)? == 0 {
+        let Some(response) = receive(&mut reader, sock, &mut line)? else {
             if matches!(request.verb, Verb::Watch(_)) {
                 return Ok(0);
             }
-            return Err(fail(
-                ErrorCode::Other,
-                "notesd closed the connection without a response",
-                "run `notes doctor`",
-            ));
-        }
-        let bad = |e: serde_json::Error| {
-            fail(
-                ErrorCode::Other,
-                format!("bad response from notesd: {e}"),
-                "the CLI and notesd may speak different protocol versions; run `notes doctor`",
-            )
+            return Err(closed());
         };
-        let response = serde_json::from_str(&line).map_err(bad)?;
         match response {
             Response::Event { event, .. } => {
                 // A closed stdout (e.g. `notes watch | head`) ends the stream quietly.
@@ -468,6 +1033,17 @@ fn call(
                 } else {
                     Vec::new()
                 };
+                // User replies ride on post writes and the daemon hands each out
+                // once, so they go to stderr even with -q or --json.
+                if matches!(
+                    request.verb,
+                    Verb::PostNew(_) | Verb::PostUpdate(_) | Verb::PostPart(_)
+                ) {
+                    let feedback = result.get("feedback").cloned().unwrap_or_default();
+                    for c in serde_json::from_value::<Vec<Comment>>(feedback).unwrap_or_default() {
+                        eprintln!("feedback: {}", comment_line(&c));
+                    }
+                }
                 if !quiet {
                     let _ = out.write_all(render(&request.verb, result, json, number).as_bytes());
                     let _ = out.flush();
@@ -588,6 +1164,54 @@ fn text(verb: &Verb, result: &Value, number: bool) -> Option<String> {
             _ = writeln!(out, "notes     {}", d.notes);
         }
         Verb::Manifest => out = serde_json::to_string_pretty(result).ok()? + "\n",
+        Verb::PostNew(_) | Verb::PostUpdate(_) | Verb::PostPart(_) => {
+            let w: PostWriteResult = serde_json::from_value(result.clone()).ok()?;
+            _ = writeln!(out, "{} v{}", w.post.id, w.post.version);
+        }
+        Verb::PostList(_) => {
+            for p in serde_json::from_value::<Vec<PostSummary>>(result.clone()).ok()? {
+                let kinds = p.kinds.join(",");
+                _ = writeln!(out, "{}\tv{}\t{kinds}\t{}", p.id, p.version, p.title);
+            }
+        }
+        Verb::PostShow(_) => {
+            let post: Post = serde_json::from_value(result.clone()).ok()?;
+            _ = writeln!(out, "{}\tv{}\t{}", post.id, post.version, post.title);
+            for (i, part) in post.parts.iter().enumerate() {
+                let part = serde_json::to_value(part).ok()?;
+                let id = part["id"].as_str().unwrap_or("-");
+                _ = writeln!(out, "  {i}\t{}\t{id}", part["kind"].as_str()?);
+            }
+        }
+        Verb::AssetPut(_) => {
+            let info: AssetInfo = serde_json::from_value(result.clone()).ok()?;
+            _ = writeln!(out, "{}", info.id);
+        }
+        Verb::CommentNew(_) | Verb::Wait(_) if !result.is_null() => {
+            let c: Comment = serde_json::from_value(result.clone()).ok()?;
+            _ = writeln!(out, "{}", comment_line(&c));
+        }
+        Verb::CommentList(_) => {
+            for c in serde_json::from_value::<Vec<Comment>>(result.clone()).ok()? {
+                _ = writeln!(out, "{}", comment_line(&c));
+            }
+        }
+        Verb::SessionList => {
+            for s in serde_json::from_value::<Vec<Session>>(result.clone()).ok()? {
+                let title = s.title.as_deref().unwrap_or("");
+                let active = utc(s.last_active_at);
+                _ = writeln!(
+                    out,
+                    "{}\t{}\t{} posts\t{active}\t{title}",
+                    s.id, s.agent, s.post_count
+                );
+            }
+        }
+        Verb::Kits => {
+            for k in serde_json::from_value::<Vec<Kit>>(result.clone()).ok()? {
+                _ = writeln!(out, "{}\t{}: {}", k.id, k.label, k.summary);
+            }
+        }
         _ => match result {
             Value::Null => {}
             Value::String(s) => _ = writeln!(out, "{s}"),
@@ -663,16 +1287,21 @@ fn main() -> ExitCode {
     }
     let number = matches!(cli.cmd, Cmd::Read { number: true, .. });
     let sock = cli.sock.unwrap_or_else(default_socket_path);
-    let outcome = to_verb(cli.cmd, cli.if_version, &mut io::stdin()).and_then(|verb| {
-        let request = Request {
-            v: PROTOCOL_VERSION,
-            id: 1,
-            verb,
-            cwd: env::current_dir().ok(),
-            agent: env::var("NOTES_AGENT").ok().filter(|a| !a.is_empty()),
-        };
-        call(&sock, &request, cli.json, cli.quiet, number)
-    });
+    let (cwd, agent) = (
+        env::current_dir().ok(),
+        env::var("NOTES_AGENT").ok().filter(|a| !a.is_empty()),
+    );
+    let request = |verb| Request {
+        v: PROTOCOL_VERSION,
+        id: 1,
+        verb,
+        cwd: cwd.clone(),
+        agent: agent.clone(),
+    };
+    let outcome = to_verb(cli.cmd, cli.if_version, &mut io::stdin(), &mut |verb| {
+        ask(&sock, &request(verb))
+    })
+    .and_then(|verb| call(&sock, &request(verb), cli.json, cli.quiet, number));
     match outcome {
         Ok(code) => ExitCode::from(code),
         Err(error) => ExitCode::from(report(&error, cli.json)),
@@ -686,7 +1315,9 @@ mod tests {
     fn verb(args: &[&str], stdin: &str) -> Result<Verb, ErrorBody> {
         let cli =
             Cli::try_parse_from(std::iter::once("notes").chain(args.iter().copied())).unwrap();
-        to_verb(cli.cmd, cli.if_version, &mut stdin.as_bytes())
+        to_verb(cli.cmd, cli.if_version, &mut stdin.as_bytes(), &mut |_| {
+            panic!("unit tests have no daemon")
+        })
     }
 
     fn usage_code(args: &[&str]) -> ErrorCode {
@@ -864,6 +1495,82 @@ mod tests {
         );
         let err = verb(&["batch"], "{\"verb\":\"doctor\"}\nnope\n").unwrap_err();
         assert!(err.message.starts_with("batch line 2:"), "{}", err.message);
+    }
+
+    #[test]
+    fn post_args() {
+        assert_eq!(
+            verb(&["post", "markdown", "-", "--title", "Plan"], "# Hi").unwrap(),
+            Verb::PostNew(PostNewArgs {
+                session: None,
+                title: Some("Plan".into()),
+                parts: vec![Part::Markdown {
+                    markdown: "# Hi".into(),
+                    id: None
+                }]
+            })
+        );
+        assert_eq!(
+            verb(
+                &["post", "part", "p1", "add", "--at", "0", "diff", "-", "--layout", "split"],
+                "--- a\n"
+            )
+            .unwrap(),
+            Verb::PostPart(PostPartArgs {
+                id: "p1".into(),
+                op: PartOp::Add,
+                target: Some("0".into()),
+                part: Some(Part::Diff {
+                    patch: Some("--- a\n".into()),
+                    files: vec![],
+                    layout: DiffLayout::Split,
+                    id: None
+                })
+            })
+        );
+        assert_eq!(
+            verb(&["post", "update", "p1", "--title", "New"], "").unwrap(),
+            Verb::PostUpdate(PostUpdateArgs {
+                id: "p1".into(),
+                title: Some("New".into()),
+                parts: None
+            })
+        );
+        assert_eq!(
+            verb(&["post", "json", "-"], "{oops").unwrap_err().code,
+            ErrorCode::Usage
+        );
+        assert!(Cli::try_parse_from(["notes", "post", "gif", "x"]).is_err());
+        assert!(Cli::try_parse_from(["notes", "comment", "p1", "hi", "--part", "1"]).is_err());
+    }
+
+    #[test]
+    fn base64_trace_steps_and_languages() {
+        let vectors = [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ];
+        for (plain, encoded) in vectors {
+            assert_eq!(base64(plain.as_bytes()), encoded);
+        }
+        assert_eq!(base64(&[0xff, 0xfe, 0x00]), "//4A");
+        let array = trace_steps(r#"[{"label":"a"},{"label":"b","kind":"tool"}]"#).unwrap();
+        let jsonl =
+            trace_steps("{\"label\":\"a\"}\n\n{\"label\":\"b\",\"kind\":\"tool\"}\n").unwrap();
+        assert_eq!(array, jsonl);
+        assert_eq!(array[1].kind.as_deref(), Some("tool"));
+        assert!(trace_steps("{\"label\":\"a\"}\nnope\n")
+            .unwrap_err()
+            .message
+            .starts_with("trace line 2:"));
+        assert_eq!(language_for("src/Main.RS").as_deref(), Some("rust"));
+        assert_eq!(language_for("-"), None);
+        assert_eq!(content_type_for("a.PNG"), "image/png");
     }
 
     #[test]

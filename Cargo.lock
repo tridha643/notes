@@ -3317,6 +3317,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "notes-proto",
+ "serde",
  "serde_json",
 ]
 

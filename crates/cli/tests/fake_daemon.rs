@@ -12,13 +12,27 @@ use std::{
 };
 
 struct Run {
+    /// The last request line; `requests` has every connection's, in order.
     request: String,
+    requests: Vec<String>,
     cwd: PathBuf,
     out: Output,
 }
 
 /// Serve one connection: read its request line, reply with `responses`, close.
 fn notes(args: &[&str], stdin: &str, responses: &[&str]) -> Run {
+    serve(args, stdin, &[responses])
+}
+
+/// A file outside the run's cwd for verbs that read one (image, trace, upload).
+fn temp_file(name: &str, bytes: &[u8]) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("notes-cli-{}-{name}", std::process::id()));
+    fs::write(&path, bytes).unwrap();
+    path
+}
+
+/// Serve one connection per `conns` entry, each replying with its responses.
+fn serve(args: &[&str], stdin: &str, conns: &[&[&str]]) -> Run {
     static N: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "notes-cli-{}-{}",
@@ -29,15 +43,23 @@ fn notes(args: &[&str], stdin: &str, responses: &[&str]) -> Run {
     let dir = dir.canonicalize().unwrap();
     let sock = dir.join("d.sock");
     let listener = UnixListener::bind(&sock).unwrap();
-    let responses: Vec<String> = responses.iter().map(|r| format!("{r}\n")).collect();
-    let daemon: JoinHandle<String> = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut request = String::new();
-        BufReader::new(&stream).read_line(&mut request).unwrap();
-        for response in responses {
-            (&stream).write_all(response.as_bytes()).unwrap();
-        }
-        request
+    let conns: Vec<Vec<String>> = conns
+        .iter()
+        .map(|responses| responses.iter().map(|r| format!("{r}\n")).collect())
+        .collect();
+    let daemon: JoinHandle<Vec<String>> = thread::spawn(move || {
+        conns
+            .into_iter()
+            .map(|responses| {
+                let (stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(&stream).read_line(&mut request).unwrap();
+                for response in responses {
+                    (&stream).write_all(response.as_bytes()).unwrap();
+                }
+                request
+            })
+            .collect()
     });
     let mut child = Command::new(env!("CARGO_BIN_EXE_notes"))
         .args(args)
@@ -57,10 +79,11 @@ fn notes(args: &[&str], stdin: &str, responses: &[&str]) -> Run {
         .write_all(stdin.as_bytes())
         .unwrap();
     let out = child.wait_with_output().unwrap();
-    let request = daemon.join().unwrap();
+    let requests = daemon.join().unwrap();
     fs::remove_dir_all(&dir).unwrap();
     Run {
-        request,
+        request: requests.last().cloned().unwrap_or_default(),
+        requests,
         cwd: dir,
         out,
     }
@@ -348,4 +371,234 @@ fn unreachable_socket_exits_6() {
         stderr.contains("\nhint: stale socket, nothing is listening"),
         "{stderr}"
     );
+}
+
+/// The full request line the CLI sends for `verb_and_args` from the run's cwd.
+fn line(run: &Run, verb_and_args: &str) -> String {
+    format!(
+        r#"{{"v":1,"id":1,{verb_and_args},"cwd":"{}","agent":"tester"}}"#,
+        run.cwd.display()
+    ) + "\n"
+}
+
+fn ok(result: &str) -> String {
+    format!(r#"{{"id":1,"ok":true,"result":{result}}}"#)
+}
+
+const POST_WRITE: &str = r#"{"post":{"id":"p1","session":"s1","title":"Plan","kinds":["markdown"],"version":1,"updated_at":0}}"#;
+
+#[test]
+fn post_prints_id_and_user_feedback_on_stderr() {
+    let result = r#"{"post":{"id":"p1","session":"s1","title":"Plan","kinds":["markdown"],"version":1,"updated_at":0},"feedback":[{"id":"c7","seq":7,"session":"s1","post":"p1","author":"user","text":"looks\n  good","created_at":0}]}"#;
+    let run = notes(
+        &["post", "markdown", "-", "--title", "Plan"],
+        "# Hi\n",
+        &[&ok(result)],
+    );
+    assert_eq!(
+        run.request,
+        line(
+            &run,
+            r##""verb":"post-new","args":{"title":"Plan","parts":[{"kind":"markdown","markdown":"# Hi\n"}]}"##
+        )
+    );
+    assert_eq!(stdout(&run), "p1 v1\n");
+    assert_eq!(stderr(&run), "feedback: #7 user on post p1: looks good\n");
+    assert_eq!(run.out.status.code(), Some(0));
+
+    // Feedback is handed out once, so -q doesn't swallow it.
+    let quiet = notes(&["post", "markdown", "-", "-q"], "x", &[&ok(result)]);
+    assert_eq!(stdout(&quiet), "");
+    assert_eq!(stderr(&quiet), "feedback: #7 user on post p1: looks good\n");
+}
+
+#[test]
+fn post_image_uploads_the_asset_then_posts_it() {
+    let file = temp_file("shot.png", b"\x89PNG");
+    let name = file.file_name().unwrap().to_str().unwrap().to_owned();
+    let asset =
+        r#"{"id":"sha1","kind":"image","content_type":"image/png","byte_length":4,"created_at":0}"#;
+    let run = serve(
+        &[
+            "post",
+            "image",
+            file.to_str().unwrap(),
+            "--caption",
+            "C",
+            "--session",
+            "s1",
+        ],
+        "",
+        &[&[&ok(asset)], &[&ok(POST_WRITE)]],
+    );
+    fs::remove_file(&file).unwrap();
+    assert_eq!(
+        run.requests[0],
+        line(
+            &run,
+            &format!(
+                r#""verb":"asset-put","args":{{"session":"s1","kind":"image","content_type":"image/png","filename":"{name}","data_base64":"iVBORw=="}}"#
+            )
+        )
+    );
+    assert_eq!(
+        run.requests[1],
+        line(
+            &run,
+            r#""verb":"post-new","args":{"session":"s1","parts":[{"kind":"image","asset_id":"sha1","caption":"C"}]}"#
+        )
+    );
+    assert_eq!(stdout(&run), "p1 v1\n");
+}
+
+#[test]
+fn post_update_code_infers_language_and_title() {
+    let file = temp_file("x.rs", b"fn main() {}\n");
+    let name = file.file_name().unwrap().to_str().unwrap().to_owned();
+    let run = notes(
+        &[
+            "post",
+            "update",
+            "p1",
+            "code",
+            file.to_str().unwrap(),
+            "--line-start",
+            "3",
+        ],
+        "",
+        &[&ok(POST_WRITE)],
+    );
+    fs::remove_file(&file).unwrap();
+    assert_eq!(
+        run.request,
+        line(
+            &run,
+            &format!(
+                r#""verb":"post-update","args":{{"id":"p1","parts":[{{"kind":"code","code":"fn main() {{}}\n","language":"rust","title":"{name}","line_start":3}}]}}"#
+            )
+        )
+    );
+}
+
+#[test]
+fn comment_line_anchor_pins_the_current_post_version() {
+    let post = r#"{"id":"p1","session":"s1","title":"t","parts":[],"version":3,"created_at":0,"updated_at":0}"#;
+    let comment = r#"{"id":"c8","seq":8,"session":"s1","post":"p1","author":"tester","text":"fix this","created_at":0}"#;
+    let run = serve(
+        &["comment", "p1", "fix this", "--line", "4:9"],
+        "",
+        &[&[&ok(post)], &[&ok(comment)]],
+    );
+    assert_eq!(
+        run.requests[0],
+        line(&run, r#""verb":"post-show","args":{"id":"p1"}"#)
+    );
+    assert_eq!(
+        run.requests[1],
+        line(
+            &run,
+            r#""verb":"comment-new","args":{"post":"p1","text":"fix this","anchor":{"kind":"line-range","part":0,"post_version":3,"start_line":4,"end_line":9}}"#
+        )
+    );
+    assert_eq!(stdout(&run), "#8 tester on post p1: fix this\n");
+
+    // A failed lookup stops before the comment is sent.
+    let missing = r#"{"id":1,"ok":false,"error":{"code":"not_found","message":"no post p9"}}"#;
+    let run = notes(&["comment", "p9", "x", "--line", "1:1"], "", &[missing]);
+    assert_eq!(run.requests.len(), 1);
+    assert_eq!(run.out.status.code(), Some(3));
+}
+
+#[test]
+fn sideshow_verbs_send_exact_requests_and_print_text() {
+    let upload = temp_file("notes.txt", b"hi");
+    let upload_name = upload.file_name().unwrap().to_str().unwrap().to_owned();
+    let comment = |seq: u32, text: &str| {
+        format!(
+            r#"{{"id":"c{seq}","seq":{seq},"session":"s1","post":"p1","author":"user","text":"{text}","created_at":0}}"#
+        )
+    };
+    let cases: Vec<(Vec<&str>, &str, String, String, String)> = vec![
+        (vec!["wait", "--post", "p1", "--timeout", "5"], "", r#""verb":"wait","args":{"post":"p1","timeout_secs":5}"#.into(), comment(9, "ship it"), "#9 user on post p1: ship it\n".into()),
+        (vec!["wait"], "", r#""verb":"wait","args":{"timeout_secs":120}"#.into(), "null".into(), "".into()),
+        (
+            vec!["comments", "--session", "s1", "--after", "3"],
+            "",
+            r#""verb":"comment-list","args":{"session":"s1","after_seq":3}"#.into(),
+            format!("[{},{}]", comment(4, "a"), comment(5, "b")),
+            "#4 user on post p1: a\n#5 user on post p1: b\n".into(),
+        ),
+        (
+            vec!["sessions"],
+            "",
+            r#""verb":"session-list""#.into(),
+            r#"[{"id":"s1","agent":"claude","title":"Fix","created_at":0,"last_active_at":0,"post_count":2}]"#.into(),
+            "s1\tclaude\t2 posts\t1970-01-01 00:00Z\tFix\n".into(),
+        ),
+        (vec!["session", "rename", "s1", "New name"], "", r#""verb":"session-rename","args":{"id":"s1","title":"New name"}"#.into(), "null".into(), "".into()),
+        (vec!["session", "delete", "s1"], "", r#""verb":"session-delete","args":{"id":"s1"}"#.into(), "null".into(), "".into()),
+        (vec!["kits"], "", r#""verb":"kits""#.into(), r#"[{"id":"slides","label":"Slides","summary":"Deck","css":""}]"#.into(), "slides\tSlides: Deck\n".into()),
+        (
+            vec!["trace", "-", "--session", "s1"],
+            "{\"label\":\"read\"}\n{\"label\":\"edit\",\"kind\":\"tool\"}\n",
+            r#""verb":"trace-set","args":{"session":"s1","steps":[{"label":"read"},{"label":"edit","kind":"tool"}]}"#.into(),
+            "null".into(),
+            "".into(),
+        ),
+        (
+            vec!["post", "list", "--session", "s1"],
+            "",
+            r#""verb":"post-list","args":{"session":"s1"}"#.into(),
+            r#"[{"id":"p1","session":"s1","title":"Plan","kinds":["markdown","code"],"version":2,"updated_at":0}]"#.into(),
+            "p1\tv2\tmarkdown,code\tPlan\n".into(),
+        ),
+        (
+            vec!["post", "show", "p1", "--version", "2"],
+            "",
+            r#""verb":"post-show","args":{"id":"p1","version":2}"#.into(),
+            r#"{"id":"p1","session":"s1","title":"Plan","parts":[{"kind":"markdown","markdown":"x","id":"intro"},{"kind":"code","code":"y"}],"version":2,"created_at":0,"updated_at":0}"#.into(),
+            "p1\tv2\tPlan\n  0\tmarkdown\tintro\n  1\tcode\t-\n".into(),
+        ),
+        (vec!["post", "delete", "p1"], "", r#""verb":"post-delete","args":{"id":"p1"}"#.into(), "null".into(), "".into()),
+        (vec!["post", "part", "p1", "rm", "1"], "", r#""verb":"post-part","args":{"id":"p1","op":"rm","target":"1"}"#.into(), POST_WRITE.into(), "p1 v1\n".into()),
+        (
+            vec!["post", "part", "p1", "set", "0", "terminal", "-", "--cols", "80", "--term-title", "cargo"],
+            "\u{1b}[31mred\u{1b}[0m",
+            r#""verb":"post-part","args":{"id":"p1","op":"set","target":"0","part":{"kind":"terminal","text":"\u001b[31mred\u001b[0m","cols":80,"title":"cargo"}}"#.into(),
+            POST_WRITE.into(),
+            "p1 v1\n".into(),
+        ),
+        (
+            vec!["post", "html", "-", "--kit", "slides,issues"],
+            "<h1>x</h1>",
+            r#""verb":"post-new","args":{"parts":[{"kind":"html","html":"<h1>x</h1>","kits":["slides","issues"]}]}"#.into(),
+            POST_WRITE.into(),
+            "p1 v1\n".into(),
+        ),
+        (
+            vec!["post", "json", "-", "--title", "Data"],
+            r#"{"a":[1,null]}"#,
+            r#""verb":"post-new","args":{"title":"Data","parts":[{"kind":"json","data":{"a":[1,null]}}]}"#.into(),
+            POST_WRITE.into(),
+            "p1 v1\n".into(),
+        ),
+        (
+            vec!["upload", upload.to_str().unwrap()],
+            "",
+            format!(r#""verb":"asset-put","args":{{"kind":"file","content_type":"text/plain","filename":"{upload_name}","data_base64":"aGk="}}"#),
+            r#"{"id":"sha2","kind":"file","content_type":"text/plain","byte_length":2,"created_at":0}"#.into(),
+            "sha2\n".into(),
+        ),
+    ];
+    for (args, stdin, request, result, text) in cases {
+        let run = notes(&args, stdin, &[&ok(&result)]);
+        assert_eq!(run.request, line(&run, &request), "{args:?}");
+        assert_eq!(stdout(&run), text, "{args:?}");
+        assert_eq!(
+            (stderr(&run), run.out.status.code()),
+            ("", Some(0)),
+            "{args:?}"
+        );
+    }
+    fs::remove_file(&upload).unwrap();
 }
