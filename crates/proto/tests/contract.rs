@@ -199,7 +199,10 @@ fn check(file: &str, line: &str) {
     }
     let golden = fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("{}: {e} (regenerate with UPDATE_FIXTURES=1)", path.display()));
-    assert_eq!(line, golden, "{file} changed: the wire contract moved");
+    // Compared as JSON: key order isn't part of the contract (and gpui, elsewhere
+    // in the workspace, turns on serde_json's preserve_order).
+    let parse = |s: &str| serde_json::from_str::<Value>(s).expect("fixture is JSON");
+    assert_eq!(parse(line), parse(&golden), "{file} changed: the wire contract moved");
 }
 
 #[test]

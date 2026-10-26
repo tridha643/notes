@@ -1,329 +1,205 @@
-//! Syntax highlighting to token-class spans with tree-sitter-highlight.
-//!
-//! Each language's query set compiles once, on first use, into a `'static`
-//! `OnceLock`; the parser and cursors are reused per thread.
+//! Syntax highlighting to token-class spans with Pierre's Highlights
+//! (`pierre/highlights.wasm`, @pierre/highlights 0.2.0, Apache-2.0), a lexer
+//! written in WebAssembly text that covers 80 languages. It runs in wasmi;
+//! the module compiles once per process and each thread keeps an instance.
 
 use std::{cell::RefCell, sync::OnceLock};
 
 use notes_proto::posts::{Span, StyledLine};
-use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
+use wasmi::{Caller, Config, Engine, Instance, Linker, Memory, Module, Store, TypedFunc};
 
-/// Capture names we ask tree-sitter for; it picks the longest configured
-/// prefix of each query capture (`function.method.call` → `function.method`).
-const CAPTURES: &[&str] = &[
-    "attribute",
-    "boolean",
-    "comment",
-    "constant",
-    "constant.builtin",
-    "constructor",
-    "escape",
-    "function",
-    "function.builtin",
-    "function.macro",
-    "function.method",
-    "keyword",
-    "label",
-    "module",
-    "number",
-    "operator",
-    "property",
-    "punctuation",
-    "string",
-    "string.special",
-    "tag",
-    "type",
-    "type.builtin",
-    "variable",
-    "variable.builtin",
-    "variable.parameter",
-];
+const WASM: &[u8] = include_bytes!("../pierre/highlights.wasm");
+/// Every alias Highlights resolves, `name id` per line (its `languages.ts`).
+const LANGUAGES: &str = include_str!("../pierre/languages.txt");
+/// Input starts at the second wasm page; the header lives in the first.
+const PAGE: usize = 65536;
+/// A record whose token id is this marks a line break.
+const LINE_BREAK: u32 = u32::MAX;
 
-/// Span class per capture index. Plain identifiers and punctuation get no
-/// class: they're the default text colour and would only bloat the output.
-fn class_for(capture: usize) -> Option<&'static str> {
-    Some(match CAPTURES[capture] {
-        "variable" | "punctuation" => return None,
-        "boolean" | "constant.builtin" => "constant",
-        "constructor" | "type.builtin" => "type",
-        "string.special" => "string",
-        "function.builtin" | "function.macro" | "function.method" => "function",
-        "variable.builtin" => "variable",
-        "variable.parameter" => "parameter",
-        name => name,
+/// Span class per Highlights token id (its `token-types.ts`, in order). Plain
+/// identifiers and punctuation get no class: they're the default text colour.
+fn class_for(token: u32) -> Option<&'static str> {
+    const TYPES: [&str; 73] = [
+        "none", "attribute", "attribute.jsx", "boolean", "comment", "comment.doc", "constant",
+        "constant.builtin", "constructor", "diff.minus", "diff.plus", "embedded", "emphasis",
+        "emphasis.strong", "function", "function.definition", "function.method", "keyword",
+        "keyword.control", "keyword.declaration", "keyword.import", "keyword.operator", "label",
+        "namespace", "number", "operator", "predictive", "preproc", "primary", "property",
+        "property.json_key", "punctuation", "punctuation.bracket", "punctuation.bracket.html",
+        "punctuation.bracket.jsx", "punctuation.delimiter", "punctuation.delimiter.html",
+        "punctuation.delimiter.jsx", "punctuation.list_marker", "punctuation.markup",
+        "punctuation.special", "selector", "selector.class", "selector.id", "string",
+        "string.escape", "string.regex", "string.special", "string.special.symbol", "tag",
+        "tag.doctype", "tag.jsx", "text.jsx", "text.literal", "title", "type", "type.builtin",
+        "type.class", "variable", "variable.parameter", "variable.special", "enum", "hint",
+        "keyword.jsdoc", "link_text", "link_uri", "selector.pseudo", "tag.component.jsx",
+        "type.jsdoc", "variable.jsdoc", "variant", "background", "foreground",
+    ];
+    let name = *TYPES.get(token as usize)?;
+    Some(match name {
+        "string.escape" => "escape",
+        "variable.parameter" | "variable.jsdoc" => "parameter",
+        "variable.special" => "variable",
+        "boolean" | "variant" => "constant",
+        "constructor" | "enum" => "type",
+        "hint" => "comment",
+        "namespace" => "module",
+        "preproc" | "title" => "keyword",
+        "text.literal" | "link_text" | "link_uri" => "string",
+        _ => match name.split('.').next().unwrap_or(name) {
+            group @ ("attribute" | "comment" | "constant" | "function" | "keyword" | "label"
+            | "number" | "operator" | "property" | "string" | "tag" | "type") => group,
+            "selector" => "tag",
+            _ => return None,
+        },
     })
 }
 
+/// A Highlights language (its wasm id) with a canonical display name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Lang {
-    Bash,
-    C,
-    Cpp,
-    Css,
-    Go,
-    Html,
-    Java,
-    Javascript,
-    Json,
-    Python,
-    Ruby,
-    Rust,
-    Swift,
-    Toml,
-    Tsx,
-    Typescript,
-    Yaml,
+pub struct Lang {
+    id: u8,
+    name: &'static str,
 }
 
-pub const ALL_LANGS: &[Lang] = &[
-    Lang::Bash,
-    Lang::C,
-    Lang::Cpp,
-    Lang::Css,
-    Lang::Go,
-    Lang::Html,
-    Lang::Java,
-    Lang::Javascript,
-    Lang::Json,
-    Lang::Python,
-    Lang::Ruby,
-    Lang::Rust,
-    Lang::Swift,
-    Lang::Toml,
-    Lang::Tsx,
-    Lang::Typescript,
-    Lang::Yaml,
-];
+fn aliases() -> impl Iterator<Item = (&'static str, u8)> {
+    LANGUAGES.lines().filter_map(|l| {
+        let (name, id) = l.split_once(' ')?;
+        Some((name, id.parse().ok()?))
+    })
+}
 
 impl Lang {
-    /// Resolve a language id or common alias (`rs`, `ts`, `py`, `sh`, ...).
+    /// Resolve a language id or alias (`rs`, `ts`, `py`, `sh`, ...). Plain
+    /// text resolves to `None`, so it's never sent through the lexer.
     pub fn from_name(name: &str) -> Option<Lang> {
-        Some(match name.trim().to_ascii_lowercase().as_str() {
-            "bash" | "sh" | "shell" | "zsh" | "shellscript" | "console" => Lang::Bash,
-            "c" | "h" => Lang::C,
-            "cpp" | "c++" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Lang::Cpp,
-            "css" | "scss" | "less" => Lang::Css,
-            "go" | "golang" => Lang::Go,
-            "html" | "htm" | "xhtml" | "vue" | "svelte" | "xml" | "svg" => Lang::Html,
-            "java" => Lang::Java,
-            "javascript" | "js" | "jsx" | "mjs" | "cjs" | "node" => Lang::Javascript,
-            "json" | "jsonc" | "json5" | "jsonl" | "ndjson" => Lang::Json,
-            "python" | "py" | "pyi" | "python3" => Lang::Python,
-            "ruby" | "rb" | "rake" | "gemspec" => Lang::Ruby,
-            "rust" | "rs" => Lang::Rust,
-            "swift" => Lang::Swift,
-            "toml" => Lang::Toml,
-            "tsx" => Lang::Tsx,
-            "typescript" | "ts" | "mts" | "cts" => Lang::Typescript,
-            "yaml" | "yml" => Lang::Yaml,
-            _ => return None,
-        })
+        let name = name.trim().to_ascii_lowercase();
+        let id = aliases().find(|(alias, _)| *alias == name)?.1;
+        // The longest alias names the language (`rust` over `rs`).
+        let canonical = aliases().filter(|a| a.1 == id).map(|a| a.0).max_by_key(|a| a.len())?;
+        (id != 0).then_some(Lang { id, name: canonical })
     }
 
     /// Infer from a file path's name or extension.
     pub fn from_filename(path: &str) -> Option<Lang> {
         let name = path.rsplit('/').next().unwrap_or(path);
-        match name {
-            "Gemfile" | "Rakefile" | "Podfile" | "Fastfile" => return Some(Lang::Ruby),
-            "Cargo.lock" | "Pipfile" => return Some(Lang::Toml),
-            ".bashrc" | ".zshrc" | ".profile" | ".bash_profile" | ".envrc" => {
-                return Some(Lang::Bash)
-            }
-            "Package.swift" => return Some(Lang::Swift),
-            _ => {}
-        }
-        let (_, ext) = name.rsplit_once('.')?;
-        Lang::from_name(ext)
+        let special = match name {
+            "Gemfile" | "Rakefile" | "Podfile" | "Fastfile" => Some("ruby"),
+            "Cargo.lock" | "Pipfile" => Some("toml"),
+            ".bashrc" | ".zshrc" | ".profile" | ".bash_profile" | ".envrc" => Some("bash"),
+            "Dockerfile" | "Containerfile" => Some("dockerfile"),
+            "Makefile" | "makefile" | "GNUmakefile" => Some("make"),
+            _ => None,
+        };
+        special.map_or_else(|| Lang::from_name(name.rsplit_once('.')?.1), Lang::from_name)
     }
 
     pub fn name(self) -> &'static str {
-        match self {
-            Lang::Bash => "bash",
-            Lang::C => "c",
-            Lang::Cpp => "cpp",
-            Lang::Css => "css",
-            Lang::Go => "go",
-            Lang::Html => "html",
-            Lang::Java => "java",
-            Lang::Javascript => "javascript",
-            Lang::Json => "json",
-            Lang::Python => "python",
-            Lang::Ruby => "ruby",
-            Lang::Rust => "rust",
-            Lang::Swift => "swift",
-            Lang::Toml => "toml",
-            Lang::Tsx => "tsx",
-            Lang::Typescript => "typescript",
-            Lang::Yaml => "yaml",
+        self.name
+    }
+}
+
+/// One wasm instance and the views into it, per thread.
+struct Lexer {
+    store: Store<()>,
+    memory: Memory,
+    run: TypedFunc<(), ()>,
+}
+
+impl Lexer {
+    fn new() -> Option<Lexer> {
+        static MODULE: OnceLock<Option<(Engine, Module)>> = OnceLock::new();
+        let (engine, module) = MODULE
+            .get_or_init(|| {
+                let mut config = Config::default();
+                config.wasm_simd(true);
+                let engine = Engine::new(&config);
+                let module = Module::new(&engine, WASM).ok()?;
+                Some((engine, module))
+            })
+            .as_ref()?;
+        let mut store = Store::new(engine, ());
+        let mut linker = <Linker<()>>::new(engine);
+        linker.func_wrap("env", "is_id_start", |c: Caller<'_, ()>, p: u32, n: u32| ident(c, p, n, true)).ok()?;
+        linker.func_wrap("env", "is_id_continue", |c: Caller<'_, ()>, p: u32, n: u32| ident(c, p, n, false)).ok()?;
+        let instance: Instance = linker.instantiate_and_start(&mut store, module).ok()?;
+        let memory = instance.get_memory(&store, "memory")?;
+        let run = instance.get_typed_func(&store, "highlight").ok()?;
+        Some(Lexer { store, memory, run })
+    }
+
+    /// Lex `text` and return its records: `(end, token)` pairs with UTF-16
+    /// end offsets, a `LINE_BREAK` token marking where the next line starts.
+    fn records(&mut self, lang: Lang, text: &str) -> Option<Vec<(u32, u32)>> {
+        let len = text.len();
+        let pages = 1 + (len + 96).div_ceil(PAGE);
+        let have = self.memory.size(&self.store) as usize;
+        if pages > have {
+            self.memory.grow(&mut self.store, (pages - have) as u64).ok()?;
+        }
+        let mem = self.memory.data_mut(&mut self.store);
+        mem[0] = lang.id;
+        mem[1] = 3; // output mode: UTF-16 line records
+        mem[2..6].copy_from_slice(&u32::try_from(len).ok()?.to_le_bytes());
+        mem[PAGE..PAGE + len].copy_from_slice(text.as_bytes());
+        mem[PAGE + len] = 0;
+        self.run.call(&mut self.store, ()).ok()?;
+        let mem = self.memory.data(&self.store);
+        let word = |at: usize| u32::from_le_bytes(mem[at..at + 4].try_into().expect("4 bytes"));
+        let (at, n) = (word(6) as usize, word(10) as usize);
+        let out = mem.get(at..at + n)?;
+        let (records, _) = out.as_chunks::<4>();
+        let words: Vec<u32> = records.iter().map(|w| u32::from_le_bytes(*w)).collect();
+        Some(words.as_chunks::<2>().0.iter().map(|&[end, token]| (end, token)).collect())
+    }
+}
+
+/// The wasm asks about non-ASCII identifier characters (`len` UTF-8 bytes at `ptr`).
+fn ident(caller: Caller<'_, ()>, ptr: u32, len: u32, start: bool) -> u32 {
+    let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+        return 0;
+    };
+    let bytes = memory.data(&caller).get(ptr as usize..(ptr + len) as usize).unwrap_or_default();
+    let ch = std::str::from_utf8(bytes).ok().and_then(|s| s.chars().next());
+    ch.is_some_and(|c| if start { unicode_ident::is_xid_start(c) } else { unicode_ident::is_xid_continue(c) }) as u32
+}
+
+/// Split `text` into lines of class-tagged spans. `None` (or a lexer
+/// failure) yields plain unstyled lines. A trailing newline doesn't add a line.
+pub fn highlight(lang: Option<Lang>, text: &str) -> Vec<StyledLine> {
+    thread_local!(static LEXER: RefCell<Option<Lexer>> = RefCell::new(Lexer::new()));
+    let records = lang.and_then(|lang| {
+        LEXER.with_borrow_mut(|lexer| lexer.as_mut()?.records(lang, text))
+    });
+    let mut out = LineBuilder::default();
+    let Some(records) = records else {
+        out.push(text, None);
+        return out.finish();
+    };
+    // Walk the text once, turning UTF-16 offsets into byte offsets.
+    let (mut chars, mut units, mut at) = (text.char_indices().peekable(), 0u32, 0usize);
+    for (end, token) in records {
+        let from = at;
+        while units < end {
+            let Some((_, c)) = chars.next() else { break };
+            units += c.len_utf16() as u32;
+            at = chars.peek().map_or(text.len(), |(i, _)| *i);
+        }
+        let piece = &text[from..at];
+        let class = if token == LINE_BREAK { None } else { class_for(token) };
+        // Highlights folds whitespace into the neighbouring token; keep it
+        // unclassed so plain runs merge and spans stay tight.
+        let core = piece.trim();
+        if class.is_none() || core.is_empty() {
+            out.push(piece, None);
+        } else {
+            let lead = piece.len() - piece.trim_start().len();
+            out.push(&piece[..lead], None);
+            out.push(core, class);
+            out.push(&piece[lead + core.len()..], None);
         }
     }
-
-    /// The compiled query set, built on first use (a few ms per language).
-    pub fn config(self) -> &'static HighlightConfiguration {
-        static CONFIGS: [OnceLock<HighlightConfiguration>; 17] = [const { OnceLock::new() }; 17];
-        CONFIGS[ALL_LANGS.iter().position(|l| *l == self).expect("listed")]
-            .get_or_init(|| build(self))
-    }
-}
-
-fn build(lang: Lang) -> HighlightConfiguration {
-    use tree_sitter_javascript as js;
-    use tree_sitter_typescript as ts;
-    let (language, highlights, injections, locals): (tree_sitter::Language, String, &str, String) =
-        match lang {
-            Lang::Bash => (
-                tree_sitter_bash::LANGUAGE.into(),
-                tree_sitter_bash::HIGHLIGHT_QUERY.into(),
-                "",
-                String::new(),
-            ),
-            Lang::C => (
-                tree_sitter_c::LANGUAGE.into(),
-                tree_sitter_c::HIGHLIGHT_QUERY.into(),
-                "",
-                String::new(),
-            ),
-            Lang::Cpp => (
-                tree_sitter_cpp::LANGUAGE.into(),
-                [
-                    tree_sitter_cpp::HIGHLIGHT_QUERY,
-                    tree_sitter_c::HIGHLIGHT_QUERY,
-                ]
-                .concat(),
-                "",
-                String::new(),
-            ),
-            Lang::Css => (
-                tree_sitter_css::LANGUAGE.into(),
-                tree_sitter_css::HIGHLIGHTS_QUERY.into(),
-                "",
-                String::new(),
-            ),
-            Lang::Go => (
-                tree_sitter_go::LANGUAGE.into(),
-                tree_sitter_go::HIGHLIGHTS_QUERY.into(),
-                "",
-                String::new(),
-            ),
-            Lang::Html => (
-                tree_sitter_html::LANGUAGE.into(),
-                tree_sitter_html::HIGHLIGHTS_QUERY.into(),
-                tree_sitter_html::INJECTIONS_QUERY,
-                String::new(),
-            ),
-            Lang::Java => (
-                tree_sitter_java::LANGUAGE.into(),
-                tree_sitter_java::HIGHLIGHTS_QUERY.into(),
-                "",
-                String::new(),
-            ),
-            Lang::Javascript => (
-                js::LANGUAGE.into(),
-                [js::JSX_HIGHLIGHT_QUERY, js::HIGHLIGHT_QUERY].concat(),
-                js::INJECTIONS_QUERY,
-                js::LOCALS_QUERY.into(),
-            ),
-            Lang::Json => (
-                tree_sitter_json::LANGUAGE.into(),
-                tree_sitter_json::HIGHLIGHTS_QUERY.into(),
-                "",
-                String::new(),
-            ),
-            Lang::Python => (
-                tree_sitter_python::LANGUAGE.into(),
-                tree_sitter_python::HIGHLIGHTS_QUERY.into(),
-                "",
-                String::new(),
-            ),
-            Lang::Ruby => (
-                tree_sitter_ruby::LANGUAGE.into(),
-                tree_sitter_ruby::HIGHLIGHTS_QUERY.into(),
-                "",
-                tree_sitter_ruby::LOCALS_QUERY.into(),
-            ),
-            Lang::Rust => (
-                tree_sitter_rust::LANGUAGE.into(),
-                tree_sitter_rust::HIGHLIGHTS_QUERY.into(),
-                tree_sitter_rust::INJECTIONS_QUERY,
-                String::new(),
-            ),
-            Lang::Swift => (
-                tree_sitter_swift::LANGUAGE.into(),
-                tree_sitter_swift::HIGHLIGHTS_QUERY.into(),
-                tree_sitter_swift::INJECTIONS_QUERY,
-                tree_sitter_swift::LOCALS_QUERY.into(),
-            ),
-            Lang::Toml => (
-                tree_sitter_toml_ng::LANGUAGE.into(),
-                tree_sitter_toml_ng::HIGHLIGHTS_QUERY.into(),
-                "",
-                String::new(),
-            ),
-            Lang::Tsx => (
-                ts::LANGUAGE_TSX.into(),
-                [
-                    ts::HIGHLIGHTS_QUERY,
-                    js::JSX_HIGHLIGHT_QUERY,
-                    js::HIGHLIGHT_QUERY,
-                ]
-                .concat(),
-                js::INJECTIONS_QUERY,
-                [ts::LOCALS_QUERY, js::LOCALS_QUERY].concat(),
-            ),
-            Lang::Typescript => (
-                ts::LANGUAGE_TYPESCRIPT.into(),
-                [ts::HIGHLIGHTS_QUERY, js::HIGHLIGHT_QUERY].concat(),
-                js::INJECTIONS_QUERY,
-                [ts::LOCALS_QUERY, js::LOCALS_QUERY].concat(),
-            ),
-            Lang::Yaml => (
-                tree_sitter_yaml::LANGUAGE.into(),
-                tree_sitter_yaml::HIGHLIGHTS_QUERY.into(),
-                "",
-                String::new(),
-            ),
-        };
-    let mut config =
-        HighlightConfiguration::new(language, lang.name(), &highlights, injections, &locals)
-            .unwrap_or_else(|e| panic!("{} highlight queries compile: {e}", lang.name()));
-    config.configure(CAPTURES);
-    config
-}
-
-/// Split `text` into lines of class-tagged spans. `None` (or a highlighter
-/// error) yields plain unstyled lines. A trailing newline doesn't add a line.
-pub fn highlight(lang: Option<Lang>, text: &str) -> Vec<StyledLine> {
-    let mut out = LineBuilder::default();
-    let highlighted = lang.is_some_and(|lang| {
-        thread_local!(static HL: RefCell<Highlighter> = RefCell::new(Highlighter::new()));
-        HL.with_borrow_mut(|hl| {
-            let Ok(events) = hl.highlight(lang.config(), text.as_bytes(), None, |name| {
-                Lang::from_name(name).map(Lang::config)
-            }) else {
-                return false;
-            };
-            let mut stack: Vec<Option<&'static str>> = Vec::new();
-            for event in events {
-                match event {
-                    Ok(HighlightEvent::HighlightStart(h)) => stack.push(class_for(h.0)),
-                    Ok(HighlightEvent::HighlightEnd) => {
-                        stack.pop();
-                    }
-                    Ok(HighlightEvent::Source { start, end }) => {
-                        // Innermost classed capture wins; unclassed ones inherit.
-                        let class = stack.iter().rev().find_map(|c| *c);
-                        out.push(&text[start..end], class);
-                    }
-                    Err(_) => return false,
-                }
-            }
-            true
-        })
-    });
-    if !highlighted {
-        out = LineBuilder::default();
-        out.push(text, None);
-    }
+    out.push(&text[at..], None);
     out.finish()
 }
 
@@ -434,59 +310,56 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn every_language_compiles_and_highlights() {
-        for lang in ALL_LANGS {
-            let lines = highlight(Some(*lang), "x = 1\n");
-            assert_eq!(lines.len(), 1, "{}", lang.name());
-        }
+    fn lang(name: &str) -> Option<Lang> {
+        Lang::from_name(name)
     }
 
     #[test]
     fn rust_tokens_get_classes() {
-        let lines = highlight(
-            Some(Lang::Rust),
-            "fn main() {\n    // hi\n    let s = \"x\";\n}\n",
-        );
+        let lines = highlight(lang("rust"), "fn main() {\n    // hi\n    let s = \"x\";\n}\n");
         assert_eq!(lines.len(), 4);
         let spans = classes(&lines);
-        assert!(spans.contains(&("fn".into(), Some("keyword".into()))));
-        assert!(spans.contains(&("main".into(), Some("function".into()))));
-        assert!(spans.contains(&("// hi".into(), Some("comment".into()))));
-        assert!(spans.contains(&("\"x\"".into(), Some("string".into()))));
+        assert!(spans.contains(&("fn".into(), Some("keyword".into()))), "{spans:?}");
+        assert!(spans.contains(&("main".into(), Some("function".into()))), "{spans:?}");
+        assert!(spans.contains(&("// hi".into(), Some("comment".into()))), "{spans:?}");
+        assert!(spans.contains(&("\"x\"".into(), Some("string".into()))), "{spans:?}");
         // Text round-trips exactly.
         let text: Vec<String> = lines
             .iter()
             .map(|l| l.iter().map(|s| s.text.as_str()).collect())
             .collect();
-        assert_eq!(
-            text,
-            ["fn main() {", "    // hi", "    let s = \"x\";", "}"]
-        );
+        assert_eq!(text, ["fn main() {", "    // hi", "    let s = \"x\";", "}"]);
     }
 
     #[test]
-    fn html_injects_javascript() {
-        let lines = highlight(Some(Lang::Html), "<script>let x = 1;</script>\n");
-        assert!(classes(&lines).contains(&("let".into(), Some("keyword".into()))));
+    fn non_ascii_text_round_trips() {
+        let src = "let café = \"naïve 🚀\"; // ok ✓\nlet ä = 1;\n";
+        let lines = highlight(lang("rust"), src);
+        let text: String = lines
+            .iter()
+            .map(|l| l.iter().map(|s| s.text.as_str()).collect::<String>() + "\n")
+            .collect();
+        assert_eq!(text, src);
+        assert!(classes(&lines).contains(&("\"naïve 🚀\"".into(), Some("string".into()))));
+    }
+
+    #[test]
+    fn html_highlights_embedded_javascript() {
+        let lines = highlight(lang("html"), "<script>let x = 1;</script>\n");
+        assert!(classes(&lines).contains(&("let".into(), Some("keyword".into()))), "{:?}", classes(&lines));
     }
 
     #[test]
     fn unknown_language_is_plain_and_crlf_is_trimmed() {
         assert_eq!(Lang::from_name("brainfuck"), None);
+        assert_eq!(Lang::from_name("text"), None);
         let lines = highlight(None, "a\r\n\r\nb");
         assert_eq!(
             lines,
             vec![
-                vec![Span {
-                    text: "a".into(),
-                    class: None
-                }],
+                vec![Span { text: "a".into(), class: None }],
                 vec![],
-                vec![Span {
-                    text: "b".into(),
-                    class: None
-                }]
+                vec![Span { text: "b".into(), class: None }]
             ]
         );
     }
@@ -494,21 +367,18 @@ mod tests {
     #[test]
     fn parallel_batches_match_serial_in_order() {
         let big = "fn f() { let x = \"s\"; }\n".repeat(2000);
-        let jobs = [
-            (Some(Lang::Rust), big.as_str()),
-            (None, "plain\n"),
-            (Some(Lang::Python), "def g(): pass\n"),
-        ];
+        let jobs = [(lang("rust"), big.as_str()), (None, "plain\n"), (lang("python"), "def g(): pass\n")];
         let serial: Vec<_> = jobs.iter().map(|(l, t)| highlight(*l, t)).collect();
         assert_eq!(highlight_many(&jobs), serial);
     }
 
     #[test]
     fn languages_resolve_from_names_and_filenames() {
-        assert_eq!(Lang::from_name("TS"), Some(Lang::Typescript));
-        assert_eq!(Lang::from_filename("src/app.tsx"), Some(Lang::Tsx));
-        assert_eq!(Lang::from_filename("a/b/Gemfile"), Some(Lang::Ruby));
-        assert_eq!(Lang::from_filename("Makefile"), None);
-        assert_eq!(Lang::from_filename("notes.md"), None);
+        assert_eq!(Lang::from_name("TS").map(Lang::name), Some("typescript"));
+        assert_eq!(Lang::from_name("rs").map(Lang::name), Some("rust"));
+        assert_eq!(Lang::from_filename("src/app.tsx").map(Lang::name), Some("tsx"));
+        assert_eq!(Lang::from_filename("a/b/Gemfile").map(Lang::name), Some("ruby"));
+        assert_eq!(Lang::from_filename("notes.md").map(Lang::name), Some("markdown"));
+        assert_eq!(Lang::from_filename("LICENSE"), None);
     }
 }

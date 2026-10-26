@@ -23,3 +23,7 @@ unicode-width = "0.2.2"
 [[bench]]
 name = "frames"
 harness = false
+
+[[bench]]
+name = "visuals"
+harness = false

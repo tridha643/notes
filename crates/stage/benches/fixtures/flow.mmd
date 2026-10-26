@@ -1,0 +1,11 @@
+flowchart TD
+  subgraph Agent[Agent]
+    A[notes post] --> B[(notesd)]
+  end
+  subgraph Desktop[~/Desktop/Stage]
+    C[session.json]
+  end
+  B --> C
+  B -->|watch event| D[stage TUI]
+  D --> E{kitty graphics}
+  E -->|shm frames| F[Rex pane]

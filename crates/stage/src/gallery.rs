@@ -13,8 +13,9 @@
 use std::{
     collections::HashMap,
     io::{BufRead, BufReader, Write},
+    os::unix::{net::UnixStream, process::CommandExt},
     path::PathBuf,
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Command, Stdio},
     sync::{mpsc::Sender, Arc, OnceLock},
     thread,
 };
@@ -51,16 +52,19 @@ struct Img {
     /// The html page streaming into this image, if live.
     page: Option<u64>,
     paused: bool,
+    /// The image file these pixels came from (PNG sent as a file, or decoded by
+    /// the helper), to send again after a clear.
+    file: Option<PathBuf>,
 }
 
+/// The connection to the shared helper (see `stage-helper --serve`).
 struct Helper {
-    stdin: ChildStdin,
-    _child: Child,
+    stream: UnixStream,
 }
 
 enum Pending {
     Mermaid(VisualKey),
-    Image(VisualKey),
+    Image(VisualKey, PathBuf),
 }
 
 pub struct Gallery {
@@ -76,30 +80,62 @@ pub struct Gallery {
     svgs: HashMap<VisualKey, String>,
     target: Target,
     cache: PathBuf,
+    /// The session folder; assets are read straight from its `assets/` (notesd only writes it).
+    stage: PathBuf,
+    /// `STAGE_TRACE=<file>`: one line per visual, request → pixels transmitted.
+    trace: Option<std::fs::File>,
+    asked: HashMap<VisualKey, (std::time::Instant, &'static str)>,
+    /// While the user scrolls, live pages hold still so the terminal spends its
+    /// time on the scroll, not on uploading frames.
+    held: bool,
 }
 
 fn fonts() -> Arc<resvg::usvg::fontdb::Database> {
     static DB: OnceLock<Arc<resvg::usvg::fontdb::Database>> = OnceLock::new();
     DB.get_or_init(|| {
+        // Only the faces pele's SVG names (the helper resolves fonts to these), not
+        // every system font: loading them all costs ~40 ms on a cold start.
         let mut db = resvg::usvg::fontdb::Database::new();
-        db.load_system_fonts();
+        for face in ["HelveticaNeue.ttc", "Helvetica.ttc", "Menlo.ttc"] {
+            let _ = db.load_font_file(format!("/System/Library/Fonts/{face}"));
+        }
+        if db.is_empty() {
+            db.load_system_fonts();
+        }
         Arc::new(db)
     })
     .clone()
 }
 
-/// SVG → RGBA at `width_px` (never past 2× its CSS size), over the card color.
-pub fn rasterize(svg: &str, width_px: u32) -> Result<(Vec<u8>, u32, u32), String> {
+/// SVG → RGBA at the size it will be shown: within `width_px` × `height_px`
+/// (never past 2× its CSS size), over the card color.
+pub fn rasterize(svg: &str, width_px: u32, height_px: u32) -> Result<(Vec<u8>, u32, u32), String> {
     let opt = resvg::usvg::Options { fontdb: fonts(), ..Default::default() };
     let tree = resvg::usvg::Tree::from_str(svg, &opt).map_err(|e| format!("svg: {e}"))?;
     let size = tree.size();
-    let scale = (width_px as f32 / size.width()).min(SCALE as f32);
+    let scale = (width_px as f32 / size.width()).min(height_px as f32 / size.height()).min(SCALE as f32);
     let (w, h) = ((size.width() * scale).ceil() as u32, (size.height() * scale).ceil() as u32);
     let mut pixmap = resvg::tiny_skia::Pixmap::new(w.max(1), h.max(1)).ok_or("empty diagram")?;
     pixmap.fill(resvg::tiny_skia::Color::from_rgba8(BG[0], BG[1], BG[2], BG[3]));
     resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
     // Opaque background, so premultiplied RGBA is already straight RGBA.
     Ok((pixmap.take(), w.max(1), h.max(1)))
+}
+
+/// One `STAGE_TRACE` line, when tracing.
+fn note(trace: &mut Option<std::fs::File>, line: std::fmt::Arguments) {
+    if let Some(f) = trace {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// The first bytes of a file (enough for a PNG header).
+fn read_head(path: &std::path::Path) -> Vec<u8> {
+    use std::io::Read;
+    let mut head = vec![0; 32];
+    let n = std::fs::File::open(path).and_then(|mut f| f.read(&mut head)).unwrap_or(0);
+    head.truncate(n);
+    head
 }
 
 fn helper_path() -> PathBuf {
@@ -113,7 +149,7 @@ fn helper_path() -> PathBuf {
 }
 
 impl Gallery {
-    pub fn new(tx: Sender<Msg>, client: StageClient, cache: PathBuf, target: Target) -> Gallery {
+    pub fn new(tx: Sender<Msg>, client: StageClient, cache: PathBuf, stage: PathBuf, target: Target) -> Gallery {
         Gallery {
             tx,
             client,
@@ -126,41 +162,85 @@ impl Gallery {
             svgs: HashMap::new(),
             target,
             cache,
+            stage,
+            trace: std::env::var_os("STAGE_TRACE").and_then(|p| std::fs::File::create(p).ok()),
+            asked: HashMap::new(),
+            held: false,
         }
     }
 
-    /// Send one request to stage-helper, starting it if needed.
+    /// Hold (or release) every live page; `place` resumes the visible ones on release.
+    pub fn hold_live(&mut self, held: bool) {
+        if held == self.held {
+            return;
+        }
+        self.held = held;
+        if held {
+            let pages: Vec<u64> = self.images.values_mut().filter(|i| !i.paused).filter_map(|i| {
+                i.paused = true;
+                i.page
+            }).collect();
+            for page in pages {
+                let _ = self.send(json!({"op": "html-pause", "id": page}));
+            }
+        }
+    }
+
+    /// Start the helper and load fonts now (after stage's first frame), so the
+    /// first visual doesn't pay for process launch, WebKit and font loading.
+    pub fn warm(&mut self) {
+        thread::spawn(fonts);
+        let _ = self.ask(json!({"op": "warm"}));
+    }
+
+    /// Connect to the shared helper, launching it (detached, so it outlives this
+    /// stage and the next one starts warm) if nobody answers.
+    fn connect(&self) -> Result<UnixStream, String> {
+        let sock = self.cache.join("helper.sock");
+        if let Ok(stream) = UnixStream::connect(&sock) {
+            return Ok(stream);
+        }
+        std::fs::create_dir_all(&self.cache).map_err(|e| e.to_string())?;
+        Command::new(helper_path())
+            .arg("--serve")
+            .arg(&sock)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            // `STAGE_HELPER_LOG=<file>` keeps the helper's stderr (with STAGE_HELPER_TRACE=1, its phase timings).
+            .stderr(std::env::var_os("STAGE_HELPER_LOG").and_then(|p| std::fs::File::create(p).ok()).map_or(Stdio::null(), Stdio::from))
+            .process_group(0)
+            .spawn()
+            .map_err(|e| format!("stage-helper isn't available ({e})"))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            match UnixStream::connect(&sock) {
+                Ok(stream) => return Ok(stream),
+                Err(_) if std::time::Instant::now() < deadline => thread::sleep(std::time::Duration::from_millis(2)),
+                Err(e) => return Err(format!("stage-helper didn't start ({e})")),
+            }
+        }
+    }
+
+    /// Send one request to stage-helper, connecting first if needed.
     fn ask(&mut self, mut req: Value) -> Result<u64, String> {
         if self.helper.is_none() {
-            let mut child = Command::new(helper_path())
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|e| format!("stage-helper isn't available ({e})"))?;
-            let stdout = child.stdout.take().expect("piped");
+            let stream = self.connect()?;
+            let reader = stream.try_clone().map_err(|e| e.to_string())?;
             let tx = self.tx.clone();
             thread::spawn(move || {
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                for line in BufReader::new(reader).lines().map_while(Result::ok) {
                     if tx.send(Msg::Gfx(Gfx::Helper(line))).is_err() {
                         return;
                     }
                 }
                 let _ = tx.send(Msg::Gfx(Gfx::HelperExited));
             });
-            let stdin = child.stdin.take().expect("piped");
-            self.helper = Some(Helper { stdin, _child: child });
+            self.helper = Some(Helper { stream });
         }
         let id = self.next_req;
         self.next_req += 1;
         req["id"] = json!(id);
-        let line = format!("{req}\n");
-        let helper = self.helper.as_mut().expect("started above");
-        if helper.stdin.write_all(line.as_bytes()).and_then(|()| helper.stdin.flush()).is_err() {
-            self.helper = None;
-            return Err("stage-helper stopped".into());
-        }
-        Ok(id)
+        self.send(req).map(|()| id)
     }
 
     fn write_cache(&self, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
@@ -174,30 +254,55 @@ impl Gallery {
     }
 
     /// Start making a visual's pixels. Failures come back as messages for the app.
-    pub fn need(&mut self, key: VisualKey, source: VisualSource, target: Target) -> Vec<Msg> {
+    pub fn need(&mut self, out: &mut impl Write, key: VisualKey, source: VisualSource, target: Target) -> Vec<Msg> {
         self.target = target;
+        let kind = match &source {
+            VisualSource::Mermaid(_) => "mermaid",
+            VisualSource::Asset(_) => "image",
+            VisualSource::Html(_) => "html",
+        };
+        self.asked.insert(key.clone(), (std::time::Instant::now(), kind));
         let result = match &source {
             VisualSource::Mermaid(src) => self
                 .ask(json!({"op": "mermaid", "source": src, "max_width": target.width_px as f64 / SCALE, "font_size": 14}))
                 .map(|req| {
                     self.pending.insert(req, Pending::Mermaid(key.clone()));
                 }),
-            VisualSource::Asset(asset) => self
-                .client
-                .asset_get(asset.clone())
-                .map_err(|e| e.message)
-                .and_then(|data| self.write_cache(&format!("asset-{asset}"), &data))
-                .and_then(|path| self.ask(json!({"op": "image", "path": path})))
-                .map(|req| {
-                    self.pending.insert(req, Pending::Image(key.clone()));
-                }),
+            VisualSource::Asset(asset) => {
+                // The file in the session folder, else the bytes over the socket.
+                let local = self.stage.join("assets").join(asset.as_str());
+                let path = if asset.bytes().all(|b| b.is_ascii_hexdigit()) && local.is_file() {
+                    Ok(local)
+                } else {
+                    self.client
+                        .asset_get(asset.clone())
+                        .map_err(|e| e.message)
+                        .and_then(|data| self.write_cache(&format!("asset-{asset}"), &data))
+                };
+                // A PNG goes to the terminal as a file it decodes itself; anything else
+                // (jpeg, heic, gif…) is decoded by the helper.
+                match path.map(|p| (kitty::png_size(&read_head(&p)), p)) {
+                    Ok((Some(size), path)) => {
+                        if let Some(msg) = self.show_png(out, key.clone(), &path, size) {
+                            return vec![msg];
+                        }
+                        Ok(())
+                    }
+                    Ok((None, path)) => self.decode(key.clone(), path),
+                    Err(e) => Err(e),
+                }
+            }
             VisualSource::Html(html) => {
                 let name = format!("page-{}-{}-{}.html", key.0, key.1, key.2);
+                let path = match self.write_cache(&name, html.as_bytes()) {
+                    Ok(path) => path,
+                    Err(reason) => return vec![Msg::VisualFailed { key, reason }],
+                };
+                if let Some(msgs) = self.update_page(&key, &path) {
+                    return msgs;
+                }
                 let (width, max_height) = self.html_size();
-                self.write_cache(&name, html.as_bytes())
-                    .and_then(|path| {
-                        self.ask(json!({"op": "html-open", "path": path, "width": width, "max_height": max_height, "scale": SCALE, "fps": 60}))
-                    })
+                self.ask(json!({"op": "html-open", "path": path, "width": width, "max_height": max_height, "scale": SCALE, "fps": 60}))
                     .map(|req| {
                         self.pages.insert(req, key.clone());
                     })
@@ -207,6 +312,26 @@ impl Gallery {
             Ok(()) => vec![],
             Err(reason) => vec![Msg::VisualFailed { key, reason }],
         }
+    }
+
+    /// A new revision of a part that already has a page updates that page (patched
+    /// in place when it can be), keeping its pixels on screen. `None`: no such page.
+    fn update_page(&mut self, key: &VisualKey, path: &std::path::Path) -> Option<Vec<Msg>> {
+        let (page, old) = self.pages.iter().find(|(_, k)| k.0 == key.0 && k.2 == key.2).map(|(page, k)| (*page, k.clone()))?;
+        self.send(json!({"op": "html-update", "id": page, "path": path})).ok()?;
+        self.pages.insert(page, key.clone());
+        self.asked.remove(key);
+        let Some(img) = self.images.remove(&old) else { return Some(vec![]) };
+        let (w, h) = (img.w, img.h);
+        self.images.insert(key.clone(), img);
+        Some(vec![Msg::VisualReady { key: key.clone(), w, h, max_scale: 1.0 }])
+    }
+
+    /// Ask the helper to decode a non-PNG image file.
+    fn decode(&mut self, key: VisualKey, path: PathBuf) -> Result<(), String> {
+        let req = self.ask(json!({"op": "image", "path": path}))?;
+        self.pending.insert(req, Pending::Image(key, path));
+        Ok(())
     }
 
     /// The card width or pane height changed: re-render what depends on it.
@@ -227,28 +352,65 @@ impl Gallery {
     /// A request about an existing page (its id is the page id, not a new one).
     fn send(&mut self, req: Value) -> Result<(), String> {
         let helper = self.helper.as_mut().ok_or("stage-helper isn't running")?;
-        helper.stdin.write_all(format!("{req}\n").as_bytes()).and_then(|()| helper.stdin.flush()).map_err(|e| e.to_string())
+        if let Err(e) = helper.stream.write_all(format!("{req}\n").as_bytes()) {
+            self.helper = None;
+            return Err(format!("stage-helper stopped ({e})"));
+        }
+        Ok(())
     }
 
     fn raster(&self, key: VisualKey, svg: String) {
-        let (tx, width) = (self.tx.clone(), self.target.width_px);
+        let (tx, width, height) = (self.tx.clone(), self.target.width_px, self.target.max_height_px);
         thread::spawn(move || {
-            let done = rasterize(&svg, width).and_then(|(px, w, h)| {
+            let t0 = std::time::Instant::now();
+            let raster = rasterize(&svg, width, height);
+            if std::env::var_os("STAGE_HELPER_TRACE").is_some() {
+                eprintln!("resvg {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            let done = raster.and_then(|(px, w, h)| {
                 kitty::shm_write(&px).map(|shm| (shm, w, h)).map_err(|e| format!("shared memory: {e}"))
             });
             let _ = tx.send(Msg::Gfx(Gfx::Raster { key, done }));
         });
     }
 
-    /// New pixels for `key`: transmit them, re-placing the image if it's on screen.
-    fn show(&mut self, out: &mut impl Write, key: VisualKey, shm: &str, (w, h): (u32, u32), page: Option<u64>) -> Option<Msg> {
-        let fresh = !self.images.contains_key(&key);
+    /// Trace a visual's first pixels: how long since it was asked for.
+    fn traced(&mut self, key: &VisualKey, (w, h): (u32, u32)) {
+        if let Some((at, kind)) = self.asked.remove(key) {
+            note(&mut self.trace, format_args!("{kind} {:.1} ms {w}x{h}", at.elapsed().as_secs_f64() * 1000.0));
+        }
+    }
+
+    /// A PNG file for `key`: the terminal decodes it; the next `place` positions it.
+    fn show_png(&mut self, out: &mut impl Write, key: VisualKey, path: &std::path::Path, (w, h): (u32, u32)) -> Option<Msg> {
         let next_id = &mut self.next_id;
         let img = self.images.entry(key.clone()).or_insert_with(|| {
             let id = *next_id;
             *next_id += 1;
-            Img { id, w, h, placed: None, page, paused: false }
+            Img { id, w, h, placed: None, page: None, paused: false, file: None }
         });
+        img.file = Some(path.to_owned());
+        let _ = out.write_all(&kitty::transmit_png(img.id, path));
+        note(&mut self.trace, format_args!("transmit png {} {}", img.id, path.display()));
+        let _ = out.flush();
+        img.placed = None;
+        self.traced(&key, (w, h));
+        Some(Msg::VisualReady { key, w, h, max_scale: 1.0 })
+    }
+
+    /// New pixels for `key`: transmit them, re-placing the image if it's on screen.
+    fn show(&mut self, out: &mut impl Write, key: VisualKey, shm: &str, (w, h): (u32, u32), page: Option<u64>, file: Option<PathBuf>) -> Option<Msg> {
+        let fresh = !self.images.contains_key(&key);
+        self.traced(&key, (w, h));
+        let next_id = &mut self.next_id;
+        let img = self.images.entry(key.clone()).or_insert_with(|| {
+            let id = *next_id;
+            *next_id += 1;
+            Img { id, w, h, placed: None, page, paused: false, file: None }
+        });
+        if file.is_some() {
+            img.file = file;
+        }
         let resized = (img.w, img.h) != (w, h);
         (img.w, img.h) = (w, h);
         // Same size and on screen: replace the frame in place. Otherwise just
@@ -274,14 +436,14 @@ impl Gallery {
                     .pending
                     .drain()
                     .map(|(_, p)| match p {
-                        Pending::Mermaid(key) | Pending::Image(key) => Msg::VisualFailed { key, reason: "stage-helper stopped".into() },
+                        Pending::Mermaid(key) | Pending::Image(key, _) => Msg::VisualFailed { key, reason: "stage-helper stopped".into() },
                     })
                     .collect();
                 msgs.extend(self.pages.drain().map(|(_, key)| Msg::VisualFailed { key, reason: "stage-helper stopped".into() }));
                 msgs
             }
             Gfx::Raster { key, done } => match done {
-                Ok((shm, w, h)) => self.show(out, key, &shm, (w, h), None).into_iter().collect(),
+                Ok((shm, w, h)) => self.show(out, key, &shm, (w, h), None, None).into_iter().collect(),
                 Err(reason) => vec![Msg::VisualFailed { key, reason }],
             },
             Gfx::Helper(line) => {
@@ -292,14 +454,14 @@ impl Gallery {
                     let (Some(key), Some(shm), Some(size)) = (self.pages.get(&id).cloned(), v["shm"].as_str(), dims()) else {
                         return vec![];
                     };
-                    let msg = self.show(out, key, shm, size, Some(id));
+                    let msg = self.show(out, key, shm, size, Some(id), None);
                     let _ = self.send(json!({"op": "html-ack", "id": id, "frame": frame}));
                     return msg.into_iter().collect();
                 }
                 if v["ok"] == json!(false) {
                     let reason = v["error"].as_str().unwrap_or("stage-helper failed").to_owned();
                     let key = match self.pending.remove(&id) {
-                        Some(Pending::Mermaid(k) | Pending::Image(k)) => Some(k),
+                        Some(Pending::Mermaid(k) | Pending::Image(k, _)) => Some(k),
                         None => self.pages.remove(&id),
                     };
                     return key.map(|key| Msg::VisualFailed { key, reason }).into_iter().collect();
@@ -311,8 +473,8 @@ impl Gallery {
                         self.raster(key, svg);
                         vec![]
                     }
-                    Some(Pending::Image(key)) => match (v["shm"].as_str(), dims()) {
-                        (Some(shm), Some(size)) => self.show(out, key, shm, size, None).into_iter().collect(),
+                    Some(Pending::Image(key, path)) => match (v["shm"].as_str(), dims()) {
+                        (Some(shm), Some(size)) => self.show(out, key, shm, size, None, Some(path)).into_iter().collect(),
                         _ => vec![Msg::VisualFailed { key, reason: "stage-helper sent no pixels".into() }],
                     },
                     None => vec![],
@@ -334,9 +496,11 @@ impl Gallery {
                 (Some(p), Some(q)) if p == q => {}
                 (Some(p), _) => {
                     let _ = out.write_all(&kitty::place(img.id, &p));
+                    note(&mut self.trace, format_args!("place {} at {},{} {}x{} cells src {:?}", img.id, p.col, p.row, p.cols, p.rows, p.src));
                     img.placed = Some(p);
                 }
                 (None, Some(_)) => {
+                    note(&mut self.trace, format_args!("unplace {}", img.id));
                     let _ = out.write_all(&kitty::unplace(img.id));
                     img.placed = None;
                 }
@@ -348,7 +512,7 @@ impl Gallery {
                         img.paused = true;
                         pause.push(page);
                     }
-                    (true, true) => {
+                    (true, true) if !self.held => {
                         img.paused = false;
                         resume.push(page);
                     }
@@ -364,10 +528,32 @@ impl Gallery {
         }
     }
 
-    /// The screen was cleared (a resize): placements are gone, so place again.
-    pub fn replace_all(&mut self) {
-        for img in self.images.values_mut() {
+    /// The screen was cleared (a resize). Placements are gone, and Rex drops the
+    /// images too, so send every one again (at `target`); the next `place` shows them.
+    pub fn replace_all(&mut self, out: &mut impl Write, target: Target) {
+        self.target = target;
+        note(&mut self.trace, format_args!("clear: sending {} images again", self.images.len()));
+        let mut decode = Vec::new();
+        for (key, img) in self.images.iter_mut() {
             img.placed = None;
+            match img.file.as_ref().map(|f| (kitty::png_size(&read_head(f)).is_some(), f)) {
+                Some((true, file)) => {
+                    let _ = out.write_all(&kitty::transmit_png(img.id, file));
+                }
+                Some((false, file)) => decode.push((key.clone(), file.clone())),
+                None => {}
+            }
+        }
+        for (key, file) in decode {
+            let _ = self.decode(key, file);
+        }
+        for (key, svg) in self.svgs.clone() {
+            self.raster(key, svg);
+        }
+        // A resize makes each page measure again and send a fresh frame.
+        let (width, max_height) = self.html_size();
+        for page in self.pages.keys().copied().collect::<Vec<_>>() {
+            let _ = self.send(json!({"op": "html-resize", "id": page, "width": width, "max_height": max_height, "scale": SCALE}));
         }
     }
 
@@ -375,6 +561,16 @@ impl Gallery {
     pub fn clear(&mut self, out: &mut impl Write) {
         let _ = out.write_all(kitty::FREE_ALL);
         self.images.clear();
+    }
+}
+
+impl Drop for Gallery {
+    /// Hang up on the helper (its reader thread holds a clone of the socket, so
+    /// dropping ours alone wouldn't); it closes this stage's pages.
+    fn drop(&mut self) {
+        if let Some(h) = &self.helper {
+            let _ = h.stream.shutdown(std::net::Shutdown::Both);
+        }
     }
 }
 
@@ -404,7 +600,7 @@ mod tests {
     #[test]
     fn live_frames_reuse_the_placed_pixel_rect() {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut g = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), Target { width_px: 660, max_height_px: 360 });
+        let mut g = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 660, max_height_px: 360 });
         let key: VisualKey = ("p".into(), 1, 0);
         g.pages.insert(9, key.clone());
         let frame = |n: u64| Gfx::Helper(format!(r#"{{"id":9,"frame":{n},"shm":"/stg-test-{n}","w":660,"h":360}}"#));
@@ -420,10 +616,11 @@ mod tests {
     #[test]
     fn rasterizes_svg_at_the_card_width() {
         let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="#89b4fa"/></svg>"##;
-        let (px, w, h) = rasterize(svg, 150).unwrap();
+        let (px, w, h) = rasterize(svg, 150, 1000).unwrap();
         assert_eq!((w, h), (150, 75));
         assert_eq!(&px[..4], &[0x89, 0xb4, 0xfa, 0xff]);
-        // Never past 2× the SVG's own size.
-        assert_eq!(rasterize(svg, 1000).unwrap().1, 200);
+        // Never past 2× the SVG's own size, and no taller than it will be shown.
+        assert_eq!(rasterize(svg, 1000, 1000).unwrap().1, 200);
+        assert_eq!(rasterize(svg, 1000, 40).unwrap().2, 40);
     }
 }

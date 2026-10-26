@@ -141,6 +141,27 @@ private func page(_ html: String) throws -> String {
         try h.send(["op": "html-close", "id": 8])
     }
 
+    @Test func updatesPatchStylesAndTextInPlaceElseReload() throws {
+        let v1 = "<style>p{color:#fff}</style><body style='margin:0'><p id=t>one</p><script>let x = 1</script></body>"
+        let path = try page(v1)
+        let h = try Helper()
+        try h.send(["op": "html-open", "id": 9, "path": path, "width": 200, "max_height": 100, "scale": 1, "fps": 60])
+        let first = try #require(h.next())
+        shm_unlink(try #require(first["shm"] as? String))
+        try h.send(["op": "html-ack", "id": 9, "frame": 1])
+        func update(_ html: String) throws -> Bool? {
+            try h.send(["op": "html-update", "id": 9, "path": try page(html)])
+            while let r = h.next(2) {
+                if let shm = r["shm"] as? String { shm_unlink(shm); continue }
+                if let patched = r["patched"] as? Bool { return patched }
+            }
+            return nil
+        }
+        #expect(try update(v1.replacingOccurrences(of: "one", with: "two").replacingOccurrences(of: "#fff", with: "#f00")) == true)
+        #expect(try update(v1.replacingOccurrences(of: "let x = 1", with: "let x = 2")) == false, "a script change reloads")
+        try h.send(["op": "html-close", "id": 9])
+    }
+
     @Test func unknownOpsAndBadRequestsError() throws {
         let h = try Helper()
         try h.send(["op": "nope", "id": 3])

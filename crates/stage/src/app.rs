@@ -98,6 +98,8 @@ pub enum Msg {
     Key(KeyEvent),
     Mouse(MouseEvent),
     Resize(u16, u16),
+    /// The terminal's cell size in px changed (or became known).
+    CellPx((u16, u16)),
     Event(Event),
     Reply(Reply),
     /// The watch stream dropped; it reconnects on its own with `since = last_seq`.
@@ -309,6 +311,13 @@ impl App {
             Msg::Mouse(m) => self.mouse(m),
             Msg::Resize(w, h) => {
                 self.size = (w, h);
+                vec![Effect::Redraw]
+            }
+            Msg::CellPx(px) => {
+                if px == self.cell_px {
+                    return vec![];
+                }
+                self.cell_px = px;
                 vec![Effect::Redraw]
             }
             Msg::Event(e) => self.event(e),

@@ -17,15 +17,10 @@
 //!
 //! # Highlighter
 //!
-//! tree-sitter-highlight with 17 bundled grammars (bash, c, cpp, css, go,
-//! html, java, javascript, json, python, ruby, rust, swift, toml, tsx,
-//! typescript, yaml), chosen over syntect by measurement: on 500 lines of
-//! Rust, tree-sitter highlights in ~1.3 ms where syntect (`default-fancy`)
-//! takes 12 ms warm and 60 ms on its first call (lazy regex compilation).
-//! tree-sitter's one-time cost is compiling a language's queries (Rust ~25 ms,
-//! Swift ~170 ms, most others under 20 ms), done lazily once per language into
-//! a `static OnceLock`, never twice; [`warm_languages`] does them all up front
-//! on a background thread if you'd rather not pay it on a first render.
+//! Pierre's Highlights (`pierre/highlights.wasm`), a WebAssembly lexer for
+//! 80 languages, run in the wasmi interpreter. It replaced tree-sitter: on a
+//! 57 KB Rust file it lexes in ~7 ms warm where tree-sitter took ~21 ms, with
+//! no per-language query compile (one ~4 ms module compile per process).
 //! Unknown languages render as plain lines. Diff sides highlight in parallel
 //! on scoped threads. Numbers: `crates/posts/BENCH.md`.
 //!
@@ -72,7 +67,7 @@ mod validate;
 pub use json_store::{AssetMeta, PostRec, SessionFile, Store, VersionRec, SCHEMA};
 pub use kits::{kits, KIT_IDS};
 pub use render::{
-    post_render, post_render_json, render_part, warm_languages, CacheStats, RenderCache,
+    post_render, post_render_json, render_part, CacheStats, RenderCache,
     RENDER_VERSION,
 };
 pub use store::*;

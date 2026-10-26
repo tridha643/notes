@@ -38,6 +38,22 @@ pub fn transmit(id: u32, shm: &str, (w, h): (u32, u32), place: Option<&Place>) -
     .into_bytes()
 }
 
+/// Hand the terminal a PNG file as image `id`: it reads and decodes the file
+/// itself (`t=f,f=100`), so stage never decodes or copies the pixels.
+pub fn transmit_png(id: u32, path: &std::path::Path) -> Vec<u8> {
+    let name = STANDARD.encode(path.as_os_str().as_encoded_bytes());
+    format!("\x1b_Ga=t,t=f,f=100,i={id},q=2;{name}\x1b\\").into_bytes()
+}
+
+/// A PNG's pixel size from its IHDR chunk, or `None` if it isn't a PNG.
+pub fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let be = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+    Some((be(&bytes[16..20]), be(&bytes[20..24])))
+}
+
 /// Show an already-transmitted image at `p` (replaces its placement).
 pub fn place(id: u32, p: &Place) -> Vec<u8> {
     format!("{}\x1b_Ga=p,i={id},{},q=2\x1b\\", at(p), place_keys(p)).into_bytes()

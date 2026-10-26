@@ -338,15 +338,6 @@ pub fn post_render(s: &Store, cache: &RenderCache, args: &PostShowArgs) -> Resul
     Ok(cache.render_post(&s.db, &post_show(s, args)?))
 }
 
-/// Compile every language's highlight queries now (~350 ms total, swift alone
-/// ~190 ms) instead of on each language's first render. Optional: call it
-/// from a background thread at daemon start to keep first renders smooth.
-pub fn warm_languages() {
-    for lang in highlight::ALL_LANGS {
-        lang.config();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
