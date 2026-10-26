@@ -27,6 +27,7 @@ use ratatui::{
 use stage::{
     app::{App, Effect, Msg},
     client::{StageClient, Watch},
+    gallery::Gallery,
     latency::Latency,
     perform, probe, pump, ui,
 };
@@ -104,9 +105,18 @@ fn main() -> ExitCode {
         app.size = (size.width, size.height);
     }
     let mut latency = Latency::from_env();
-    let mut draw = |term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App| {
+    let mut gallery = Gallery::new(tx.clone(), StageClient::new(sock.clone()), cache_dir(), app.target());
+    let mut drawn_size = app.size;
+    let mut draw = |term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App, gallery: &mut Gallery| {
+        // A resize clears the screen (and with it kitty's placements): re-place everything.
+        if app.size != drawn_size {
+            gallery.replace_all();
+            drawn_size = app.size;
+        }
+        gallery.retarget(app.target());
         let _ = term.backend_mut().write_all(b"\x1b[?2026h");
         let _ = term.draw(|f| ui::draw(f, app));
+        gallery.place(term.backend_mut(), &app.on_screen);
         let _ = term.backend_mut().write_all(b"\x1b[?2026l");
         let _ = term.backend_mut().flush();
         latency.painted(&app.take_fresh());
@@ -115,7 +125,7 @@ fn main() -> ExitCode {
     // Draw first, probe after: the queries go out, the first frame paints, and
     // only then do we wait (≤100 ms) for the replies.
     let _ = probe::send(&mut io::stdout());
-    draw(&mut term, &mut app);
+    draw(&mut term, &mut app, &mut gallery);
     let p = probe::read(0, Duration::from_millis(100));
     app.update(Msg::Probed { cell_px: p.cell_px, kitty: p.kitty });
 
@@ -187,12 +197,19 @@ fn main() -> ExitCode {
     let mut pending = perform(&mut app, &mut client, start);
     loop {
         let mut redraw = false;
+        let mut later = Vec::new();
         for effect in pending.drain(..) {
             match effect {
                 Effect::Redraw => redraw = true,
                 Effect::Quit => {
+                    gallery.clear(term.backend_mut());
                     restore();
                     return ExitCode::SUCCESS;
+                }
+                Effect::NeedVisual { key, source, target } => {
+                    for m in gallery.need(key, source, target) {
+                        later.extend(pump(&mut app, &mut client, m));
+                    }
                 }
                 Effect::Fatal(m) => {
                     restore();
@@ -212,16 +229,31 @@ fn main() -> ExitCode {
                 Effect::Request(_) => unreachable!("pump performs requests"),
             }
         }
+        if !later.is_empty() {
+            // Effects of a visual's failure (a redraw): run them before blocking.
+            pending = later;
+            if redraw {
+                pending.push(Effect::Redraw);
+            }
+            continue;
+        }
         if redraw {
-            draw(&mut term, &mut app);
+            draw(&mut term, &mut app, &mut gallery);
         }
         let Ok(msg) = rx.recv() else {
             restore();
             return ExitCode::SUCCESS;
         };
-        pending.extend(pump(&mut app, &mut client, msg));
-        while let Ok(msg) = rx.try_recv() {
-            pending.extend(pump(&mut app, &mut client, msg));
+        for msg in std::iter::once(msg).chain(std::iter::from_fn(|| rx.try_recv().ok())) {
+            match msg {
+                // Graphics plumbing goes to the gallery; only its results reach the app.
+                Msg::Gfx(g) => {
+                    for m in gallery.handle(term.backend_mut(), g) {
+                        pending.extend(pump(&mut app, &mut client, m));
+                    }
+                }
+                msg => pending.extend(pump(&mut app, &mut client, msg)),
+            }
         }
     }
 }

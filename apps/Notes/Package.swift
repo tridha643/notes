@@ -11,6 +11,10 @@ let package = Package(
         // Window, sidebar, editor and posts; a library so tests can drive the views.
         .target(name: "NotesUI", dependencies: ["NotesCore"]),
         .executableTarget(name: "Notes", dependencies: ["NotesUI"]),
-        .testTarget(name: "NotesCoreTests", dependencies: ["NotesCore", "NotesUI"]),
+        // stage's pixel helper (JSON lines on stdin/stdout): pele SVG, image decode, live
+        // HTML frames into POSIX shm. StageShm is a C shim because shm_open is variadic.
+        .target(name: "StageShm", path: "Sources/StageHelper/Shm"),
+        .executableTarget(name: "stage-helper", dependencies: ["NotesCore", "StageShm"], path: "Sources/StageHelper", exclude: ["Shm"]),
+        .testTarget(name: "NotesCoreTests", dependencies: ["NotesCore", "NotesUI", "StageShm", "stage-helper"]),
     ]
 )

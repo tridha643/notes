@@ -6,6 +6,8 @@ pub mod app;
 pub mod cards;
 pub mod client;
 pub mod commands;
+pub mod gallery;
+pub mod kitty;
 pub mod latency;
 pub mod probe;
 pub mod sanitize;

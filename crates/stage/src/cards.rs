@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use notes_proto::posts::{
-    Comment, DiffLineKind, Part, PartRender, Post, PostRender, StyledLine, TraceStep,
+    AssetId, Comment, DiffLineKind, Part, PartRender, Post, PostRender, StyledLine, TraceStep,
 };
 use ratatui::{
     style::{Modifier, Style},
@@ -29,6 +29,32 @@ pub enum CardBody {
     Lines(Vec<Line<'static>>),
     Tree(FoldTree),
     Placeholder(String),
+    /// Preformatted rows (terminal output, code): never re-flowed. A row wider
+    /// than the card hard-wraps; continuations start with `gutter` (the line
+    /// number column's blank twin) or a dim `↪`. `shade` gives it a terminal's
+    /// own background.
+    Pre { lines: Vec<Line<'static>>, gutter: Option<usize>, shade: bool },
+    /// Pixels drawn through kitty graphics; `fallback` shows until they're
+    /// ready, and for good if they can't be made.
+    Visual { source: VisualSource, fallback: Vec<Line<'static>> },
+}
+
+/// What a visual card renders from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VisualSource {
+    Mermaid(String),
+    Asset(AssetId),
+    Html(String),
+}
+
+/// A visual's state as layout sees it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Fit {
+    /// Sized to this many cells.
+    Ready { cols: u16, rows: u16 },
+    /// Still rendering: hold `rows` rows, so the feed doesn't jump when it lands.
+    Pending { rows: u16 },
+    Failed(String),
 }
 
 /// JSON values and trace steps, flattened in preorder. `end` is the index
@@ -99,11 +125,19 @@ fn card(part: &Part, render: Option<&PartRender>) -> Card {
         },
         (Part::Code { title, language, code, .. }, Some(PartRender::Code { line_start, lines, .. })) => Card {
             label: label("code", title.as_deref().or(language.as_deref())),
-            body: CardBody::Lines(capped(code_lines(*line_start, lines), code.len())),
+            body: CardBody::Pre {
+                gutter: Some(gutter_width(*line_start, lines.len())),
+                lines: capped(code_lines(*line_start, lines), code.len()),
+                shade: false,
+            },
         },
         (Part::Code { title, language, code, line_start, .. }, _) => Card {
             label: label("code", title.as_deref().or(language.as_deref())),
-            body: CardBody::Lines(capped(plain_code(code, line_start.unwrap_or(1)), code.len())),
+            body: CardBody::Pre {
+                gutter: Some(gutter_width(line_start.unwrap_or(1), code.lines().count())),
+                lines: capped(plain_code(code, line_start.unwrap_or(1)), code.len()),
+                shade: false,
+            },
         },
         (Part::Diff { patch, files, .. }, Some(PartRender::Diff { layout, files: rendered })) => {
             let mut label = label("diff", Some(&format!("{} files", rendered.len())));
@@ -123,11 +157,15 @@ fn card(part: &Part, render: Option<&PartRender>) -> Card {
         }
         (Part::Terminal { title, text, .. }, Some(PartRender::Terminal { lines })) => Card {
             label: label("terminal", title.as_deref()),
-            body: CardBody::Lines(capped(lines.iter().map(styled).collect(), text.len())),
+            body: CardBody::Pre { lines: capped(terminal_lines(lines.iter().map(styled).collect()), text.len()), gutter: None, shade: true },
         },
         (Part::Terminal { title, text, .. }, _) => Card {
             label: label("terminal", title.as_deref()),
-            body: CardBody::Lines(capped(sanitize::lines(text).map(Line::from).collect(), text.len())),
+            body: CardBody::Pre {
+                lines: capped(terminal_lines(sanitize::lines(text).map(Line::from).collect()), text.len()),
+                gutter: None,
+                shade: true,
+            },
         },
         (Part::Json { data, .. }, _) => Card {
             label: "json".into(),
@@ -144,22 +182,25 @@ fn card(part: &Part, render: Option<&PartRender>) -> Card {
             },
         },
         (Part::Mermaid { mermaid, .. }, _) => Card {
-            label: "mermaid · source (diagram lands in S5)".into(),
-            body: CardBody::Lines(capped(
-                sanitize::lines(mermaid).map(|l| Line::styled(l, ui::dim())).collect(),
-                mermaid.len(),
-            )),
+            label: "mermaid".into(),
+            body: CardBody::Visual {
+                source: VisualSource::Mermaid(mermaid.clone()),
+                fallback: capped(sanitize::lines(mermaid).map(|l| Line::styled(l, ui::dim())).collect(), mermaid.len()),
+            },
         },
-        (Part::Image { alt, caption, .. }, _) => Card {
-            label: "image".into(),
-            body: CardBody::Placeholder(format!(
-                "[image{}] · inline images land in S3",
-                alt.as_deref().or(caption.as_deref()).map(|a| format!(": {}", sanitize(a))).unwrap_or_default()
-            )),
+        (Part::Image { asset_id, alt, caption, .. }, _) => Card {
+            label: label("image", caption.as_deref()),
+            body: CardBody::Visual {
+                source: VisualSource::Asset(asset_id.clone()),
+                fallback: vec![Line::styled(alt.as_deref().map_or("image".into(), |a| sanitize(a).into_owned()), ui::dim())],
+            },
         },
-        (Part::Html { .. }, _) => Card {
+        (Part::Html { html, .. }, _) => Card {
             label: "html".into(),
-            body: CardBody::Placeholder("html · snapshot lands in S4 · :open opens it in the browser".into()),
+            body: CardBody::Visual {
+                source: VisualSource::Html(html.clone()),
+                fallback: vec![Line::styled("o opens it in the browser", ui::dim())],
+            },
         },
     }
 }
@@ -181,6 +222,56 @@ fn styled(line: &StyledLine) -> Line<'static> {
             .map(|s| Span::styled(sanitize(&s.text).into_owned(), ui::class_style(s.class.as_deref())))
             .collect::<Vec<_>>(),
     )
+}
+
+/// Cells taken by a code card's line-number column: digits, space, `│`, space.
+fn gutter_width(start: u32, lines: usize) -> usize {
+    (start as usize + lines).to_string().len() + 3
+}
+
+/// Terminal output as a terminal shows it: tabs to 8-column stops, a `$`
+/// prompt picked out, trailing blank lines dropped, and "(no output)" if empty.
+fn terminal_lines(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = lines
+        .into_iter()
+        .map(|line| {
+            let mut col = 0;
+            let mut spans: Vec<Span<'static>> = line
+                .spans
+                .into_iter()
+                .map(|span| {
+                    let mut text = String::with_capacity(span.content.len());
+                    for ch in span.content.chars() {
+                        if ch == '\t' {
+                            let n = 8 - col % 8;
+                            text.extend(std::iter::repeat_n(' ', n));
+                            col += n;
+                        } else {
+                            text.push(ch);
+                            col += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                        }
+                    }
+                    Span::styled(text, span.style)
+                })
+                .collect();
+            if let Some(first) = spans.first_mut() {
+                if let Some(rest) = first.content.strip_prefix("$ ") {
+                    let rest = rest.to_owned();
+                    let style = first.style;
+                    *first = Span::styled("$ ", Style::new().fg(ui::TEAL).add_modifier(Modifier::BOLD));
+                    spans.insert(1, Span::styled(rest, style.add_modifier(Modifier::BOLD)));
+                }
+            }
+            Line::from(spans)
+        })
+        .collect();
+    while out.last().is_some_and(|l| l.width() == 0) {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push(Line::styled("(no output)", ui::dim()));
+    }
+    out
 }
 
 fn gutter(n: u32, width: usize) -> Vec<Span<'static>> {
@@ -511,6 +602,46 @@ pub enum Hit {
 pub struct Laid {
     pub lines: Vec<Line<'static>>,
     pub hits: Vec<Hit>,
+    pub slots: Vec<Slot>,
+}
+
+/// Rows reserved for a card's pixels: from `line`, `rows` tall, `cols` wide,
+/// `col` cells in from the card's left edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Slot {
+    pub card: usize,
+    pub line: usize,
+    pub rows: u16,
+    pub cols: u16,
+    pub col: u16,
+}
+
+/// Split a preformatted line every `width` cells, keeping every space. Each
+/// continuation starts with the gutter's blank twin (`   │ `) or a dim `↪ `.
+pub fn hard_wrap(line: &Line<'static>, width: usize, gutter: Option<usize>) -> Vec<Line<'static>> {
+    let width = width.max(4);
+    let lead: Vec<Span<'static>> = match gutter {
+        Some(g) if g + 4 <= width => vec![Span::raw(" ".repeat(g - 2)), Span::styled("│ ", ui::border())],
+        _ => vec![Span::styled("↪ ", ui::dim())],
+    };
+    let lead_w: usize = lead.iter().map(|s| s.content.width()).sum();
+    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut used = 0;
+    for span in &line.spans {
+        let mut chunk = String::new();
+        for ch in span.content.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + cw > width {
+                rows.last_mut().unwrap().push(Span::styled(std::mem::take(&mut chunk), span.style));
+                rows.push(lead.clone());
+                used = lead_w;
+            }
+            chunk.push(ch);
+            used += cw;
+        }
+        rows.last_mut().unwrap().push(Span::styled(chunk, span.style));
+    }
+    rows.into_iter().map(|spans| Line::from(spans).style(line.style)).collect()
 }
 
 /// Wrap a styled line to `width` cells, breaking at spaces where it can.
@@ -589,7 +720,8 @@ fn boxed(content: Line<'static>, inner: usize) -> Line<'static> {
 }
 
 /// Every card, wrapped to `width`, with folds applied and comments below.
-pub fn layout(cards: &[Card], comments: &[Comment], width: u16, folds: &Folds) -> Laid {
+/// `fit` sizes each visual card (by card index) for the inner width.
+pub fn layout(cards: &[Card], comments: &[Comment], width: u16, folds: &Folds, fit: &dyn Fn(usize) -> Fit) -> Laid {
     let width = (width as usize).max(8);
     let inner = width - 4;
     let mut laid = Laid::default();
@@ -601,12 +733,41 @@ pub fn layout(cards: &[Card], comments: &[Comment], width: u16, folds: &Folds) -
         push(&mut laid, bordered(&card.label, width), Hit::Card(c));
         let rows: Vec<(Line<'static>, Hit)> = match &card.body {
             CardBody::Lines(lines) => lines.iter().map(|l| (l.clone(), Hit::Card(c))).collect(),
+            CardBody::Pre { lines, gutter, shade } => {
+                let shade = if *shade { Style::new().bg(ui::CODE_BG) } else { Style::new() };
+                for line in lines {
+                    for row in hard_wrap(line, inner, *gutter) {
+                        push(&mut laid, boxed(row.patch_style(shade), inner), Hit::Card(c));
+                    }
+                }
+                push(&mut laid, Line::styled(format!("╰{}╯", "─".repeat(width - 2)), ui::border()), Hit::Card(c));
+                push(&mut laid, Line::default(), Hit::None);
+                continue;
+            }
             CardBody::Placeholder(text) => vec![(Line::styled(text.clone(), ui::dim()), Hit::Card(c))],
             CardBody::Tree(tree) => tree
                 .visible(folds.get(&c))
                 .into_iter()
                 .map(|(n, l)| (l, Hit::Node(c, n)))
                 .collect(),
+            CardBody::Visual { fallback, .. } => match fit(c) {
+                Fit::Ready { cols, rows } => {
+                    let cols = cols.min(inner as u16);
+                    let col = 2 + (inner as u16 - cols) / 2;
+                    laid.slots.push(Slot { card: c, line: laid.lines.len(), rows, cols, col });
+                    vec![(Line::default(), Hit::Card(c)); rows as usize]
+                }
+                Fit::Pending { rows } => {
+                    let mut held = vec![(Line::styled("rendering…", ui::dim()), Hit::Card(c))];
+                    held.resize(rows.max(1) as usize, (Line::default(), Hit::Card(c)));
+                    held
+                }
+                Fit::Failed(why) => {
+                    let mut rows: Vec<_> = fallback.iter().map(|l| (l.clone(), Hit::Card(c))).collect();
+                    rows.push((Line::styled(sanitize(&why).into_owned(), ui::dim()), Hit::Card(c)));
+                    rows
+                }
+            },
         };
         for (line, hit) in rows {
             for row in wrap(&line, inner) {
@@ -683,7 +844,7 @@ mod tests {
     fn golden(part: Part, render: PartRender) -> String {
         let p = post(vec![part]);
         let r = PostRender { id: "p1".into(), version: 1, parts: vec![render] };
-        let laid = layout(&build_cards(&p, &r), &[], 40, &Folds::new());
+        let laid = layout(&build_cards(&p, &r), &[], 40, &Folds::new(), &|_| Fit::Pending { rows: 1 });
         let height = laid.lines.len() as u16;
         let mut term = Terminal::new(TestBackend::new(40, height)).unwrap();
         term.draw(|f| f.render_widget(Paragraph::new(laid.lines.clone()), f.area())).unwrap();
@@ -779,7 +940,7 @@ mod tests {
                 }],
             }],
         };
-        let laid = layout(&build_cards(&post(vec![part]), &PostRender { id: "p1".into(), version: 1, parts: vec![render] }), &[], 40, &Folds::new());
+        let laid = layout(&build_cards(&post(vec![part]), &PostRender { id: "p1".into(), version: 1, parts: vec![render] }), &[], 40, &Folds::new(), &|_| Fit::Pending { rows: 1 });
         let row = &laid.lines[3];
         let pad = &row.spans[row.spans.len() - 2];
         assert_eq!(pad.style.bg, Some(ui::ADDED_BG));
@@ -824,18 +985,26 @@ mod tests {
     }
 
     #[test]
-    fn golden_placeholders() {
-        assert_eq!(
-            golden(Part::Image { asset_id: "a".into(), alt: Some("chart".into()), caption: None, id: None }, PartRender::Native),
-            "╭─ image ──────────────────────────────╮
-│ [image: chart] · inline images land  │
-│ in S3                                │
-╰──────────────────────────────────────╯"
+    fn visuals_reserve_rows_or_fall_back() {
+        let cards = build_cards(
+            &post(vec![Part::Mermaid { mermaid: "graph TD\nA-->B".into(), id: None }]),
+            &PostRender { id: "p1".into(), version: 1, parts: vec![PartRender::Native] },
         );
-        let mermaid = golden(Part::Mermaid { mermaid: "graph TD\nA-->B".into(), id: None }, PartRender::Native);
-        assert!(mermaid.contains("A-->B"), "{mermaid}");
-        let html = golden(Part::Html { html: "<b>x</b>".into(), kits: vec![], id: None }, PartRender::Native);
-        assert!(html.contains("snapshot lands in S4"), "{html}");
+        let lay = |fit: Fit| layout(&cards, &[], 40, &Folds::new(), &move |_| fit.clone());
+        let pending = lay(Fit::Pending { rows: 4 });
+        assert!(pending.lines[1].to_string().contains("rendering…"));
+        assert!(pending.slots.is_empty());
+        // The held rows are the size it's expected to land at, so nothing below jumps.
+        assert_eq!(pending.lines.len(), 1 + 4 + 1 + 1);
+
+        let failed = lay(Fit::Failed("no stage-helper".into()));
+        let text: String = failed.lines.iter().map(|l| l.to_string()).collect();
+        assert!(text.contains("A-->B") && text.contains("no stage-helper"), "{text}");
+
+        // 36 inner cells, a 20×3 image: centered (col 2 + 8), three blank rows after the border.
+        let ready = lay(Fit::Ready { cols: 20, rows: 3 });
+        assert_eq!(ready.slots, vec![Slot { card: 0, line: 1, rows: 3, cols: 20, col: 10 }]);
+        assert_eq!(ready.lines.len(), 1 + 3 + 1 + 1);
     }
 
     #[test]
@@ -857,7 +1026,7 @@ mod tests {
     fn caps_a_huge_part() {
         let code = (0..1000).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
         let card = card(&Part::Code { code, language: None, title: None, line_start: None, id: None }, None);
-        let CardBody::Lines(lines) = card.body else { panic!() };
+        let CardBody::Pre { lines, .. } = card.body else { panic!() };
         assert_eq!(lines.len(), sanitize::PART_LINES + 1);
         assert!(lines.last().unwrap().to_string().contains("600 more lines"));
     }
@@ -868,5 +1037,25 @@ mod tests {
         assert_eq!(rows.iter().map(|l| l.to_string()).collect::<Vec<_>>(), ["aaa bbb", "ccc"]);
         let rows = wrap(&Line::from("abcdefghij"), 4);
         assert_eq!(rows.iter().map(|l| l.to_string()).collect::<Vec<_>>(), ["abcd", "efgh", "ij"]);
+    }
+}
+
+#[cfg(test)]
+mod pre_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_output_keeps_columns_and_marks_continuations() {
+        let lines = terminal_lines(vec![Line::from("$ cargo test"), Line::from("a\tb"), Line::from(""), Line::from("")]);
+        let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        assert_eq!(text, ["$ cargo test", "a       b"], "tab to column 8, trailing blanks dropped");
+        assert_eq!(lines[0].spans[0].style.fg, Some(ui::TEAL));
+        assert_eq!(terminal_lines(vec![])[0].to_string(), "(no output)");
+
+        let rows: Vec<String> = hard_wrap(&Line::from("0123456789abcdef"), 10, None).iter().map(|l| l.to_string()).collect();
+        assert_eq!(rows, ["0123456789", "↪ abcdef"]);
+        // Code continuations sit under the gutter rule, not under the number.
+        let rows: Vec<String> = hard_wrap(&Line::from(" 9 │ 0123456789abcdef"), 14, Some(5)).iter().map(|l| l.to_string()).collect();
+        assert_eq!(rows, [" 9 │ 012345678", "   │ 9abcdef"]);
     }
 }

@@ -109,7 +109,7 @@ fn bootstrap_and_live_updates_build_each_version_once() {
     perform(&mut app, &mut client, start);
     assert_eq!(app.open.as_ref(), Some(&session));
     assert_eq!(app.posts.len(), 2);
-    assert_eq!(app.builds, 1, "only the shown (latest) post is built");
+    assert_eq!(app.builds, 2, "the feed builds every post once");
 
     // A new version of the shown post, then a third post: each built once.
     let two = app.shown.clone().unwrap();

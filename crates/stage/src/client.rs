@@ -1,4 +1,4 @@
-//! `StageClient`: the eight notesd verbs stage may call, and nothing else.
+//! `StageClient`: the notesd verbs stage may call (all reads, plus `comment-new`), and nothing else.
 //! Requests go over one connection; `watch` holds its own.
 
 use std::{
@@ -9,7 +9,7 @@ use std::{
 
 use notes_proto::{
     posts::{
-        Comment, CommentListArgs, CommentNewArgs, Post, PostListArgs, PostRender, PostShowArgs,
+        AssetId, Comment, CommentListArgs, CommentNewArgs, Post, PostListArgs, PostRender, PostShowArgs,
         PostSummary, Session, SessionHit, SessionId, SessionSearchArgs,
     },
     to_line, ErrorBody, ErrorCode, Event, Request, Response, Verb, WatchArgs, PROTOCOL_VERSION,
@@ -107,6 +107,13 @@ impl StageClient {
 
     pub fn comment_new(&mut self, args: CommentNewArgs) -> Result<Comment, ErrorBody> {
         self.call(Verb::CommentNew(args))
+    }
+
+/// An asset's bytes (images in image parts). Read-only.
+    pub fn asset_get(&mut self, id: AssetId) -> Result<Vec<u8>, ErrorBody> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let data: notes_proto::posts::AssetData = self.call(Verb::AssetGet(notes_proto::posts::IdArgs { id }))?;
+        STANDARD.decode(data.data_base64.trim()).map_err(|e| unreachable(format!("asset data: {e}")))
     }
 
     pub fn comment_list(&mut self, session: SessionId) -> Result<Vec<Comment>, ErrorBody> {

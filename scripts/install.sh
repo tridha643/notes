@@ -10,6 +10,12 @@ support="$HOME/Library/Application Support/Notes"
 plist="$HOME/Library/LaunchAgents/dev.notes.notesd.plist"
 mkdir -p "$bin" "$support" "$HOME/Notes" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 install -m 755 target/release/notesd target/release/notes target/release/stage "$bin/"
+# stage-helper (Swift): mermaid via pele, image decoding, live HTML frames for stage.
+# It loads pele from Notes_NotesCore.bundle, which must sit next to the binary.
+swift build -c release --package-path apps/Notes --product stage-helper
+swiftbin="$(swift build -c release --package-path apps/Notes --show-bin-path)"
+install -m 755 "$swiftbin/stage-helper" "$bin/"
+rm -rf "$bin/Notes_NotesCore.bundle" && cp -R "$swiftbin/Notes_NotesCore.bundle" "$bin/"
 # Standard, not Background: notesd answers the UI and the CLI, so it shouldn't be throttled.
 cat > "$plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -30,4 +36,6 @@ cat > "$plist" <<PLIST
 PLIST
 launchctl bootout "gui/$(id -u)/dev.notes.notesd" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$plist"
+# launchd needs a moment after bootstrap before the socket answers.
+for _ in 1 2 3 4 5 6 7 8 9 10; do "$bin/notes" doctor 2>/dev/null && exit 0; sleep 0.2; done
 "$bin/notes" doctor

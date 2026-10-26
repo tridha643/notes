@@ -14,10 +14,60 @@ use notes_proto::{
     ErrorBody, ErrorCode, Event,
 };
 
+use ratatui::text::{Line, Span};
+
 use crate::{
-    cards::{self, build_cards, Card, Folds, Hit, Laid},
+    cards::{self, build_cards, Card, CardBody, Fit, Folds, Hit, Laid, Slot, VisualSource},
     commands, ui,
 };
+
+/// The open session's posts as one stream, oldest first, the way sideshow's
+/// viewer shows a session: each post's title, then its part cards and comments.
+#[derive(Default)]
+pub struct Feed {
+    pub lines: Vec<Line<'static>>,
+    /// Per line: the post (index into `App::posts`) and what in it.
+    pub hits: Vec<(usize, Hit)>,
+    pub slots: Vec<(VisualKey, Slot)>,
+    /// First line of each post, by index into `App::posts`.
+    pub starts: Vec<usize>,
+}
+
+/// Everything the feed reads: per post (id, version, fold generation, built),
+/// width, page height, cell px, and the comment and visual generations.
+type FeedKey = (Vec<(PostId, u64, u64, bool)>, u16, u16, (u16, u16), u64, u64);
+
+/// One visual card: (post, version, card index).
+pub type VisualKey = (PostId, u64, usize);
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum VisualState {
+    Pending,
+    /// Pixels exist at `w`×`h`; `max_scale` caps upscaling (1 for photos,
+    /// 2 for vector diagrams rendered at 2× CSS px).
+    Ready { w: u32, h: u32, max_scale: f32 },
+    Failed(String),
+}
+
+/// Pixel budget for a visual: the card's inner width and half the visible height.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Target {
+    pub width_px: u32,
+    pub max_height_px: u32,
+}
+
+/// A visual on screen this frame: top-left cell, size in cells, and how many
+/// of its rows are cut off above (`top`) and shown (`rows` of `total`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnScreen {
+    pub key: VisualKey,
+    pub col: u16,
+    pub row: u16,
+    pub cols: u16,
+    pub top: u16,
+    pub rows: u16,
+    pub total: u16,
+}
 
 /// The only requests stage can make. `CommentNew` is its only write.
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +105,11 @@ pub enum Msg {
     WatchBack,
     /// Terminal probe replies (cell size in px, kitty graphics support).
     Probed { cell_px: Option<(u16, u16)>, kitty: bool },
+    /// A visual's pixels are ready, or can't be made.
+    VisualReady { key: VisualKey, w: u32, h: u32, max_scale: f32 },
+    VisualFailed { key: VisualKey, reason: String },
+    /// Graphics plumbing (helper replies, rasterized frames); `main` handles these.
+    Gfx(crate::gallery::Gfx),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,6 +123,8 @@ pub enum Effect {
     Quit,
     /// Print and exit 2 (unknown `--session`).
     Fatal(String),
+    /// Make pixels for a visual card.
+    NeedVisual { key: VisualKey, source: VisualSource, target: Target },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,14 +148,16 @@ pub struct Loaded {
     pub cards: Option<Vec<Card>>,
 }
 
+/// Everything a layout reads: version, width, height, cell px, comment, fold and visual generations.
+type LaidKey = (u64, u16, u16, (u16, u16), u64, u64, u64);
+
+/// Per post: folds, a pinned version, and the post's own layout cache.
 #[derive(Default)]
 pub struct View {
-    pub scroll: usize,
-    pub cursor: usize,
     pub folds: Folds,
     /// A version picked with `v`; `None` follows the latest.
     pub pinned: Option<u64>,
-    laid: Option<((u64, u16, u64, u64), Laid)>,
+    laid: Option<(LaidKey, Laid)>,
     fold_gen: u64,
 }
 
@@ -131,6 +190,31 @@ pub struct App {
     pub builds: usize,
     /// Bumped on every comment-list reply, so the layout cache sees new comments.
     comments_gen: u64,
+    pub visuals: HashMap<VisualKey, VisualState>,
+    /// Bumped when a visual's state changes, so the layout cache re-sizes it.
+    visual_gen: u64,
+    /// Visuals drawn this frame (set by `ui::draw`), for `main` to place.
+    pub on_screen: Vec<OnScreen>,
+    /// Feed scroll (first line on screen) and cursor line.
+    pub scroll: usize,
+    pub cursor: usize,
+    feed: Option<(FeedKey, Feed)>,
+    /// A post to bring to the top on the next layout (a sidebar pick, a follow).
+    jump: Option<PostId>,
+    /// A mouse drag in the feed: where it started and where it is, as (line, cell column).
+    pub drag: Option<((usize, u16), (usize, u16))>,
+    /// Sessions opened before: their posts, comments and place in the feed, so
+    /// coming back shows them at once (then refreshes) instead of a blank pane.
+    remembered: HashMap<SessionId, Remembered>,
+}
+
+struct Remembered {
+    posts: Vec<PostSummary>,
+    comments: Vec<Comment>,
+    scroll: usize,
+    cursor: usize,
+    shown: Option<PostId>,
+    follow: bool,
 }
 
 const WHEEL: usize = 3;
@@ -160,6 +244,15 @@ impl App {
             seen_rows: HashSet::new(),
             builds: 0,
             comments_gen: 0,
+            visuals: HashMap::new(),
+            visual_gen: 0,
+            on_screen: Vec::new(),
+            scroll: 0,
+            cursor: 0,
+            feed: None,
+            jump: None,
+            remembered: HashMap::new(),
+            drag: None,
         }
     }
 
@@ -169,6 +262,42 @@ impl App {
     }
 
     pub fn update(&mut self, msg: Msg) -> Vec<Effect> {
+        let mut fx = self.step(msg);
+        fx.extend(self.request_visuals());
+        fx
+    }
+
+    /// Pixel budget for visual cards at the current pane size.
+    pub fn target(&self) -> Target {
+        let inner = ui::geometry(self.size).main.width.saturating_sub(5).max(1) as u32;
+        Target {
+            width_px: inner * self.cell_px.0 as u32,
+            max_height_px: (self.page() as u32 / 2).max(1) * self.cell_px.1 as u32,
+        }
+    }
+
+    /// Ask once for the pixels of each visual card in the open session's posts.
+    fn request_visuals(&mut self) -> Vec<Effect> {
+        let target = self.target();
+        let mut fx = Vec::new();
+        let posts: Vec<(PostId, u64)> =
+            self.posts.iter().filter_map(|p| Some((p.id.clone(), self.version_of(&p.id)?))).collect();
+        for (id, version) in posts {
+            let Some(cards) = self.loaded.get(&(id.clone(), version)).and_then(|l| l.cards.as_ref()) else { continue };
+            for (c, card) in cards.iter().enumerate() {
+                if let CardBody::Visual { source, .. } = &card.body {
+                    let key = (id.clone(), version, c);
+                    if !self.visuals.contains_key(&key) {
+                        self.visuals.insert(key.clone(), VisualState::Pending);
+                        fx.push(Effect::NeedVisual { key, source: source.clone(), target });
+                    }
+                }
+            }
+        }
+        fx
+    }
+
+    fn step(&mut self, msg: Msg) -> Vec<Effect> {
         match msg {
             Msg::Key(k) if k.kind != KeyEventKind::Release => {
                 self.toast = None;
@@ -203,8 +332,19 @@ impl App {
                     self.cell_px = px;
                 }
                 self.kitty = kitty;
-                vec![]
+                vec![Effect::Redraw]
             }
+            Msg::VisualReady { key, w, h, max_scale } => {
+                self.visuals.insert(key, VisualState::Ready { w, h, max_scale });
+                self.visual_gen += 1;
+                vec![Effect::Redraw]
+            }
+            Msg::VisualFailed { key, reason } => {
+                self.visuals.insert(key, VisualState::Failed(reason));
+                self.visual_gen += 1;
+                vec![Effect::Redraw]
+            }
+            Msg::Gfx(_) => vec![],
         }
     }
 
@@ -231,11 +371,30 @@ impl App {
         if self.open.as_ref() == Some(&id) {
             return vec![];
         }
+        if let Some(old) = self.open.take() {
+            let r = Remembered {
+                posts: std::mem::take(&mut self.posts),
+                comments: std::mem::take(&mut self.comments),
+                scroll: self.scroll,
+                cursor: self.cursor,
+                shown: self.shown.take(),
+                follow: self.follow,
+            };
+            self.remembered.insert(old, r);
+        }
         self.open = Some(id.clone());
-        self.posts.clear();
-        self.comments.clear();
-        self.shown = None;
-        self.follow = true;
+        self.feed = None;
+        self.jump = None;
+        match self.remembered.remove(&id) {
+            Some(r) => {
+                (self.posts, self.comments, self.scroll, self.cursor, self.shown, self.follow) =
+                    (r.posts, r.comments, r.scroll, r.cursor, r.shown, r.follow);
+                self.comments_gen += 1;
+            }
+            None => {
+                (self.scroll, self.cursor, self.shown, self.follow) = (0, 0, None, true);
+            }
+        }
         self.banner = None;
         if let Some(i) = self.sessions.iter().position(|s| s.id == id) {
             self.sel = self.rows().iter().position(|r| *r == Row::Session(i)).unwrap_or(0);
@@ -258,6 +417,7 @@ impl App {
             Row::Post(i) => {
                 let id = self.posts[i].id.clone();
                 self.follow = i + 1 == self.posts.len();
+                self.jump = Some(id.clone());
                 self.show(id)
             }
         }
@@ -307,8 +467,7 @@ impl App {
         self.loaded.get(&(id, self.shown_version()?))?.cards.as_deref()
     }
 
-    pub fn shown_comments(&self) -> Vec<Comment> {
-        let Some(id) = &self.shown else { return vec![] };
+    fn comments_on(&self, id: &PostId) -> Vec<Comment> {
         self.comments.iter().filter(|c| c.post.as_ref() == Some(id)).cloned().collect()
     }
 
@@ -321,65 +480,147 @@ impl App {
         }
     }
 
-    /// The shown post laid out for the main column. Memoized on every input it
-    /// reads (version, width, comments generation, folds generation), so a
-    /// change to any of them is a different key and nothing is invalidated.
-    pub fn laid(&mut self) -> Option<&Laid> {
-        let id = self.shown.clone()?;
-        let version = self.shown_version()?;
-        let width = ui::geometry(self.size).main.width.saturating_sub(1);
-        let comments = self.shown_comments();
+    /// One post laid out at `width`, memoized in its view on everything it reads.
+    fn post_laid(&mut self, id: &PostId, version: u64, width: u16, page: u16) -> Option<&Laid> {
+        let comments = self.comments_on(id);
         let cards = self.loaded.get(&(id.clone(), version))?.cards.as_ref()?;
-        let view = self.views.entry(id).or_default();
-        let key = (version, width, self.comments_gen, view.fold_gen);
+        let (cell, visuals) = (self.cell_px, &self.visuals);
+        let view = self.views.entry(id.clone()).or_default();
+        let key = (version, width, page, cell, self.comments_gen, view.fold_gen, self.visual_gen);
         if view.laid.as_ref().is_none_or(|(k, _)| *k != key) {
-            view.laid = Some((key, cards::layout(cards, &comments, width, &view.folds)));
+            let inner = width.saturating_sub(4).max(1);
+            let fit = |c: usize| match visuals.get(&(id.clone(), version, c)) {
+                Some(VisualState::Ready { w, h, max_scale }) => fit_cells((*w, *h), *max_scale, inner, page / 2, cell),
+                Some(VisualState::Failed(why)) => Fit::Failed(why.clone()),
+                // Hold about the room a diagram or page usually takes.
+                Some(VisualState::Pending) | None => Fit::Pending { rows: (page / 3).clamp(3, 12) },
+            };
+            view.laid = Some((key, cards::layout(cards, &comments, width, &view.folds, &fit)));
         }
         view.laid.as_ref().map(|(_, l)| l)
+    }
+
+    /// The feed for the main column, rebuilt only when something it reads changed.
+    /// A rebuild (a post loading above, a resize rewrapping everything, a fold)
+    /// keeps the line under the cursor where it was on screen.
+    pub fn feed(&mut self) -> &Feed {
+        let width = ui::geometry(self.size).main.width.saturating_sub(1);
+        let page = self.page() as u16;
+        let posts: Vec<(PostId, u64, u64, bool)> = self
+            .posts
+            .iter()
+            .filter_map(|p| {
+                let v = self.version_of(&p.id)?;
+                let fold_gen = self.views.get(&p.id).map_or(0, |v| v.fold_gen);
+                let built = self.loaded.get(&(p.id.clone(), v)).is_some_and(|l| l.cards.is_some());
+                Some((p.id.clone(), v, fold_gen, built))
+            })
+            .collect();
+        let key: FeedKey = (posts.clone(), width, page, self.cell_px, self.comments_gen, self.visual_gen);
+        if self.feed.as_ref().is_none_or(|(k, _)| *k != key) {
+            // Where the cursor was: which post, how far into it, how far down the screen.
+            let anchor = self.feed.as_ref().and_then(|(_, f)| {
+                let (post, _) = *f.hits.get(self.cursor)?;
+                Some((self.posts.get(post)?.id.clone(), self.cursor - f.starts[post], self.cursor.saturating_sub(self.scroll)))
+            });
+            let mut feed = Feed::default();
+            for (i, (id, version, _, _)) in posts.iter().enumerate() {
+                feed.starts.push(feed.lines.len());
+                feed.lines.push(self.header(i));
+                feed.hits.push((i, Hit::None));
+                let start = feed.lines.len();
+                match self.post_laid(id, *version, width, page) {
+                    Some(laid) => {
+                        feed.lines.extend(laid.lines.iter().cloned());
+                        feed.hits.extend(laid.hits.iter().map(|h| (i, *h)));
+                        feed.slots.extend(laid.slots.iter().map(|s| {
+                            ((id.clone(), *version, s.card), Slot { line: s.line + start, ..*s })
+                        }));
+                    }
+                    None => {
+                        feed.lines.push(Line::styled("  loading…", ui::dim()));
+                        feed.hits.push((i, Hit::None));
+                        feed.lines.push(Line::default());
+                        feed.hits.push((i, Hit::None));
+                    }
+                }
+            }
+            let total = feed.lines.len();
+            if let Some(id) = self.jump.take() {
+                if let Some(i) = self.posts.iter().position(|p| p.id == id) {
+                    self.cursor = feed.starts[i];
+                    self.scroll = self.cursor;
+                }
+            } else if let Some((id, offset, row)) = anchor {
+                if let Some(i) = self.posts.iter().position(|p| p.id == id) {
+                    let end = feed.starts.get(i + 1).copied().unwrap_or(total);
+                    self.cursor = (feed.starts[i] + offset).min(end.saturating_sub(1));
+                    self.scroll = self.cursor.saturating_sub(row);
+                }
+            }
+            self.cursor = self.cursor.min(total.saturating_sub(1));
+            self.scroll = self.scroll.min(total.saturating_sub(page as usize)).min(self.cursor);
+            self.feed = Some((key, feed));
+        }
+        &self.feed.as_ref().expect("built above").1
+    }
+
+    /// A post's title row in the feed: bold title, dim version and time.
+    fn header(&self, i: usize) -> Line<'static> {
+        let p = &self.posts[i];
+        let title = crate::sanitize::sanitize(&p.title).into_owned();
+        Line::from(vec![
+            Span::styled(format!(" {title}"), ui::bold().fg(ui::TEXT)),
+            Span::styled(format!("  v{} · {}", p.version, ui::when(p.updated_at)), ui::dim()),
+        ])
     }
 
     fn page(&self) -> usize {
         ui::geometry(self.size).main.height.saturating_sub(1).max(1) as usize
     }
 
-    fn view(&mut self) -> Option<&mut View> {
-        let id = self.shown.clone()?;
-        self.views.get_mut(&id)
+    /// The shown post follows the cursor through the feed.
+    fn follow_cursor(&mut self) {
+        let cursor = self.cursor;
+        let post = self.feed().hits.get(cursor).map(|(p, _)| *p);
+        if let Some(id) = post.and_then(|p| self.posts.get(p)).map(|p| p.id.clone()) {
+            self.unseen.remove(&id);
+            self.shown = Some(id);
+        }
     }
 
     /// Move the cursor by `delta` lines, keeping it on screen.
     fn cursor(&mut self, delta: isize) {
-        let total = self.laid().map_or(0, |l| l.lines.len());
+        let total = self.feed().lines.len();
         let page = self.page();
-        if let Some(v) = self.view() {
-            v.cursor = (v.cursor as isize + delta).clamp(0, total.saturating_sub(1) as isize) as usize;
-            if v.cursor < v.scroll {
-                v.scroll = v.cursor;
-            } else if v.cursor >= v.scroll + page {
-                v.scroll = v.cursor + 1 - page;
-            }
+        self.cursor = (self.cursor as isize + delta).clamp(0, total.saturating_sub(1) as isize) as usize;
+        if self.cursor < self.scroll {
+            self.scroll = self.cursor;
+        } else if self.cursor >= self.scroll + page {
+            self.scroll = self.cursor + 1 - page;
         }
+        self.follow_cursor();
     }
 
-    /// Scroll the view by `delta` lines, dragging the cursor along.
+    /// Scroll the feed by `delta` lines, dragging the cursor along.
     fn scroll(&mut self, delta: isize) {
-        let total = self.laid().map_or(0, |l| l.lines.len());
+        let total = self.feed().lines.len();
         let page = self.page();
-        if let Some(v) = self.view() {
-            let max = total.saturating_sub(page);
-            v.scroll = (v.scroll as isize + delta).clamp(0, max as isize) as usize;
-            v.cursor = v.cursor.clamp(v.scroll, (v.scroll + page).saturating_sub(1).max(v.scroll));
-        }
+        let max = total.saturating_sub(page);
+        self.scroll = (self.scroll as isize + delta).clamp(0, max as isize) as usize;
+        self.cursor = self.cursor.clamp(self.scroll, (self.scroll + page).saturating_sub(1).max(self.scroll));
+        self.follow_cursor();
     }
 
-    pub fn hit_at_cursor(&mut self) -> Hit {
-        let cursor = self.views.get(self.shown.as_ref().unwrap_or(&PostId::default())).map_or(0, |v| v.cursor);
-        self.laid().and_then(|l| l.hits.get(cursor).copied()).unwrap_or(Hit::None)
+    pub fn hit_at_cursor(&mut self) -> (Option<usize>, Hit) {
+        let cursor = self.cursor;
+        self.feed().hits.get(cursor).map_or((None, Hit::None), |(p, h)| (Some(*p), *h))
     }
 
-    fn toggle(&mut self, hit: Hit) -> bool {
-        let Hit::Node(card, node) = hit else { return false };
-        let Some(v) = self.view() else { return false };
+    fn toggle(&mut self, (post, hit): (Option<usize>, Hit)) -> bool {
+        let (Some(post), Hit::Node(card, node)) = (post, hit) else { return false };
+        let Some(id) = self.posts.get(post).map(|p| p.id.clone()) else { return false };
+        let v = self.views.entry(id).or_default();
         let set = v.folds.entry(card).or_default();
         if !set.remove(&node) {
             set.insert(node);
@@ -388,9 +629,9 @@ impl App {
         true
     }
 
-    /// The part under the cursor (else the first part).
+    /// The part under the cursor (else the shown post's first part).
     pub fn part_at_cursor(&mut self) -> Option<Part> {
-        let card = match self.hit_at_cursor() {
+        let card = match self.hit_at_cursor().1 {
             Hit::Card(c) | Hit::Node(c, _) => c,
             Hit::None => 0,
         };
@@ -605,18 +846,36 @@ impl App {
                 let row = (m.row - g.sidebar.y) as usize + ui::sidebar_offset(self, g.sidebar.height);
                 self.select_row(row, true)
             }
+            // In the feed: press starts a selection, drag extends it, release
+            // copies it; a press and release in one place is a click.
             MouseEventKind::Down(MouseButton::Left) if inside(g.main) && m.row > g.main.y => {
-                let scroll = self.view().map_or(0, |v| v.scroll);
-                let line = scroll + (m.row - g.main.y - 1) as usize;
-                let total = self.laid().map_or(0, |l| l.lines.len());
-                if line < total {
-                    if let Some(v) = self.view() {
-                        v.cursor = line;
-                    }
-                    let hit = self.hit_at_cursor();
-                    self.toggle(hit);
+                let at = self.feed_point(m.column, m.row);
+                self.drag = Some((at, at));
+                vec![]
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.drag.is_some() => {
+                let at = self.feed_point(m.column, m.row);
+                if let Some((_, end)) = &mut self.drag {
+                    *end = at;
                 }
                 vec![]
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.drag.is_some() => {
+                let (start, end) = self.drag.take().expect("checked");
+                if start != end {
+                    let text = self.selected_text(start, end);
+                    let n = text.lines().count();
+                    self.toast = Some(format!("copied {n} line{}", if n == 1 { "" } else { "s" }));
+                    vec![Effect::Copy(text)]
+                } else if start.0 < self.feed().lines.len() {
+                    self.cursor = start.0;
+                    self.follow_cursor();
+                    let hit = self.hit_at_cursor();
+                    self.toggle(hit);
+                    vec![]
+                } else {
+                    vec![]
+                }
             }
             // Motion and other buttons change nothing, so they don't redraw.
             _ => return vec![],
@@ -624,6 +883,30 @@ impl App {
         let mut fx = fx;
         fx.push(Effect::Redraw);
         fx
+    }
+
+    /// A mouse position in the feed as (line, cell column inside the content area).
+    fn feed_point(&mut self, column: u16, row: u16) -> (usize, u16) {
+        let g = ui::geometry(self.size);
+        let line = self.scroll + row.saturating_sub(g.main.y + 1) as usize;
+        (line, column.saturating_sub(g.main.x + 1))
+    }
+
+    /// The text between two feed points, without card frames or wrap markers.
+    pub fn selected_text(&mut self, a: (usize, u16), b: (usize, u16)) -> String {
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        let lines = &self.feed().lines;
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate().take(end.0 + 1).skip(start.0) {
+            let text = line.to_string();
+            let from = if i == start.0 { start.1 as usize } else { 0 };
+            let to = if i == end.0 { end.1 as usize + 1 } else { usize::MAX };
+            let cut = ui::cells(&text, from, to);
+            let cut = cut.trim_start_matches(['│', '╭', '╰']).trim_end_matches(['│', '╮', '╯']);
+            let cut = cut.strip_prefix(' ').unwrap_or(cut).trim_end();
+            out.push(cut.strip_prefix("↪ ").unwrap_or(cut).to_owned());
+        }
+        out.join("\n")
     }
 
     // ---- notesd ---------------------------------------------------------------
@@ -643,7 +926,7 @@ impl App {
             "post-created" | "post-updated" | "post-deleted" if mine => {
                 let id = PostId::from(e.id.clone().unwrap_or_default());
                 fx.push(Effect::Request(StageRequest::PostList(self.open.clone().unwrap())));
-                if e.kind == "post-updated" && self.shown.as_ref() == Some(&id) {
+                if e.kind == "post-updated" {
                     if let Some(v) = e.version {
                         let pinned = self.views.get(&id).and_then(|v| v.pinned).is_some();
                         if !pinned {
@@ -730,7 +1013,16 @@ impl App {
                     }
                     _ => self.posts.last().map(|p| p.id.clone()),
                 };
+                // The feed shows every post, so load them all.
+                for p in self.posts.clone() {
+                    if let Some(v) = self.version_of(&p.id) {
+                        fx.extend(self.load(p.id.clone(), v));
+                    }
+                }
                 if let Some(id) = target {
+                    if self.follow {
+                        self.jump = Some(id.clone());
+                    }
                     fx.extend(self.show(id.clone()));
                     if let Some(row) = self.row_of_post(&id) {
                         self.sel = row;
@@ -759,7 +1051,11 @@ impl App {
                     self.comments_gen += 1;
                 }
             }
-            Reply::Commented(_) => self.toast = Some("comment sent".into()),
+            Reply::Commented(c) => {
+                let agent = self.open.as_ref().and_then(|id| self.sessions.iter().find(|s| &s.id == id)).map_or("the agent".into(), |s| s.agent.clone());
+                let on = c.post.as_ref().and_then(|p| self.posts.iter().find(|x| &x.id == p)).map_or(String::new(), |p| format!(" on {}", p.title));
+                self.toast = Some(format!("sent{on} · {agent} sees it with its next post or wait"));
+            }
             Reply::Failed(req, e) => {
                 if let StageRequest::PostShow(a) | StageRequest::PostRender(a) = &req {
                     if let Some(v) = a.version {
@@ -787,6 +1083,21 @@ trait CodeName {
 impl CodeName for ErrorBody {
     fn code_name(&self) -> String {
         serde_json::to_value(self.code).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default()
+    }
+}
+
+/// Cells for a `w`×`h` image: as large as fits `cols` × `rows` cells, never
+/// past `max_scale`, aspect kept.
+pub fn fit_cells((w, h): (u32, u32), max_scale: f32, cols: u16, rows: u16, (cw, ch): (u16, u16)) -> Fit {
+    if w == 0 || h == 0 || cw == 0 || ch == 0 {
+        return Fit::Failed("empty image".into());
+    }
+    let scale = max_scale
+        .min(cols as f32 * cw as f32 / w as f32)
+        .min(rows.max(1) as f32 * ch as f32 / h as f32);
+    Fit::Ready {
+        cols: ((w as f32 * scale / cw as f32).ceil() as u16).clamp(1, cols.max(1)),
+        rows: ((h as f32 * scale / ch as f32).ceil() as u16).max(1),
     }
 }
 
@@ -913,8 +1224,9 @@ mod tests {
         let mut app = booted(&db);
         let fx = app.update(key(KeyCode::Char('k')));
         assert_eq!(app.shown.as_deref(), Some("a"));
-        assert_eq!(requests(&fx), [StageRequest::PostShow(PostShowArgs { id: "a".into(), version: Some(1) }), StageRequest::PostRender(PostShowArgs { id: "a".into(), version: Some(1) })]);
-        serve(&mut app, fx, &db);
+        // The feed loaded every post when the session opened, so picking one asks for nothing.
+        assert!(requests(&fx).is_empty());
+        assert!(app.loaded.contains_key(&(PostId::from("a"), 1)));
         app.update(key(KeyCode::Char('k')));
         assert_eq!(app.rows()[app.sel], Row::Session(0));
         // j past the posts lands on session 2; enter opens it.
@@ -954,10 +1266,12 @@ mod tests {
         db.md = (0..80).map(|i| format!("line {i}\n\n")).collect();
         let mut app = booted(&db);
         let wheel = |kind| Msg::Mouse(MouseEvent { kind, column: 60, row: 10, modifiers: KeyModifiers::NONE });
-        app.update(wheel(MouseEventKind::ScrollDown));
-        assert_eq!(app.views[&PostId::from("b")].scroll, WHEEL);
         app.update(wheel(MouseEventKind::ScrollUp));
-        assert_eq!(app.views[&PostId::from("b")].scroll, 0);
+        let top = app.scroll;
+        app.update(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.scroll, top + WHEEL);
+        app.update(wheel(MouseEventKind::ScrollUp));
+        assert_eq!(app.scroll, top);
         // Motion doesn't redraw.
         assert!(app.update(wheel(MouseEventKind::Moved)).is_empty());
 
@@ -969,12 +1283,64 @@ mod tests {
         app.loaded.get_mut(&key).unwrap().cards = Some(build_cards(&p, &r));
         app.loaded.get_mut(&key).unwrap().post = Some(p);
         app.views.get_mut(&PostId::from("b")).unwrap().laid = None;
-        let before = app.laid().unwrap().lines.len();
+        app.feed = None;
+        let before = app.feed().lines.len();
+        let b = app.posts.iter().position(|p| p.id == "b").unwrap();
+        let start = app.feed().starts[b];
+        // In the feed: the post's title, its card border, then the root node.
+        let root = start + 2;
+        assert!(root >= app.scroll, "root on screen");
         let g = ui::geometry(app.size);
-        // Row 0 of the laid post is the card border; row 1 is the root node.
-        let click = Msg::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: g.main.x + 2, row: g.main.y + 2, modifiers: KeyModifiers::NONE });
-        assert_eq!(app.update(click), [Effect::Redraw]);
-        assert_eq!(app.laid().unwrap().lines.len(), before - 2);
+        let row = g.main.y + 1 + (root - app.scroll) as u16;
+        let at = |kind| Msg::Mouse(MouseEvent { kind, column: g.main.x + 2, row, modifiers: KeyModifiers::NONE });
+        // A click acts on release (a press could be the start of a drag).
+        assert_eq!(app.update(at(MouseEventKind::Down(MouseButton::Left))), [Effect::Redraw]);
+        assert_eq!(app.update(at(MouseEventKind::Up(MouseButton::Left))), [Effect::Redraw]);
+        assert_eq!(app.feed().lines.len(), before - 2);
+
+        // A drag across lines copies their text, without the card frame.
+        let press = Msg::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: g.main.x + 1, row: g.main.y + 1, modifiers: KeyModifiers::NONE });
+        let drag = Msg::Mouse(MouseEvent { kind: MouseEventKind::Drag(MouseButton::Left), column: g.main.x + 40, row: g.main.y + 4, modifiers: KeyModifiers::NONE });
+        let release = Msg::Mouse(MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), column: g.main.x + 40, row: g.main.y + 4, modifiers: KeyModifiers::NONE });
+        app.update(press);
+        app.update(drag);
+        let fx = app.update(release);
+        let copied = fx.iter().find_map(|e| match e { Effect::Copy(t) => Some(t.clone()), _ => None }).expect("a copy");
+        assert!(!copied.contains('│') && !copied.contains('╭'), "{copied:?}");
+        assert!(app.toast.as_deref().is_some_and(|t| t.starts_with("copied")));
+    }
+
+    /// Every pane size from 1×1 to 160×50, with real content: drawing never
+    /// panics, no row runs past the pane, and the feed keeps the line under
+    /// the cursor in place across a resize.
+    #[test]
+    fn every_size_draws_cleanly_and_keeps_its_place() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut db = fake();
+        db.md = (0..40).map(|i| format!("para {i} with some words to wrap at narrow widths\n\n")).collect();
+        let mut app = booted(&db);
+        for w in (1..=160u16).step_by(7).chain([1, 2, 59, 60, 61]) {
+            for h in (1..=50u16).step_by(5).chain([1, 2, 3]) {
+                app.update(Msg::Resize(w, h));
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| ui::draw(f, &mut app)).unwrap();
+                let buf = term.backend().buffer();
+                assert_eq!(buf.area.width, w);
+                for o in &app.on_screen {
+                    assert!(o.col + o.cols <= w && o.row + o.rows <= h, "visual outside {w}×{h}: {o:?}");
+                }
+            }
+        }
+        // Resize with the cursor mid-feed: the same post stays under it.
+        app.update(Msg::Resize(100, 30));
+        for _ in 0..12 {
+            app.update(Msg::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        }
+        let before = (app.shown.clone(), app.cursor - app.scroll);
+        app.update(Msg::Resize(70, 30));
+        let _ = app.feed();
+        assert_eq!(app.shown, before.0);
+        assert_eq!(app.cursor - app.scroll, before.1, "the cursor's row on screen survives a rewrap");
     }
 
     #[test]
