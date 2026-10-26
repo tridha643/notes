@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::{ansi, diff, highlight, store::post_show, Result};
+use crate::{ansi, diff, highlight, store::post_show, Result, Store};
 
 /// Part of every cache key. Bump it whenever render output changes (renderer
 /// code, class names, or a grammar crate upgrade) so old entries are never served.
@@ -329,21 +329,13 @@ impl RenderCache {
 }
 
 /// The `post-render` verb as JSON (see [`RenderCache::render_post_json`]).
-pub fn post_render_json(
-    conn: &Connection,
-    cache: &RenderCache,
-    args: &PostShowArgs,
-) -> Result<String> {
-    Ok(cache.render_post_json(conn, &post_show(conn, args)?))
+pub fn post_render_json(s: &Store, cache: &RenderCache, args: &PostShowArgs) -> Result<String> {
+    Ok(cache.render_post_json(&s.db, &post_show(s, args)?))
 }
 
 /// The `post-render` verb as a typed value.
-pub fn post_render(
-    conn: &Connection,
-    cache: &RenderCache,
-    args: &PostShowArgs,
-) -> Result<PostRender> {
-    Ok(cache.render_post(conn, &post_show(conn, args)?))
+pub fn post_render(s: &Store, cache: &RenderCache, args: &PostShowArgs) -> Result<PostRender> {
+    Ok(cache.render_post(&s.db, &post_show(s, args)?))
 }
 
 /// Compile every language's highlight queries now (~350 ms total, swift alone

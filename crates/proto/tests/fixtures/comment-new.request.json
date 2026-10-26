@@ -1,0 +1,1 @@
+{"v":1,"id":7,"verb":"comment-new","args":{"post":"p1","text":"looks good","anchor":{"kind":"line-range","part":0,"post_version":2,"start_line":3,"end_line":4},"author":"user"},"agent":"claude"}

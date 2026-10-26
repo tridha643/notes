@@ -27,10 +27,10 @@ fn row(name: &str, (median, p99): (Duration, Duration)) {
     println!("| {name} | {} | {} |", ms(median), ms(p99));
 }
 
-fn db() -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
-    migrate(&conn).unwrap();
-    conn
+fn db() -> Store {
+    let dir = std::env::temp_dir().join(format!("notes-posts-bench-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    Store::open(Connection::open_in_memory().unwrap(), dir).unwrap()
 }
 
 fn code(text: String, lang: &str) -> Part {
@@ -176,7 +176,7 @@ fn main() {
         let mut runs = Vec::new();
         for _ in 0..n {
             let (conn, cache) = (db(), RenderCache::with_config(true, 64 << 20));
-            runs.push(time(|| drop(cache.render_part_json(&conn, part))).1);
+            runs.push(time(|| drop(cache.render_part_json(&conn.db, part))).1);
         }
         runs.sort();
         row(
@@ -185,10 +185,10 @@ fn main() {
         );
         let conn = db();
         let cache = RenderCache::with_config(true, 64 << 20);
-        cache.render_part_json(&conn, part);
+        cache.render_part_json(&conn.db, part);
         row(
             &format!("{name}: memory hit (key hash + Arc)"),
-            stats(200, || drop(cache.render_part_json(&conn, part))),
+            stats(200, || drop(cache.render_part_json(&conn.db, part))),
         );
         let post = Post {
             id: "p".into(),
@@ -201,16 +201,16 @@ fn main() {
         };
         row(
             &format!("{name}: memory hit, render_post_json (wire JSON)"),
-            stats(200, || drop(cache.render_post_json(&conn, &post))),
+            stats(200, || drop(cache.render_post_json(&conn.db, &post))),
         );
         row(
             &format!("{name}: memory hit, render_post (typed, parses JSON)"),
-            stats(50, || drop(cache.render_post(&conn, &post))),
+            stats(50, || drop(cache.render_post(&conn.db, &post))),
         );
         row(
             &format!("{name}: table hit (fresh process, warm db)"),
             stats(n, || {
-                drop(RenderCache::with_config(true, 64 << 20).render_part_json(&conn, part))
+                drop(RenderCache::with_config(true, 64 << 20).render_part_json(&conn.db, part))
             }),
         );
         let s = cache.stats();
@@ -220,10 +220,10 @@ fn main() {
     let conn = db();
     row(
         "500-line Rust code: NOTES_RENDER_CACHE=off",
-        stats(50, || drop(off.render_part_json(&conn, &rust))),
+        stats(50, || drop(off.render_part_json(&conn.db, &rust))),
     );
 
-    println!("\n## Store on in-memory SQLite (median / p99 of 2,000)\n");
+    println!("\n## Store on a temp session folder (median / p99 of 2,000)\n");
     println!("| verb | median | p99 |\n|---|---|---|");
     let conn = db();
     let parts = vec![

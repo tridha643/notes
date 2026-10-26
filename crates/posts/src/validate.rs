@@ -3,9 +3,8 @@
 //! fields and types; this checks what serde can't.
 
 use notes_proto::posts::Part;
-use rusqlite::{Connection, OptionalExtension};
 
-use crate::{diff::patch_has_content, kits::KIT_IDS, usage, Db, Result};
+use crate::{diff::patch_has_content, kits::KIT_IDS, usage, Result, Store};
 
 pub const MAX_PART_BYTES: usize = 2 << 20;
 pub const MAX_POST_BYTES: usize = 16 << 20;
@@ -93,7 +92,7 @@ pub fn part_bytes(part: &Part) -> usize {
             title,
             ..
         } => {
-            opt(asset_id)
+            asset_id.as_ref().map_or(0, |a| a.len())
                 + opt(title)
                 + steps
                     .iter()
@@ -125,13 +124,6 @@ pub fn part_bytes(part: &Part) -> usize {
     }
 }
 
-fn asset_exists(conn: &Connection, id: &str) -> Result<bool> {
-    conn.prepare_cached("SELECT 1 FROM assets WHERE id = ?1")
-        .and_then(|mut s| s.query_row([id], |_| Ok(())).optional())
-        .map(|r| r.is_some())
-        .db()
-}
-
 /// The first non-blank, non-comment line's first word (sideshow's mermaidDiagramType).
 fn mermaid_has_type(src: &str) -> bool {
     src.lines()
@@ -140,7 +132,7 @@ fn mermaid_has_type(src: &str) -> bool {
 }
 
 /// Check one part's content. `at` is its request path, e.g. `parts[2]`.
-pub(crate) fn validate_part(conn: &Connection, part: &Part, at: &str) -> Result<()> {
+pub(crate) fn validate_part(s: &Store, part: &Part, at: &str) -> Result<()> {
     let bytes = part_bytes(part);
     if bytes > MAX_PART_BYTES {
         return Err(usage(format!(
@@ -184,7 +176,7 @@ pub(crate) fn validate_part(conn: &Connection, part: &Part, at: &str) -> Result<
             }
         }
         Part::Image { asset_id, .. } => {
-            if !asset_exists(conn, asset_id)? {
+            if !s.asset_exists(asset_id) {
                 return fail(
                     "asset_id",
                     format!("no asset \"{asset_id}\" — upload it first (asset-put)"),
@@ -194,7 +186,7 @@ pub(crate) fn validate_part(conn: &Connection, part: &Part, at: &str) -> Result<
         Part::Trace {
             steps, asset_id, ..
         } => match asset_id {
-            Some(id) if !asset_exists(conn, id)? => {
+            Some(id) if !s.asset_exists(id) => {
                 return fail(
                     "asset_id",
                     format!("no asset \"{id}\" — upload it first (asset-put)"),
@@ -218,7 +210,7 @@ pub(crate) fn validate_part(conn: &Connection, part: &Part, at: &str) -> Result<
 
 /// Validate a post's parts: at least one, per-post size, and each part's
 /// content. `only` limits content checks to one index (a single-part edit).
-pub(crate) fn validate_parts(conn: &Connection, parts: &[Part], only: Option<usize>) -> Result<()> {
+pub(crate) fn validate_parts(s: &Store, parts: &[Part], only: Option<usize>) -> Result<()> {
     if parts.is_empty() {
         return Err(usage("a post needs at least one part"));
     }
@@ -230,7 +222,7 @@ pub(crate) fn validate_parts(conn: &Connection, parts: &[Part], only: Option<usi
     }
     for (i, part) in parts.iter().enumerate() {
         if only.is_none_or(|o| o == i) {
-            validate_part(conn, part, &format!("parts[{i}]"))?;
+            validate_part(s, part, &format!("parts[{i}]"))?;
         }
     }
     Ok(())

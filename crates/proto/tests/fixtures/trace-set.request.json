@@ -1,0 +1,1 @@
+{"v":1,"id":7,"verb":"trace-set","args":{"session":"s1","steps":[{"label":"ran tests","kind":"tool"}]},"agent":"claude"}

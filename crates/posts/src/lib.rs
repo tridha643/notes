@@ -2,16 +2,18 @@
 //! anchored comments, content-addressed assets, traces, kits, settings, and the
 //! daemon-side renderer (code highlighting, diff hunks, ANSI terminals).
 //!
-//! Synchronous, over a caller-owned `rusqlite::Connection` (WAL). Writes run
-//! in a SAVEPOINT, so they nest inside the daemon's own transactions (`batch
-//! --atomic`). The crate never writes an event log: write functions return the
+//! Synchronous, over a [`Store`]: one JSON file per session in the session
+//! folder (json_store.rs) plus the caller's `rusqlite::Connection` for settings
+//! and the render cache. Inside a daemon unit, file writes are journaled so a
+//! failed op or `batch --atomic` rolls the folder back ([`Store::begin`],
+//! [`Store::rollback`]). The crate never writes an event log: write functions return the
 //! [`Event`]s they caused with `seq: 0`, and the daemon assigns `seq` when it
 //! appends them to its log. After a successful [`comment_new`] the daemon calls
 //! [`CommentSignal::notify`] so `wait`ers wake.
 //!
 //! Errors are wire-ready [`ErrorBody`]s: `not_found` for missing records,
 //! `usage` for validation failures (the same rules as sideshow's
-//! `postSurfaces.ts`, plus its size limits), `other` for SQLite failures.
+//! `postSurfaces.ts`, plus its size limits), `other` for SQLite and file failures.
 //!
 //! # Highlighter
 //!
@@ -58,11 +60,16 @@ use rusqlite::Connection;
 mod ansi;
 mod diff;
 mod highlight;
+mod json_store;
 mod kits;
+mod migrate_json;
 mod render;
+mod sqlite_store;
+mod stage_index;
 mod store;
 mod validate;
 
+pub use json_store::{AssetMeta, PostRec, SessionFile, Store, VersionRec, SCHEMA};
 pub use kits::{kits, KIT_IDS};
 pub use render::{
     post_render, post_render_json, render_part, warm_languages, CacheStats, RenderCache,
@@ -96,6 +103,10 @@ pub(crate) fn not_found(message: impl Into<String>) -> ErrorBody {
     error(ErrorCode::NotFound, message)
 }
 
+pub(crate) fn other(message: impl Into<String>) -> ErrorBody {
+    error(ErrorCode::Other, message)
+}
+
 pub(crate) trait Db<T> {
     fn db(self) -> Result<T>;
 }
@@ -106,48 +117,11 @@ impl<T> Db<T> for rusqlite::Result<T> {
     }
 }
 
-/// Create the sideshow tables and indexes. Idempotent.
+/// Create the tables sideshow still keeps in SQLite (settings, render cache).
+/// Idempotent. Session data lives in the folder ([`Store`]).
 pub fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS sessions (
-            id TEXT PRIMARY KEY, agent TEXT NOT NULL, title TEXT, cwd TEXT,
-            created_at INTEGER NOT NULL, last_active_at INTEGER NOT NULL,
-            agent_seq INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS sessions_agent_cwd ON sessions (agent, cwd);
-        CREATE TABLE IF NOT EXISTS posts (
-            id TEXT PRIMARY KEY, session TEXT NOT NULL, title TEXT NOT NULL,
-            parts TEXT NOT NULL, kinds TEXT NOT NULL, version INTEGER NOT NULL,
-            created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS posts_session ON posts (session, created_at);
-        CREATE INDEX IF NOT EXISTS posts_updated ON posts (updated_at);
-        CREATE TABLE IF NOT EXISTS post_versions (
-            post TEXT NOT NULL, version INTEGER NOT NULL, title TEXT NOT NULL,
-            parts TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (post, version)
-        );
-        CREATE TABLE IF NOT EXISTS asset_refs (
-            asset TEXT NOT NULL, post TEXT NOT NULL, PRIMARY KEY (asset, post)
-        );
-        CREATE INDEX IF NOT EXISTS asset_refs_post ON asset_refs (post);
-        CREATE TABLE IF NOT EXISTS comments (
-            seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
-            session TEXT NOT NULL, post TEXT, author TEXT NOT NULL, text TEXT NOT NULL,
-            created_at INTEGER NOT NULL, anchor TEXT
-        );
-        CREATE INDEX IF NOT EXISTS comments_session ON comments (session, seq);
-        CREATE INDEX IF NOT EXISTS comments_post ON comments (post, seq);
-        CREATE TABLE IF NOT EXISTS assets (
-            id TEXT PRIMARY KEY, session TEXT, kind TEXT NOT NULL, content_type TEXT NOT NULL,
-            byte_length INTEGER NOT NULL, filename TEXT, data BLOB NOT NULL,
-            created_at INTEGER NOT NULL, last_accessed INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS assets_session ON assets (session);
-        CREATE TABLE IF NOT EXISTS trace_steps (
-            session TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT, label TEXT NOT NULL,
-            detail TEXT, ts TEXT, PRIMARY KEY (session, seq)
-        );
-        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS render_cache (
             key BLOB PRIMARY KEY, value BLOB NOT NULL, bytes INTEGER NOT NULL
         );",

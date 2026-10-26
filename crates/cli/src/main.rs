@@ -18,10 +18,10 @@ use std::{
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use notes_proto::posts::{
-    AssetInfo, AssetKind, AssetPutArgs, Comment, CommentAnchor, CommentListArgs, CommentNewArgs,
+    AssetId, AssetInfo, AssetKind, AssetPutArgs, Comment, CommentAnchor, CommentListArgs, CommentNewArgs,
     DiffLayout, IdArgs, Kit, Part, PartOp, Post, PostListArgs, PostNewArgs, PostPartArgs,
-    PostShowArgs, PostSummary, PostUpdateArgs, PostWriteResult, Session, SessionRenameArgs,
-    TraceSetArgs, TraceStep, WaitArgs,
+    PostId, PostShowArgs, PostSummary, PostUpdateArgs, PostWriteResult, Session, SessionHit,
+    SessionId, SessionRenameArgs, SessionSearchArgs, TraceSetArgs, TraceStep, WaitArgs,
 };
 use notes_proto::{
     default_socket_path, to_line, AppendArgs, BatchArgs, BatchOutcome, DeleteArgs, DiffArgs,
@@ -194,7 +194,7 @@ enum Cmd {
         title: Option<String>,
         /// Session (default: this agent's session for the cwd)
         #[arg(long, global = true)]
-        session: Option<String>,
+        session: Option<SessionId>,
         #[command(subcommand)]
         cmd: PostCmd,
     },
@@ -205,11 +205,11 @@ enum Cmd {
         #[arg(long, value_parser = kebab::<AssetKind>)]
         kind: Option<AssetKind>,
         #[arg(long)]
-        session: Option<String>,
+        session: Option<SessionId>,
     },
     /// Reply on a post
     Comment {
-        post: String,
+        post: PostId,
         /// Text, or - for stdin
         text: String,
         /// Anchor the comment to lines A:B of a part
@@ -222,9 +222,9 @@ enum Cmd {
     /// Comments in a session or on a post
     Comments {
         #[arg(long)]
-        post: Option<String>,
+        post: Option<PostId>,
         #[arg(long)]
-        session: Option<String>,
+        session: Option<SessionId>,
         /// Only comments after this seq
         #[arg(long, value_name = "SEQ")]
         after: Option<u64>,
@@ -232,9 +232,9 @@ enum Cmd {
     /// Block until the user comments, then print it
     Wait {
         #[arg(long)]
-        post: Option<String>,
+        post: Option<PostId>,
         #[arg(long)]
-        session: Option<String>,
+        session: Option<SessionId>,
         /// Seconds to wait; 0 waits forever
         #[arg(long, default_value_t = 120)]
         timeout: u64,
@@ -251,7 +251,7 @@ enum Cmd {
         /// [{"label":…}] array or one step per line, or - for stdin
         file: String,
         #[arg(long)]
-        session: String,
+        session: SessionId,
     },
     /// List the opt-in kits for html parts
     Kits,
@@ -271,13 +271,13 @@ enum PostCmd {
     New(PartKind),
     /// New version of a post (same card): a new title and/or this one part
     Update {
-        id: String,
+        id: PostId,
         #[command(subcommand)]
         part: Option<PartKind>,
     },
     /// Add, replace or remove one part
     Part {
-        id: String,
+        id: PostId,
         #[command(subcommand)]
         op: PartCmd,
     },
@@ -288,12 +288,12 @@ enum PostCmd {
     },
     /// Show a post and its parts
     Show {
-        id: String,
+        id: PostId,
         #[arg(long)]
         version: Option<u64>,
     },
     /// Delete a post
-    Delete { id: String },
+    Delete { id: PostId },
 }
 
 #[derive(Debug, Subcommand)]
@@ -318,8 +318,14 @@ enum PartCmd {
 
 #[derive(Debug, Subcommand)]
 enum SessionCmd {
-    Rename { id: String, title: String },
-    Delete { id: String },
+    Rename { id: SessionId, title: String },
+    Delete { id: SessionId },
+    /// Find sessions by title, agent or cwd, then by post and comment text
+    Search {
+        query: String,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
 }
 
 /// One post part read from a file, or - for stdin.
@@ -533,7 +539,7 @@ fn content_type_for(file: &str) -> &'static str {
 fn asset_put(
     file: &str,
     kind: Option<AssetKind>,
-    session: Option<String>,
+    session: Option<SessionId>,
 ) -> Result<Verb, ErrorBody> {
     if file == "-" {
         return Err(fail(
@@ -569,11 +575,11 @@ fn asset_put(
 /// Build one post part; image and trace files are uploaded as assets first.
 fn build_part(
     kind: PartKind,
-    session: &Option<String>,
+    session: &Option<SessionId>,
     stdin: &mut dyn Read,
     ask: &mut Ask<'_>,
 ) -> Result<Part, ErrorBody> {
-    let mut upload = |file: &str, kind| -> Result<String, ErrorBody> {
+    let mut upload = |file: &str, kind| -> Result<AssetId, ErrorBody> {
         let info = ask(asset_put(file, Some(kind), session.clone())?)?;
         serde_json::from_value::<AssetInfo>(info)
             .map(|info| info.id)
@@ -911,6 +917,9 @@ fn to_verb(
         Cmd::Session {
             cmd: SessionCmd::Delete { id },
         } => Verb::SessionDelete(IdArgs { id }),
+        Cmd::Session {
+            cmd: SessionCmd::Search { query, limit },
+        } => Verb::SessionSearch(SessionSearchArgs { query, limit }),
         Cmd::Trace { file, session } => Verb::TraceSet(TraceSetArgs {
             session,
             steps: trace_steps(&read_all(&file, stdin)?)?,
@@ -1205,6 +1214,13 @@ fn text(verb: &Verb, result: &Value, number: bool) -> Option<String> {
                     "{}\t{}\t{} posts\t{active}\t{title}",
                     s.id, s.agent, s.post_count
                 );
+            }
+        }
+        Verb::SessionSearch(_) => {
+            for h in serde_json::from_value::<Vec<SessionHit>>(result.clone()).ok()? {
+                let title = h.session.title.as_deref().unwrap_or("");
+                let found = h.text.as_deref().unwrap_or("");
+                _ = writeln!(out, "{}\t{}\t{title}\t{found}", h.session.id, h.session.agent);
             }
         }
         Verb::Kits => {

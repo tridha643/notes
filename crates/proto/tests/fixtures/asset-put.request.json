@@ -1,0 +1,1 @@
+{"v":1,"id":7,"verb":"asset-put","args":{"session":"s1","kind":"image","content_type":"image/png","filename":"h.png","data_base64":"aGVsbG8="},"agent":"claude"}

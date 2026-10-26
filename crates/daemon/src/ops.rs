@@ -260,6 +260,7 @@ impl Tx<'_> {
                 render_cache: Some(
                     serde_json::to_value(self.d.render.stats()).expect("stats serialize"),
                 ),
+                stage: Some(self.store.doctor()),
             }),
             Verb::Manifest => Ok(manifest()),
             Verb::Watch(_) | Verb::Wait(_) => Err(fail(
@@ -276,11 +277,12 @@ impl Tx<'_> {
     /// Sideshow verbs: sessions, posts, comments, assets, traces, kits, settings.
     fn sideshow(&mut self, verb: &Verb) -> R<Value> {
         use notes_posts as p;
-        let db = self.db;
+        let db = self.store;
         let agent = Some(self.author).filter(|a| *a != "human");
         match verb {
             Verb::SessionNew(a) => self.written_posts(p::session_new(db, a)),
             Verb::SessionList => value(p::session_list(db).map_err(Fail)?),
+            Verb::SessionSearch(a) => value(p::session_search(db, a).map_err(Fail)?),
             Verb::SessionRename(a) => self.written_posts(p::session_rename(db, a)),
             Verb::SessionDelete(a) => self.posts_events(p::session_delete(db, &a.id)),
             Verb::PostNew(a) => {

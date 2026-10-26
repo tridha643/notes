@@ -126,6 +126,9 @@ Sideshow's verbs live under `post` so they don't collide with note verbs.
 | `notes upload <file>` | Store an asset by content hash; prints its id |
 | `notes comment <post> TEXT` | Reply on a post |
 | `notes sessions` | List agent sessions |
+| `notes session search <query> [--limit N]` | Sessions whose title, agent or cwd match, then those whose posts or comments contain the query |
+
+Session data lives in `~/Desktop/Stage/`: one JSON file per session (`<date>-<slug>-<id>.json`, `"schema": 1`) plus `assets/`. notesd is the only writer; deleting a file in Finder deletes the session.
 
 ### Events
 
