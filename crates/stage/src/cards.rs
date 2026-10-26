@@ -183,8 +183,8 @@ fn styled(line: &StyledLine) -> Line<'static> {
     )
 }
 
-fn gutter(n: u32, width: usize) -> Span<'static> {
-    Span::styled(format!("{n:>width$} "), ui::dim())
+fn gutter(n: u32, width: usize) -> Vec<Span<'static>> {
+    vec![Span::styled(format!("{n:>width$} "), ui::dim()), Span::styled("│ ", ui::border())]
 }
 
 fn code_lines(start: u32, lines: &[StyledLine]) -> Vec<Line<'static>> {
@@ -194,7 +194,7 @@ fn code_lines(start: u32, lines: &[StyledLine]) -> Vec<Line<'static>> {
         .enumerate()
         .map(|(i, l)| {
             let mut line = styled(l);
-            line.spans.insert(0, gutter(start + i as u32, width));
+            line.spans.splice(0..0, gutter(start + i as u32, width));
             line
         })
         .collect()
@@ -206,7 +206,11 @@ fn plain_code(code: &str, start: u32) -> Vec<Line<'static>> {
     lines
         .into_iter()
         .enumerate()
-        .map(|(i, l)| Line::from(vec![gutter(start + i as u32, width), Span::raw(l)]))
+        .map(|(i, l)| {
+            let mut spans = gutter(start + i as u32, width);
+            spans.push(Span::raw(l));
+            Line::from(spans)
+        })
         .collect()
 }
 
@@ -244,18 +248,22 @@ fn diff_lines(files: &[notes_proto::posts::DiffFileRender]) -> Vec<Line<'static>
 
 // ---- JSON and trace trees ----------------------------------------------------
 
+fn count(n: usize, noun: &str) -> String {
+    if n == 1 { format!("1 {noun}") } else { format!("{n} {noun}s") }
+}
+
 fn json_tree(data: &Value) -> FoldTree {
     fn push(v: &Value, key: Option<String>, depth: usize, nodes: &mut Vec<Node>) {
         let i = nodes.len();
         let mut spans = Vec::new();
         if let Some(k) = key {
-            spans.push(Span::styled(k, Style::new().fg(ui::BLUE)));
-            spans.push(Span::raw(": "));
+            spans.push(Span::styled(format!("{k:?}"), Style::new().fg(ui::BLUE)));
+            spans.push(Span::styled(": ", ui::dim()));
         }
         let leaf = |s: String, color| Span::styled(s, Style::new().fg(color));
         match v {
-            Value::Object(m) => spans.push(Span::styled(format!("{{{}}}", m.len()), ui::dim())),
-            Value::Array(a) => spans.push(Span::styled(format!("[{}]", a.len()), ui::dim())),
+            Value::Object(m) => spans.push(Span::styled(format!("{{… {}}}", count(m.len(), "key")), ui::dim())),
+            Value::Array(a) => spans.push(Span::styled(format!("[… {}]", count(a.len(), "item")), ui::dim())),
             Value::String(s) => spans.push(leaf(format!("{:?}", sanitize(s)), ui::GREEN)),
             Value::Number(n) => spans.push(leaf(n.to_string(), ui::PEACH)),
             Value::Bool(b) => spans.push(leaf(b.to_string(), ui::PEACH)),
@@ -327,7 +335,7 @@ fn markdown_lines(src: &str) -> Vec<Line<'static>> {
         let value = node.data().value.clone();
         match value {
             NodeValue::Text(t) => line.push(Span::styled(sanitize(&t).into_owned(), style)),
-            NodeValue::Code(c) => line.push(Span::styled(sanitize(&c.literal).into_owned(), Style::new().fg(ui::PEACH))),
+            NodeValue::Code(c) => line.push(Span::styled(sanitize(&c.literal).into_owned(), Style::new().fg(ui::GREEN))),
             NodeValue::SoftBreak => line.push(Span::styled(" ", style)),
             NodeValue::LineBreak => lines.push(std::mem::take(line)),
             NodeValue::HtmlInline(h) => line.push(Span::styled(sanitize(&h).into_owned(), ui::dim())),
@@ -354,7 +362,9 @@ fn markdown_lines(src: &str) -> Vec<Line<'static>> {
         }
     }
 
-    fn para<'a>(node: comrak::Node<'a>, style: Style, prefix: &str, first: &str, out: &mut Vec<Line<'static>>) {
+    /// A paragraph's lines: the first starts with `marker` (a list bullet), the
+    /// rest are indented to match.
+    fn para<'a>(node: comrak::Node<'a>, style: Style, prefix: &str, marker: &str, out: &mut Vec<Line<'static>>) {
         let mut line = Vec::new();
         let mut lines = Vec::new();
         for c in node.children() {
@@ -362,8 +372,12 @@ fn markdown_lines(src: &str) -> Vec<Line<'static>> {
         }
         lines.push(line);
         for (i, spans) in lines.into_iter().enumerate() {
-            let lead = if i == 0 { first } else { prefix };
-            let mut all = vec![Span::styled(lead.to_owned(), ui::dim())];
+            let mut all = vec![Span::styled(prefix.to_owned(), ui::dim())];
+            if i == 0 {
+                all.push(Span::styled(marker.to_owned(), Style::new().fg(ui::MAUVE)));
+            } else {
+                all.push(Span::raw(" ".repeat(marker.width())));
+            }
             all.extend(spans);
             out.push(Line::from(all));
         }
@@ -373,24 +387,25 @@ fn markdown_lines(src: &str) -> Vec<Line<'static>> {
         let value = node.data().value.clone();
         match value {
             NodeValue::Paragraph => {
-                para(node, Style::new(), prefix, prefix, out);
+                para(node, Style::new().fg(ui::TEXT), prefix, "", out);
                 out.push(Line::from(prefix.to_owned()));
             }
             NodeValue::Heading(h) => {
-                let style = Style::new().fg(ui::BLUE).add_modifier(Modifier::BOLD);
-                para(node, style, prefix, &format!("{prefix}{} ", "#".repeat(h.level as usize)), out);
+                let style = match h.level {
+                    1 | 2 => Style::new().fg(ui::BLUE).add_modifier(Modifier::BOLD),
+                    _ => Style::new().fg(ui::TEXT).add_modifier(Modifier::BOLD),
+                };
+                para(node, style, prefix, "", out);
                 out.push(Line::from(prefix.to_owned()));
             }
             NodeValue::CodeBlock(cb) => {
-                let lang = cb.info.split_whitespace().next().unwrap_or("");
-                if !lang.is_empty() {
-                    out.push(Line::styled(format!("{prefix}{}", sanitize(lang)), ui::dim()));
-                }
+                // A shaded block, like the code cards; boxed() fills the row's background.
+                let shade = Style::new().bg(ui::CODE_BG);
                 for l in sanitize::lines(cb.literal.trim_end_matches('\n')) {
-                    out.push(Line::from(vec![
-                        Span::raw(prefix.to_owned()),
-                        Span::styled(l, Style::new().fg(ui::PEACH)),
-                    ]));
+                    out.push(
+                        Line::from(vec![Span::raw(format!("{prefix} ")), Span::styled(l, Style::new().fg(ui::TEXT))])
+                            .style(shade),
+                    );
                 }
                 out.push(Line::from(prefix.to_owned()));
             }
@@ -404,11 +419,11 @@ fn markdown_lines(src: &str) -> Vec<Line<'static>> {
                         NodeValue::TaskItem(t) => Some(if t.symbol.is_some() { "☑ " } else { "☐ " }),
                         _ => None,
                     };
-                    let inner = format!("{prefix}{}", " ".repeat(UnicodeWidthStr::width(bullet.as_str())));
+                    let inner = format!("{prefix}  {}", " ".repeat(UnicodeWidthStr::width(bullet.as_str())));
                     for (k, child) in item.children().enumerate() {
                         if k == 0 && matches!(child.data().value, NodeValue::Paragraph) {
-                            let first = format!("{prefix}{bullet}{}", task.unwrap_or(""));
-                            para(child, Style::new(), &inner, &first, out);
+                            let marker = format!("  {bullet}{}", task.unwrap_or(""));
+                            para(child, Style::new().fg(ui::TEXT), prefix, &marker, out);
                         } else {
                             block(child, &inner, out);
                         }
@@ -465,20 +480,18 @@ fn markdown_lines(src: &str) -> Vec<Line<'static>> {
         let widths: Vec<usize> = (0..cols)
             .map(|c| rows.iter().filter_map(|r| r.1.get(c)).map(|s| s.width()).max().unwrap_or(0))
             .collect();
+        let indent = format!("{prefix}  ");
         for (header, cells) in &rows {
-            let mut spans = vec![Span::raw(prefix.to_owned())];
+            let mut spans = vec![Span::raw(indent.clone())];
             for (c, w) in widths.iter().enumerate() {
                 let text = cells.get(c).map_or("", String::as_str);
-                let style = if *header { Style::new().add_modifier(Modifier::BOLD) } else { Style::new() };
-                if c > 0 {
-                    spans.push(Span::styled(" │ ", ui::dim()));
-                }
-                spans.push(Span::styled(format!("{text}{}", " ".repeat(w - text.width())), style));
+                let style = if *header { Style::new().fg(ui::TEXT).add_modifier(Modifier::BOLD) } else { Style::new().fg(ui::TEXT) };
+                spans.push(Span::styled(format!("{text}{}   ", " ".repeat(w - text.width())), style));
             }
             out.push(Line::from(spans));
             if *header {
                 let rule: Vec<String> = widths.iter().map(|w| "─".repeat(*w)).collect();
-                out.push(Line::styled(format!("{prefix}{}", rule.join("─┼─")), ui::dim()));
+                out.push(Line::styled(format!("{indent}{}", rule.join("   ")), ui::border()));
             }
         }
     }
@@ -504,6 +517,11 @@ pub struct Laid {
 pub fn wrap(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let base = line.style;
+    // Continuation rows hang under the text, past any indent and list marker.
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let body = text.trim_start();
+    let marker = ["• ", "☐ ", "☑ ", "│ "].iter().find(|m| body.starts_with(**m)).map_or(0, |m| m.width());
+    let hang = (text.width() - body.width() + marker).min(width / 2);
     let mut out: Vec<Vec<Span<'static>>> = vec![Vec::new()];
     let mut used = 0;
     // Words keep their trailing spaces; a word wider than the line splits by char.
@@ -517,8 +535,8 @@ pub fn wrap(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
     for (word, style) in words {
         let w = word.trim_end().width();
         if used > 0 && used + w > width {
-            out.push(Vec::new());
-            used = 0;
+            out.push(vec![Span::raw(" ".repeat(hang))]);
+            used = hang;
         }
         if w <= width {
             used += word.width();
@@ -530,13 +548,20 @@ pub fn wrap(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
             let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
             if used + cw > width {
                 out.last_mut().unwrap().push(Span::styled(std::mem::take(&mut chunk), style));
-                out.push(Vec::new());
-                used = 0;
+                out.push(vec![Span::raw(" ".repeat(hang))]);
+                used = hang;
             }
             chunk.push(ch);
             used += cw;
         }
         out.last_mut().unwrap().push(Span::styled(chunk, style));
+    }
+    // A row's trailing space is counted above but must not widen the row past `width`.
+    for row in &mut out {
+        if let Some(last) = row.last_mut() {
+            let trimmed = last.content.trim_end().to_owned();
+            last.content = trimmed.into();
+        }
     }
     out.into_iter().map(|spans| Line::from(spans).style(base)).collect()
 }
@@ -546,7 +571,7 @@ fn bordered(label: &str, width: usize) -> Line<'static> {
     let fill = width.saturating_sub(3 + label.width());
     Line::from(vec![
         Span::styled("╭─", ui::border()),
-        Span::styled(label, ui::border().add_modifier(Modifier::BOLD)),
+        Span::styled(label, ui::dim()),
         Span::styled(format!("{}╮", "─".repeat(fill)), ui::border()),
     ])
 }
@@ -596,11 +621,13 @@ pub fn layout(cards: &[Card], comments: &[Comment], width: u16, folds: &Folds) -
         push(&mut laid, Line::default(), Hit::None);
     }
     if !comments.is_empty() {
-        push(&mut laid, Line::styled(format!("Comments ({})", comments.len()), ui::bold()), Hit::None);
         for comment in comments {
+            let who = if comment.author == "user" { "you".into() } else { sanitize(&comment.author).into_owned() };
             let line = Line::from(vec![
-                Span::styled(format!("{} · ", sanitize(&comment.author)), Style::new().fg(ui::BLUE)),
-                Span::raw(sanitize::lines(&comment.text).collect::<Vec<_>>().join(" ")),
+                Span::styled("↳ ", ui::dim()),
+                Span::styled(who, Style::new().fg(ui::BLUE)),
+                Span::styled(" · ", ui::dim()),
+                Span::styled(sanitize::lines(&comment.text).collect::<Vec<_>>().join(" "), Style::new().fg(ui::TEXT)),
             ]);
             for row in wrap(&line, width) {
                 push(&mut laid, row, Hit::None);
@@ -675,16 +702,16 @@ mod tests {
         assert_eq!(
             golden(Part::Markdown { markdown: md.into(), id: None }, PartRender::Native),
             "╭─ markdown ───────────────────────────╮
-│ # Title                              │
+│ Title                                │
 │                                      │
 │ Some em and code, a link (http://x). │
 │                                      │
-│ • one                                │
-│ • two                                │
+│   • one                              │
+│   • two                              │
 │                                      │
-│ a │ bb                               │
-│ ──┼───                               │
-│ 1 │ 2                                │
+│   a   bb                             │
+│   ─   ──                             │
+│   1   2                              │
 ╰──────────────────────────────────────╯"
         );
     }
@@ -700,8 +727,8 @@ mod tests {
         assert_eq!(
             golden(part, render),
             "╭─ code · rust ────────────────────────╮
-│  9 fn a() {}                         │
-│ 10 let b;                            │
+│  9 │ fn a() {}                       │
+│ 10 │ let b;                          │
 ╰──────────────────────────────────────╯"
         );
     }
@@ -777,10 +804,10 @@ mod tests {
         assert_eq!(
             golden(Part::Json { data, id: None }, PartRender::Native),
             "╭─ json ───────────────────────────────╮
-│ ▾ {2}                                │
-│     a: 1                             │
-│   ▾ b: {1}                           │
-│     ▸ c: [1]                         │
+│ ▾ {… 2 keys}                         │
+│     \"a\": 1                           │
+│   ▾ \"b\": {… 1 key}                   │
+│     ▸ \"c\": [… 1 item]                │
 ╰──────────────────────────────────────╯"
         );
         let steps = vec![
@@ -838,7 +865,7 @@ mod tests {
     #[test]
     fn wrap_breaks_at_spaces_and_splits_long_words() {
         let rows = wrap(&Line::from("aaa bbb ccc"), 7);
-        assert_eq!(rows.iter().map(|l| l.to_string()).collect::<Vec<_>>(), ["aaa bbb ", "ccc"]);
+        assert_eq!(rows.iter().map(|l| l.to_string()).collect::<Vec<_>>(), ["aaa bbb", "ccc"]);
         let rows = wrap(&Line::from("abcdefghij"), 4);
         assert_eq!(rows.iter().map(|l| l.to_string()).collect::<Vec<_>>(), ["abcd", "efgh", "ij"]);
     }
