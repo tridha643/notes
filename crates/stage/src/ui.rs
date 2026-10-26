@@ -19,8 +19,6 @@ pub const TEXT: Color = Color::Rgb(0xcd, 0xd6, 0xf4);
 pub const TEAL: Color = Color::Rgb(0x94, 0xe2, 0xd5);
 /// Sidebar background, so the post list reads as its own column.
 pub const SIDEBAR: Color = Color::Rgb(0x1e, 0x1e, 0x2e);
-/// Key chips in the keybar.
-pub const CHIP: Color = Color::Rgb(0x31, 0x32, 0x44);
 pub const CODE_BG: Color = Color::Rgb(0x1e, 0x1e, 0x2e);
 pub const BLUE: Color = Color::Rgb(0x89, 0xb4, 0xfa);
 pub const GREEN: Color = Color::Rgb(0xa6, 0xe3, 0xa1);
@@ -173,8 +171,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 ("enter", "fold"),
                 ("/", "search"),
                 ("c", "comment"),
-                ("o", "open"),
-                ("v", "versions"),
                 (":", "command"),
                 ("q", "quit"),
             ]),
@@ -186,12 +182,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(bar(keys, g.keybar.width, BAR), g.keybar);
 }
 
-/// Keybar entries: each key in a chip, its action dim beside it.
+/// Keybar entries, as in the demo: the key bold blue, its action dim, `·` between.
 fn chips(keys: &[(&str, &str)]) -> Vec<Span<'static>> {
     let mut spans = vec![Span::raw(" ")];
-    for (key, what) in keys {
-        spans.push(Span::styled(format!(" {key} "), bold().fg(TEXT).bg(CHIP)));
-        spans.push(Span::styled(format!(" {what}  "), dim()));
+    for (i, (key, what)) in keys.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", dim()));
+        }
+        spans.push(Span::styled(key.to_string(), bold().fg(BLUE)));
+        spans.push(Span::styled(format!(" {what}"), dim()));
     }
     spans
 }
@@ -199,10 +198,9 @@ fn chips(keys: &[(&str, &str)]) -> Vec<Span<'static>> {
 /// An input line in the keybar: a labelled chip, the text, a cursor, then its keys.
 fn prompt(label: &str, input: &str, keys: &[(&str, &str)]) -> Vec<Span<'static>> {
     let mut spans = vec![
-        Span::raw(" "),
-        Span::styled(format!(" {label} "), bold().fg(BAR).bg(BLUE)),
-        Span::styled(format!(" {input}"), Style::new().fg(TEXT)),
-        Span::styled("▏  ", Style::new().fg(BLUE)),
+        Span::styled(format!(" {label} "), bold().fg(BLUE)),
+        Span::styled(input.to_owned(), Style::new().fg(TEXT)),
+        Span::styled("▏   ", Style::new().fg(BLUE)),
     ];
     spans.extend(chips(keys).into_iter().skip(1));
     spans
