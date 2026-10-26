@@ -126,6 +126,7 @@ fn create_session(
     agent: Option<&str>,
     title: Option<&str>,
     cwd: Option<&str>,
+    owner: Option<&str>,
 ) -> Result<SessionFile> {
     let at = now();
     Ok(SessionFile {
@@ -134,6 +135,7 @@ fn create_session(
         agent: reserved_agent(agent),
         title: trimmed(title, MAX_TITLE),
         cwd: cwd.map(Into::into),
+        owner: owner.map(Into::into),
         created_at: at,
         last_active_at: at,
         agent_seq: 0,
@@ -144,7 +146,7 @@ fn create_session(
 }
 
 pub fn session_new(s: &Store, args: &SessionNewArgs) -> Result<Written<Session>> {
-    let file = create_session(s, Some(&args.agent), args.title.as_deref(), args.cwd.as_deref())?;
+    let file = create_session(s, Some(&args.agent), args.title.as_deref(), args.cwd.as_deref(), None)?;
     let session = session_of(&file);
     s.save(file)?;
     let ev = event("session-created", &session.id, Some(&session.id), None);
@@ -300,8 +302,18 @@ fn collect_feedback(f: &mut SessionFile) -> Vec<Comment> {
     fresh.into_iter().filter(|c| c.author == "user").collect()
 }
 
-/// Publish a post. With no `session`, reuses the newest session for
-/// (`agent`, `cwd`) — the request's caller — or creates one.
+/// The newest session started by conversation `owner`, if any.
+pub fn owned_session(s: &Store, owner: &str) -> Option<SessionId> {
+    s.stage()
+        .sessions
+        .values()
+        .filter(|e| e.data.owner.as_deref() == Some(owner))
+        .max_by_key(|e| (e.data.last_active_at, e.ord))
+        .map(|e| e.data.id.clone())
+}
+
+/// Publish a post. With no `session`, joins the caller's conversation's session
+/// (`args.owner`), or without one the newest for (`agent`, `cwd`); else starts one.
 pub fn post_new(
     s: &Store,
     args: &PostNewArgs,
@@ -314,17 +326,21 @@ pub fn post_new(
         Some(id) => load(s, id)?,
         None => {
             let agent = reserved_agent(agent);
-            let found = s
-                .stage()
-                .sessions
-                .values()
-                .filter(|e| e.data.agent == agent && e.data.cwd.as_deref() == cwd)
-                .max_by_key(|e| (e.data.last_active_at, e.ord))
-                .map(|e| e.data.clone());
+            let owner = args.owner.as_deref();
+            let found = match owner {
+                Some(owner) => owned_session(s, owner).map(|id| load(s, &id)).transpose()?,
+                None => s
+                    .stage()
+                    .sessions
+                    .values()
+                    .filter(|e| e.data.agent == agent && e.data.cwd.as_deref() == cwd)
+                    .max_by_key(|e| (e.data.last_active_at, e.ord))
+                    .map(|e| e.data.clone()),
+            };
             match found {
                 Some(f) => f,
                 None => {
-                    let f = create_session(s, Some(&agent), None, cwd)?;
+                    let f = create_session(s, Some(&agent), args.session_title.as_deref(), cwd, owner)?;
                     events.push(event("session-created", &f.id, Some(&f.id), None));
                     f
                 }

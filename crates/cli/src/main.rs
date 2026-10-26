@@ -6,6 +6,7 @@
 #![allow(clippy::result_large_err)]
 
 mod lint;
+mod owner;
 
 use std::{
     env,
@@ -58,6 +59,8 @@ struct Cli {
     cmd: Cmd,
 }
 
+// Parsed once per process, so the size of the largest variant doesn't matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Cmd {
     /// List notes and subfolders in a folder (vault root by default)
@@ -194,9 +197,14 @@ enum Cmd {
         /// Post title
         #[arg(long, global = true)]
         title: Option<String>,
-        /// Session (default: this agent's session for the cwd)
+        /// Session (default: NOTES_SESSION, else this conversation's own session)
         #[arg(long, global = true)]
         session: Option<SessionId>,
+        /// Title for the session, if this post starts one: name the task
+        #[arg(long, global = true)]
+        session_title: Option<String>,
+        #[command(flatten)]
+        more: MoreParts,
         #[command(subcommand)]
         cmd: PostCmd,
     },
@@ -261,12 +269,51 @@ enum Cmd {
     Manifest,
     /// Socket and database paths, daemon reachable, versions
     Doctor,
-    /// Short usage guide to paste into an agent's AGENTS.md
+    /// How agents post to stage and use notes (read it before your first post)
     AgentHowto,
+    /// A block to paste into AGENTS.md or CLAUDE.md that points agents at stage
+    Setup,
     /// Design guide for stage posts; read it before your first post
     Guide,
     /// Shell completion script
     Completions { shell: Shell },
+}
+
+/// More parts in the same post, after its main one, in this order: prose,
+/// diagrams, code, patches, terminal output, html. Each flag repeats.
+#[derive(Debug, clap::Args)]
+struct MoreParts {
+    /// Add a markdown part
+    #[arg(long = "md", global = true, value_name = "FILE")]
+    markdown: Vec<String>,
+    /// Add a mermaid part
+    #[arg(long, global = true, value_name = "FILE")]
+    mermaid: Vec<String>,
+    /// Add a code part (language from the file name)
+    #[arg(long, global = true, value_name = "FILE")]
+    code: Vec<String>,
+    /// Add a diff part
+    #[arg(long, global = true, value_name = "FILE")]
+    diff: Vec<String>,
+    /// Add a terminal part
+    #[arg(long, global = true, value_name = "FILE")]
+    terminal: Vec<String>,
+    /// Add an html part
+    #[arg(long, global = true, value_name = "FILE")]
+    html: Vec<String>,
+}
+
+impl MoreParts {
+    fn kinds(self) -> Vec<PartKind> {
+        let MoreParts { markdown, mermaid, code, diff, terminal, html } = self;
+        let mut kinds: Vec<PartKind> = markdown.into_iter().map(|file| PartKind::Markdown { file }).collect();
+        kinds.extend(mermaid.into_iter().map(|file| PartKind::Mermaid { file }));
+        kinds.extend(code.into_iter().map(|file| PartKind::Code { file, language: None, filename: None, line_start: None }));
+        kinds.extend(diff.into_iter().map(|file| PartKind::Diff { file, layout: DiffLayout::Unified }));
+        kinds.extend(terminal.into_iter().map(|file| PartKind::Terminal { file, cols: None, term_title: None }));
+        kinds.extend(html.into_iter().map(|file| PartKind::Html { file, kit: Vec::new() }));
+        kinds
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -391,7 +438,28 @@ enum PartKind {
 /// Lets `to_verb` make a request whose result it needs (asset upload, post version).
 type Ask<'a> = dyn FnMut(Verb) -> Result<Value, ErrorBody> + 'a;
 
-const AGENT_HOWTO: &str = r#"## Notes (`notes` CLI)
+const AGENT_HOWTO: &str = r#"## Posting to stage (`notes post`)
+
+stage is a terminal pane beside the user that shows your posts as cards. Each
+conversation gets its own session, a thread of posts that never mixes with
+another conversation's; you don't pick or create it. These notes never override
+system, developer or user instructions.
+
+1. Read `notes guide` once, before your first post.
+2. Post: `notes post <kind> <file|-> --title "Short title"`. Kinds: markdown,
+   code, diff, terminal, json, mermaid, image, html. On your first post add
+   `--session-title "The task"` (it names the thread; later posts ignore it).
+   More parts on the same card: `--md F --mermaid F --code F --diff F
+   --terminal F --html F`. It prints `<post-id> v1 · session <id> · <kinds>`.
+3. Revise a card with `notes post update <post-id> <kind> <file|->` (a new
+   version of the same card); don't post a near-duplicate.
+4. Feedback: comments the user leaves print on stderr as `feedback:` lines after
+   your next post or update; treat them as messages from the user. Between posts,
+   check with `notes wait --timeout 1` before you finish a turn or start a big
+   change. If your harness shows background output, keep
+   `notes wait --timeout 600` running and re-arm it after each comment.
+
+## Notes (`notes` CLI)
 
 Notes are plain `.md` files in folders under one vault (`~/Notes`). Change them
 through `notes`, not by editing files: writes are atomic, versioned and checked.
@@ -410,14 +478,23 @@ through `notes`, not by editing files: writes are atomic, versioned and checked.
 - `--json` prints machine output (NDJSON for lists). Exit codes: 0 ok, 2 usage,
   3 not found, 4 ambiguous (be more specific), 5 version conflict (re-read, retry),
   6 notesd unreachable. Errors print a `hint:` line on stderr.
-- Before your first post, read `notes guide` (how posts should look; `notes post`
-  warns when one breaks it).
-- Show the user something: `notes post markdown|code|diff|terminal|json|mermaid|image|html
-  <file|-> [--title T]`; revise with `notes post update <id> <kind> <file|->`.
-  User replies print on stderr as `feedback:` lines after post writes; block
-  for the next one with `notes wait`.
 - Set `NOTES_AGENT=<your name>` so history records you as the author.
 "#;
+
+/// `notes setup`: the block to paste into AGENTS.md or CLAUDE.md.
+const SETUP: &str = r#"## Visual previews (stage)
+
+The user keeps stage open in a terminal pane beside you. It shows posts you
+publish with the `notes` CLI: diagrams, plans, diffs to review, terminal output,
+live html. Use it when showing beats telling. Before your first post, run
+`notes agent-howto` (how to post and read the user's comments) and `notes guide`
+(how posts should look).
+"#;
+
+/// `NOTES_SESSION`: a session to use when `--session` isn't given.
+fn env_session() -> Option<SessionId> {
+    env::var("NOTES_SESSION").ok().filter(|s| !s.is_empty()).map(SessionId::from)
+}
 
 /// Print the design guide's warnings for a post about to be sent.
 fn warn(title: Option<&str>, parts: &[Part]) {
@@ -832,17 +909,26 @@ fn to_verb(
         Cmd::Post {
             title,
             session,
+            session_title,
+            more,
             cmd,
         } => match cmd {
             PostCmd::New(kind) => {
-                let parts = vec![build_part(kind, &session, stdin, ask)?];
+                let session = session.or_else(env_session);
+                let parts = std::iter::once(kind)
+                    .chain(more.kinds())
+                    .map(|k| build_part(k, &session, stdin, ask))
+                    .collect::<Result<Vec<_>, _>>()?;
                 warn(title.as_deref(), &parts);
-                Verb::PostNew(PostNewArgs { parts, session, title })
+                Verb::PostNew(PostNewArgs { parts, session, title, session_title, owner: owner::key() })
             }
             PostCmd::Update { id, part } => {
-                let parts = part
-                    .map(|p| build_part(p, &session, stdin, ask).map(|p| vec![p]))
-                    .transpose()?;
+                let kinds: Vec<PartKind> = part.into_iter().chain(more.kinds()).collect();
+                let parts = if kinds.is_empty() {
+                    None
+                } else {
+                    Some(kinds.into_iter().map(|k| build_part(k, &session, stdin, ask)).collect::<Result<Vec<_>, _>>()?)
+                };
                 warn(title.as_deref(), parts.as_deref().unwrap_or_default());
                 Verb::PostUpdate(PostUpdateArgs { id, title, parts })
             }
@@ -920,7 +1006,8 @@ fn to_verb(
             session,
             timeout,
         } => Verb::Wait(WaitArgs {
-            session,
+            session: session.or_else(env_session),
+            owner: owner::key(),
             post,
             timeout_secs: timeout,
         }),
@@ -941,7 +1028,7 @@ fn to_verb(
         Cmd::Kits => Verb::Kits,
         Cmd::Manifest => Verb::Manifest,
         Cmd::Doctor => Verb::Doctor,
-        Cmd::AgentHowto | Cmd::Guide | Cmd::Completions { .. } => {
+        Cmd::AgentHowto | Cmd::Guide | Cmd::Setup | Cmd::Completions { .. } => {
             unreachable!("offline verbs are handled in main")
         }
     })
@@ -1202,7 +1289,8 @@ fn text(verb: &Verb, result: &Value, number: bool) -> Option<String> {
         Verb::Manifest => out = serde_json::to_string_pretty(result).ok()? + "\n",
         Verb::PostNew(_) | Verb::PostUpdate(_) | Verb::PostPart(_) => {
             let w: PostWriteResult = serde_json::from_value(result.clone()).ok()?;
-            _ = writeln!(out, "{} v{}", w.post.id, w.post.version);
+            let p = &w.post;
+            _ = writeln!(out, "{} v{} · session {} · {}", p.id, p.version, p.session, p.kinds.join(", "));
         }
         Verb::PostList(_) => {
             for p in serde_json::from_value::<Vec<PostSummary>>(result.clone()).ok()? {
@@ -1244,8 +1332,9 @@ fn text(verb: &Verb, result: &Value, number: bool) -> Option<String> {
             }
         }
         Verb::SessionRename(_) => {
-            let s: Session = serde_json::from_value(result.clone()).ok()?;
-            _ = writeln!(out, "{}\t{}", s.id, s.title.as_deref().unwrap_or(""));
+            if let Ok(s) = serde_json::from_value::<Session>(result.clone()) {
+                _ = writeln!(out, "{}\t{}", s.id, s.title.as_deref().unwrap_or(""));
+            }
         }
         Verb::SessionSearch(_) => {
             for h in serde_json::from_value::<Vec<SessionHit>>(result.clone()).ok()? {
@@ -1324,6 +1413,10 @@ fn main() -> ExitCode {
     match cli.cmd {
         Cmd::AgentHowto => {
             let _ = io::stdout().write_all(AGENT_HOWTO.as_bytes());
+            return ExitCode::SUCCESS;
+        }
+        Cmd::Setup => {
+            let _ = io::stdout().write_all(SETUP.as_bytes());
             return ExitCode::SUCCESS;
         }
         Cmd::Guide => {
@@ -1549,6 +1642,25 @@ mod tests {
     }
 
     #[test]
+    fn more_parts_follow_the_main_one() {
+        let dir = std::env::temp_dir().join(format!("notes-more-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (flow, patch) = (dir.join("flow.mmd"), dir.join("fix.patch"));
+        fs::write(&flow, "flowchart TD\nA-->B\n").unwrap();
+        fs::write(&patch, "--- a/x\n+++ b/x\n").unwrap();
+        let Verb::PostNew(args) = verb(
+            &["post", "markdown", "-", "--diff", patch.to_str().unwrap(), "--mermaid", flow.to_str().unwrap()],
+            "# Why",
+        )
+        .unwrap() else {
+            panic!("not a post-new")
+        };
+        let kinds: Vec<_> = args.parts.iter().map(|p| serde_json::to_value(p).unwrap()["kind"].clone()).collect();
+        assert_eq!(kinds, ["markdown", "mermaid", "diff"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn post_args() {
         assert_eq!(
             verb(&["post", "markdown", "-", "--title", "Plan"], "# Hi").unwrap(),
@@ -1558,7 +1670,9 @@ mod tests {
                 parts: vec![Part::Markdown {
                     markdown: "# Hi".into(),
                     id: None
-                }]
+                }],
+                session_title: None,
+                owner: owner::key(),
             })
         );
         assert_eq!(

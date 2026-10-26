@@ -16,6 +16,10 @@ swift build -c release --package-path apps/Notes --product stage-helper
 swiftbin="$(swift build -c release --package-path apps/Notes --show-bin-path)"
 install -m 755 "$swiftbin/stage-helper" "$bin/"
 rm -rf "$bin/Notes_NotesCore.bundle" && cp -R "$swiftbin/Notes_NotesCore.bundle" "$bin/"
+# The stage skill, for every agent that reads a skills folder, so agents find `notes post`.
+for skills in "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.pi/agent/skills" "$HOME/.agents/skills"; do
+  if [ -d "$skills" ]; then rm -rf "$skills/stage" && cp -R skills/stage "$skills/stage"; fi
+done
 # Standard, not Background: notesd answers the UI and the CLI, so it shouldn't be throttled.
 cat > "$plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

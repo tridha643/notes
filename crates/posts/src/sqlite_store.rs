@@ -48,6 +48,7 @@ pub(crate) fn export_sessions(db: &Connection) -> Result<Vec<SessionFile>> {
                 agent: r.get(1)?,
                 title: r.get(2)?,
                 cwd: r.get(3)?,
+                owner: None,
                 created_at: r.get(4)?,
                 last_active_at: r.get(5)?,
                 agent_seq: r.get(6)?,
