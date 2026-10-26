@@ -368,3 +368,25 @@ S7 (JSON history + search) is folded into S0 and S1.
 - **Mermaid metrics** (pele measurer vs resvg font) are unverified; S5 starts with a design pass.
 - **Feedback semantics.** notesd's shared `agent_seq` differs from sideshow's `afterSeq`; S6 must
   reconcile it.
+
+## Built past S1 (2026-10-25)
+
+These replace the S3 to S5 plans above where they differ.
+
+- **Feed.** A session is one scrolling feed of every post (sideshow's timeline), memoized and
+  anchored on the cursor line across rebuilds and resizes. `c` comments on the post under the
+  cursor; mouse drag selects and copies with a soft band.
+- **Visuals.** One shared `stage-helper --serve` per login (unix socket in the cache dir, 10 min
+  idle exit): pele mermaid → SVG, rasterized by resvg in stage; images by path (PNG) or decoded by
+  the helper; html runs live in an offscreen WKWebView, frames to kitty over shm only while the
+  page animates or mutates. Pages wider than the card are zoomed out to fit. Live pages hold still
+  while scrolling. Not snapshots: the S4 snapshot plan is dropped.
+- **Updates.** An html update patches the open page in place when only styles or identified
+  text changed (after vercel-labs/fx0's preview runtime), else reloads behind the last frame.
+- **Highlighting.** Pierre's Highlights (wasm, in wasmi) instead of tree-sitter.
+- **Guide.** `notes guide` is the stage design guide (from sideshow's); `notes post` warns when a
+  post breaks it.
+- **Rex facts.** A new pane starts at a placeholder size, so stage re-measures cells on resize;
+  Rex frees images on the resize clear, so stage re-sends them after each `draw`.
+- **Perf.** `cargo bench -p stage --bench visuals` fails over `benches/budget.txt`. Warm mermaid
+  ~24 ms, warm html ~75 ms, restart ~30/85 ms; cold is helper launch (~0.3/0.6 s, once per login).
