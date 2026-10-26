@@ -5,6 +5,8 @@
 // Errors are `ErrorBody` straight off the wire and happen at most once per process.
 #![allow(clippy::result_large_err)]
 
+mod lint;
+
 use std::{
     env,
     fmt::Write as _,
@@ -261,6 +263,8 @@ enum Cmd {
     Doctor,
     /// Short usage guide to paste into an agent's AGENTS.md
     AgentHowto,
+    /// Design guide for stage posts; read it before your first post
+    Guide,
     /// Shell completion script
     Completions { shell: Shell },
 }
@@ -406,12 +410,21 @@ through `notes`, not by editing files: writes are atomic, versioned and checked.
 - `--json` prints machine output (NDJSON for lists). Exit codes: 0 ok, 2 usage,
   3 not found, 4 ambiguous (be more specific), 5 version conflict (re-read, retry),
   6 notesd unreachable. Errors print a `hint:` line on stderr.
+- Before your first post, read `notes guide` (how posts should look; `notes post`
+  warns when one breaks it).
 - Show the user something: `notes post markdown|code|diff|terminal|json|mermaid|image|html
   <file|-> [--title T]`; revise with `notes post update <id> <kind> <file|->`.
   User replies print on stderr as `feedback:` lines after post writes; block
   for the next one with `notes wait`.
 - Set `NOTES_AGENT=<your name>` so history records you as the author.
 "#;
+
+/// Print the design guide's warnings for a post about to be sent.
+fn warn(title: Option<&str>, parts: &[Part]) {
+    for w in lint::check(title, parts) {
+        eprintln!("warning: {w} (see `notes guide`)");
+    }
+}
 
 /// Parse a flag value as one of a proto enum's kebab-case names.
 fn kebab<T: DeserializeOwned>(s: &str) -> Result<T, String> {
@@ -821,18 +834,18 @@ fn to_verb(
             session,
             cmd,
         } => match cmd {
-            PostCmd::New(kind) => Verb::PostNew(PostNewArgs {
-                parts: vec![build_part(kind, &session, stdin, ask)?],
-                session,
-                title,
-            }),
-            PostCmd::Update { id, part } => Verb::PostUpdate(PostUpdateArgs {
-                id,
-                title,
-                parts: part
+            PostCmd::New(kind) => {
+                let parts = vec![build_part(kind, &session, stdin, ask)?];
+                warn(title.as_deref(), &parts);
+                Verb::PostNew(PostNewArgs { parts, session, title })
+            }
+            PostCmd::Update { id, part } => {
+                let parts = part
                     .map(|p| build_part(p, &session, stdin, ask).map(|p| vec![p]))
-                    .transpose()?,
-            }),
+                    .transpose()?;
+                warn(title.as_deref(), parts.as_deref().unwrap_or_default());
+                Verb::PostUpdate(PostUpdateArgs { id, title, parts })
+            }
             PostCmd::Part { id, op } => {
                 let (op, target, part) = match op {
                     PartCmd::Add { at, part } => (PartOp::Add, at, Some(part)),
@@ -842,6 +855,7 @@ fn to_verb(
                 let part = part
                     .map(|p| build_part(p, &session, stdin, ask))
                     .transpose()?;
+                warn(title.as_deref(), part.as_slice());
                 Verb::PostPart(PostPartArgs {
                     id,
                     op,
@@ -927,7 +941,7 @@ fn to_verb(
         Cmd::Kits => Verb::Kits,
         Cmd::Manifest => Verb::Manifest,
         Cmd::Doctor => Verb::Doctor,
-        Cmd::AgentHowto | Cmd::Completions { .. } => {
+        Cmd::AgentHowto | Cmd::Guide | Cmd::Completions { .. } => {
             unreachable!("offline verbs are handled in main")
         }
     })
@@ -1229,6 +1243,10 @@ fn text(verb: &Verb, result: &Value, number: bool) -> Option<String> {
                 );
             }
         }
+        Verb::SessionRename(_) => {
+            let s: Session = serde_json::from_value(result.clone()).ok()?;
+            _ = writeln!(out, "{}\t{}", s.id, s.title.as_deref().unwrap_or(""));
+        }
         Verb::SessionSearch(_) => {
             for h in serde_json::from_value::<Vec<SessionHit>>(result.clone()).ok()? {
                 let title = h.session.title.as_deref().unwrap_or("");
@@ -1306,6 +1324,10 @@ fn main() -> ExitCode {
     match cli.cmd {
         Cmd::AgentHowto => {
             let _ = io::stdout().write_all(AGENT_HOWTO.as_bytes());
+            return ExitCode::SUCCESS;
+        }
+        Cmd::Guide => {
+            let _ = io::stdout().write_all(include_str!("guide.md").as_bytes());
             return ExitCode::SUCCESS;
         }
         Cmd::Completions { shell } => {
