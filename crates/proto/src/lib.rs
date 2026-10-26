@@ -532,6 +532,10 @@ pub struct DoctorResult {
     /// Render cache counters `{hits, misses, entries, bytes}` (hit rate = hits / (hits + misses)).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render_cache: Option<Value>,
+    /// Latest committed event seq: start a `watch` here, then list, and nothing
+    /// committed in between is missed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
     /// Sideshow session folder `{path, sessions, skipped: [file…], migration}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<Value>,

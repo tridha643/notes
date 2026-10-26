@@ -807,7 +807,10 @@ fn session_files_removed_or_added_outside_become_events() {
     let session = post["post"]["session"].clone();
     let name = d.session_files().remove(0);
     let saved = fs::read(d.stage().join(&name)).unwrap();
-    let mut watch = d.watch(json!({ "kinds": ["session"] }));
+    // Start from doctor's seq: a watch with no `since` begins wherever notesd is when it
+    // registers, which can be after the delete below.
+    let since = d.ok("doctor", Value::Null)["seq"].clone();
+    let mut watch = d.watch(json!({ "since": since, "kinds": ["session"] }));
 
     fs::remove_file(d.stage().join(&name)).unwrap();
     let e = next_event(&mut watch);

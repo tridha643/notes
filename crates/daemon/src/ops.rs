@@ -260,6 +260,7 @@ impl Tx<'_> {
                 render_cache: Some(
                     serde_json::to_value(self.d.render.stats()).expect("stats serialize"),
                 ),
+                seq: Some(self.d.latest_seq()),
                 stage: Some(self.store.doctor()),
             }),
             Verb::Manifest => Ok(manifest()),
