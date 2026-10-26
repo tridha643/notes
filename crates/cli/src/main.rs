@@ -1171,6 +1171,19 @@ fn text(verb: &Verb, result: &Value, number: bool) -> Option<String> {
             _ = writeln!(out, "vault     {}", d.vault.display());
             _ = writeln!(out, "database  {}", d.database.display());
             _ = writeln!(out, "notes     {}", d.notes);
+            if let Some(stage) = &d.stage {
+                let path = stage["path"].as_str().unwrap_or("");
+                _ = writeln!(out, "sessions  {} in {path}", stage["sessions"]);
+                if let Some(error) = stage["error"].as_str() {
+                    _ = writeln!(out, "          error: {error}");
+                }
+                for skipped in stage["skipped"].as_array().into_iter().flatten() {
+                    _ = writeln!(out, "          skipped {}", skipped.as_str().unwrap_or(""));
+                }
+                if let Some(m) = stage["migration"].as_str().filter(|m| m.starts_with("failed")) {
+                    _ = writeln!(out, "          migration {m}");
+                }
+            }
         }
         Verb::Manifest => out = serde_json::to_string_pretty(result).ok()? + "\n",
         Verb::PostNew(_) | Verb::PostUpdate(_) | Verb::PostPart(_) => {
