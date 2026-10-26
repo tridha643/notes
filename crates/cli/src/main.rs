@@ -5,6 +5,8 @@
 // Errors are `ErrorBody` straight off the wire and happen at most once per process.
 #![allow(clippy::result_large_err)]
 
+mod lint;
+
 use std::{
     env,
     fmt::Write as _,
@@ -18,10 +20,10 @@ use std::{
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use notes_proto::posts::{
-    AssetInfo, AssetKind, AssetPutArgs, Comment, CommentAnchor, CommentListArgs, CommentNewArgs,
+    AssetId, AssetInfo, AssetKind, AssetPutArgs, Comment, CommentAnchor, CommentListArgs, CommentNewArgs,
     DiffLayout, IdArgs, Kit, Part, PartOp, Post, PostListArgs, PostNewArgs, PostPartArgs,
-    PostShowArgs, PostSummary, PostUpdateArgs, PostWriteResult, Session, SessionRenameArgs,
-    TraceSetArgs, TraceStep, WaitArgs,
+    PostId, PostShowArgs, PostSummary, PostUpdateArgs, PostWriteResult, Session, SessionHit,
+    SessionId, SessionRenameArgs, SessionSearchArgs, TraceSetArgs, TraceStep, WaitArgs,
 };
 use notes_proto::{
     default_socket_path, to_line, AppendArgs, BatchArgs, BatchOutcome, DeleteArgs, DiffArgs,
@@ -194,7 +196,7 @@ enum Cmd {
         title: Option<String>,
         /// Session (default: this agent's session for the cwd)
         #[arg(long, global = true)]
-        session: Option<String>,
+        session: Option<SessionId>,
         #[command(subcommand)]
         cmd: PostCmd,
     },
@@ -205,11 +207,11 @@ enum Cmd {
         #[arg(long, value_parser = kebab::<AssetKind>)]
         kind: Option<AssetKind>,
         #[arg(long)]
-        session: Option<String>,
+        session: Option<SessionId>,
     },
     /// Reply on a post
     Comment {
-        post: String,
+        post: PostId,
         /// Text, or - for stdin
         text: String,
         /// Anchor the comment to lines A:B of a part
@@ -222,9 +224,9 @@ enum Cmd {
     /// Comments in a session or on a post
     Comments {
         #[arg(long)]
-        post: Option<String>,
+        post: Option<PostId>,
         #[arg(long)]
-        session: Option<String>,
+        session: Option<SessionId>,
         /// Only comments after this seq
         #[arg(long, value_name = "SEQ")]
         after: Option<u64>,
@@ -232,9 +234,9 @@ enum Cmd {
     /// Block until the user comments, then print it
     Wait {
         #[arg(long)]
-        post: Option<String>,
+        post: Option<PostId>,
         #[arg(long)]
-        session: Option<String>,
+        session: Option<SessionId>,
         /// Seconds to wait; 0 waits forever
         #[arg(long, default_value_t = 120)]
         timeout: u64,
@@ -251,7 +253,7 @@ enum Cmd {
         /// [{"label":…}] array or one step per line, or - for stdin
         file: String,
         #[arg(long)]
-        session: String,
+        session: SessionId,
     },
     /// List the opt-in kits for html parts
     Kits,
@@ -261,6 +263,8 @@ enum Cmd {
     Doctor,
     /// Short usage guide to paste into an agent's AGENTS.md
     AgentHowto,
+    /// Design guide for stage posts; read it before your first post
+    Guide,
     /// Shell completion script
     Completions { shell: Shell },
 }
@@ -271,13 +275,13 @@ enum PostCmd {
     New(PartKind),
     /// New version of a post (same card): a new title and/or this one part
     Update {
-        id: String,
+        id: PostId,
         #[command(subcommand)]
         part: Option<PartKind>,
     },
     /// Add, replace or remove one part
     Part {
-        id: String,
+        id: PostId,
         #[command(subcommand)]
         op: PartCmd,
     },
@@ -288,12 +292,12 @@ enum PostCmd {
     },
     /// Show a post and its parts
     Show {
-        id: String,
+        id: PostId,
         #[arg(long)]
         version: Option<u64>,
     },
     /// Delete a post
-    Delete { id: String },
+    Delete { id: PostId },
 }
 
 #[derive(Debug, Subcommand)]
@@ -318,8 +322,14 @@ enum PartCmd {
 
 #[derive(Debug, Subcommand)]
 enum SessionCmd {
-    Rename { id: String, title: String },
-    Delete { id: String },
+    Rename { id: SessionId, title: String },
+    Delete { id: SessionId },
+    /// Find sessions by title, agent or cwd, then by post and comment text
+    Search {
+        query: String,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
 }
 
 /// One post part read from a file, or - for stdin.
@@ -400,12 +410,21 @@ through `notes`, not by editing files: writes are atomic, versioned and checked.
 - `--json` prints machine output (NDJSON for lists). Exit codes: 0 ok, 2 usage,
   3 not found, 4 ambiguous (be more specific), 5 version conflict (re-read, retry),
   6 notesd unreachable. Errors print a `hint:` line on stderr.
+- Before your first post, read `notes guide` (how posts should look; `notes post`
+  warns when one breaks it).
 - Show the user something: `notes post markdown|code|diff|terminal|json|mermaid|image|html
   <file|-> [--title T]`; revise with `notes post update <id> <kind> <file|->`.
   User replies print on stderr as `feedback:` lines after post writes; block
   for the next one with `notes wait`.
 - Set `NOTES_AGENT=<your name>` so history records you as the author.
 "#;
+
+/// Print the design guide's warnings for a post about to be sent.
+fn warn(title: Option<&str>, parts: &[Part]) {
+    for w in lint::check(title, parts) {
+        eprintln!("warning: {w} (see `notes guide`)");
+    }
+}
 
 /// Parse a flag value as one of a proto enum's kebab-case names.
 fn kebab<T: DeserializeOwned>(s: &str) -> Result<T, String> {
@@ -533,7 +552,7 @@ fn content_type_for(file: &str) -> &'static str {
 fn asset_put(
     file: &str,
     kind: Option<AssetKind>,
-    session: Option<String>,
+    session: Option<SessionId>,
 ) -> Result<Verb, ErrorBody> {
     if file == "-" {
         return Err(fail(
@@ -569,11 +588,11 @@ fn asset_put(
 /// Build one post part; image and trace files are uploaded as assets first.
 fn build_part(
     kind: PartKind,
-    session: &Option<String>,
+    session: &Option<SessionId>,
     stdin: &mut dyn Read,
     ask: &mut Ask<'_>,
 ) -> Result<Part, ErrorBody> {
-    let mut upload = |file: &str, kind| -> Result<String, ErrorBody> {
+    let mut upload = |file: &str, kind| -> Result<AssetId, ErrorBody> {
         let info = ask(asset_put(file, Some(kind), session.clone())?)?;
         serde_json::from_value::<AssetInfo>(info)
             .map(|info| info.id)
@@ -815,18 +834,18 @@ fn to_verb(
             session,
             cmd,
         } => match cmd {
-            PostCmd::New(kind) => Verb::PostNew(PostNewArgs {
-                parts: vec![build_part(kind, &session, stdin, ask)?],
-                session,
-                title,
-            }),
-            PostCmd::Update { id, part } => Verb::PostUpdate(PostUpdateArgs {
-                id,
-                title,
-                parts: part
+            PostCmd::New(kind) => {
+                let parts = vec![build_part(kind, &session, stdin, ask)?];
+                warn(title.as_deref(), &parts);
+                Verb::PostNew(PostNewArgs { parts, session, title })
+            }
+            PostCmd::Update { id, part } => {
+                let parts = part
                     .map(|p| build_part(p, &session, stdin, ask).map(|p| vec![p]))
-                    .transpose()?,
-            }),
+                    .transpose()?;
+                warn(title.as_deref(), parts.as_deref().unwrap_or_default());
+                Verb::PostUpdate(PostUpdateArgs { id, title, parts })
+            }
             PostCmd::Part { id, op } => {
                 let (op, target, part) = match op {
                     PartCmd::Add { at, part } => (PartOp::Add, at, Some(part)),
@@ -836,6 +855,7 @@ fn to_verb(
                 let part = part
                     .map(|p| build_part(p, &session, stdin, ask))
                     .transpose()?;
+                warn(title.as_deref(), part.as_slice());
                 Verb::PostPart(PostPartArgs {
                     id,
                     op,
@@ -911,6 +931,9 @@ fn to_verb(
         Cmd::Session {
             cmd: SessionCmd::Delete { id },
         } => Verb::SessionDelete(IdArgs { id }),
+        Cmd::Session {
+            cmd: SessionCmd::Search { query, limit },
+        } => Verb::SessionSearch(SessionSearchArgs { query, limit }),
         Cmd::Trace { file, session } => Verb::TraceSet(TraceSetArgs {
             session,
             steps: trace_steps(&read_all(&file, stdin)?)?,
@@ -918,7 +941,7 @@ fn to_verb(
         Cmd::Kits => Verb::Kits,
         Cmd::Manifest => Verb::Manifest,
         Cmd::Doctor => Verb::Doctor,
-        Cmd::AgentHowto | Cmd::Completions { .. } => {
+        Cmd::AgentHowto | Cmd::Guide | Cmd::Completions { .. } => {
             unreachable!("offline verbs are handled in main")
         }
     })
@@ -1162,6 +1185,19 @@ fn text(verb: &Verb, result: &Value, number: bool) -> Option<String> {
             _ = writeln!(out, "vault     {}", d.vault.display());
             _ = writeln!(out, "database  {}", d.database.display());
             _ = writeln!(out, "notes     {}", d.notes);
+            if let Some(stage) = &d.stage {
+                let path = stage["path"].as_str().unwrap_or("");
+                _ = writeln!(out, "sessions  {} in {path}", stage["sessions"]);
+                if let Some(error) = stage["error"].as_str() {
+                    _ = writeln!(out, "          error: {error}");
+                }
+                for skipped in stage["skipped"].as_array().into_iter().flatten() {
+                    _ = writeln!(out, "          skipped {}", skipped.as_str().unwrap_or(""));
+                }
+                if let Some(m) = stage["migration"].as_str().filter(|m| m.starts_with("failed")) {
+                    _ = writeln!(out, "          migration {m}");
+                }
+            }
         }
         Verb::Manifest => out = serde_json::to_string_pretty(result).ok()? + "\n",
         Verb::PostNew(_) | Verb::PostUpdate(_) | Verb::PostPart(_) => {
@@ -1205,6 +1241,17 @@ fn text(verb: &Verb, result: &Value, number: bool) -> Option<String> {
                     "{}\t{}\t{} posts\t{active}\t{title}",
                     s.id, s.agent, s.post_count
                 );
+            }
+        }
+        Verb::SessionRename(_) => {
+            let s: Session = serde_json::from_value(result.clone()).ok()?;
+            _ = writeln!(out, "{}\t{}", s.id, s.title.as_deref().unwrap_or(""));
+        }
+        Verb::SessionSearch(_) => {
+            for h in serde_json::from_value::<Vec<SessionHit>>(result.clone()).ok()? {
+                let title = h.session.title.as_deref().unwrap_or("");
+                let found = h.text.as_deref().unwrap_or("");
+                _ = writeln!(out, "{}\t{}\t{title}\t{found}", h.session.id, h.session.agent);
             }
         }
         Verb::Kits => {
@@ -1277,6 +1324,10 @@ fn main() -> ExitCode {
     match cli.cmd {
         Cmd::AgentHowto => {
             let _ = io::stdout().write_all(AGENT_HOWTO.as_bytes());
+            return ExitCode::SUCCESS;
+        }
+        Cmd::Guide => {
+            let _ = io::stdout().write_all(include_str!("guide.md").as_bytes());
             return ExitCode::SUCCESS;
         }
         Cmd::Completions { shell } => {

@@ -1,14 +1,20 @@
-//! Every sideshow verb over SQLite. Mirrors docs/ref/sideshow/server/sqlStore.ts
-//! and the flow functions in app.ts.
+//! Every sideshow verb over the session folder (json_store.rs). Mirrors
+//! docs/ref/sideshow/server/sqlStore.ts and the flow functions in app.ts.
+//! Settings stay in SQLite.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    cmp::Reverse,
+    fs,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use notes_proto::{posts::*, Event};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    json_store::{AssetMeta, PostRec, SessionFile, Store, VersionRec, SCHEMA},
     not_found, usage,
     validate::{
         clip, part_id, part_id_mut, part_kind, validate_parts, MAX_ASSET_BYTES, MAX_COMMENT_TEXT,
@@ -16,9 +22,6 @@ use crate::{
     },
     Db, Result, Written,
 };
-
-/// Past versions kept per post (sideshow's HISTORY_LIMIT); older ones are pruned.
-pub const HISTORY_LIMIT: u64 = 20;
 
 fn now() -> i64 {
     SystemTime::now()
@@ -28,10 +31,11 @@ fn now() -> i64 {
 
 /// 8 random bytes as 11 url-safe base64 chars, never starting with `-`/`_`
 /// (they'd read as CLI flags). Sideshow's newId.
-fn new_id(conn: &Connection) -> Result<String> {
-    let bytes: Vec<u8> = conn
+fn new_id(s: &Store) -> Result<String> {
+    let bytes: Vec<u8> = s
+        .db
         .prepare_cached("SELECT randomblob(8)")
-        .and_then(|mut s| s.query_row([], |r| r.get(0)))
+        .and_then(|mut st| st.query_row([], |r| r.get(0)))
         .db()?;
     let mut id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
     if id.starts_with(['-', '_']) {
@@ -40,7 +44,7 @@ fn new_id(conn: &Connection) -> Result<String> {
     Ok(id)
 }
 
-fn event(kind: &str, id: &str, session: Option<&str>, version: Option<u64>) -> Event {
+pub(crate) fn event(kind: &str, id: &str, session: Option<&str>, version: Option<u64>) -> Event {
     Event {
         seq: 0,
         kind: kind.into(),
@@ -48,22 +52,6 @@ fn event(kind: &str, id: &str, session: Option<&str>, version: Option<u64>) -> E
         version,
         id: Some(id.into()),
         session: session.map(Into::into),
-    }
-}
-
-/// Run `f` inside a SAVEPOINT: all of it lands or none does, and it nests
-/// inside a transaction the caller already opened.
-fn atomic<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T> {
-    conn.execute_batch("SAVEPOINT notes_posts").db()?;
-    match f() {
-        Ok(v) => {
-            conn.execute_batch("RELEASE notes_posts").db()?;
-            Ok(v)
-        }
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK TO notes_posts; RELEASE notes_posts");
-            Err(e)
-        }
     }
 }
 
@@ -81,189 +69,207 @@ fn reserved_agent(agent: Option<&str>) -> String {
     }
 }
 
-fn touch(conn: &Connection, session: &str) -> Result<()> {
-    conn.prepare_cached("UPDATE sessions SET last_active_at = ?1 WHERE id = ?2")
-        .and_then(|mut s| s.execute(params![now(), session]))
-        .db()?;
-    Ok(())
+fn session_missing(id: &str) -> crate::ErrorBody {
+    not_found(format!("session \"{id}\" not found"))
+}
+
+fn post_missing(id: &str) -> crate::ErrorBody {
+    not_found(format!("post \"{id}\" not found"))
+}
+
+/// A copy of a session's file contents, to change and [`Store::save`].
+fn load(s: &Store, id: &str) -> Result<SessionFile> {
+    s.stage()
+        .sessions
+        .get(id)
+        .map(|e| e.data.clone())
+        .ok_or_else(|| session_missing(id))
+}
+
+/// The session holding `post`, and the post's index in it.
+fn load_post(s: &Store, post: &str) -> Result<(SessionFile, usize)> {
+    let session = s
+        .stage()
+        .index
+        .post_session(post)
+        .cloned()
+        .ok_or_else(|| post_missing(post))?;
+    let file = load(s, &session)?;
+    let at = file
+        .posts
+        .iter()
+        .position(|p| p.id == post)
+        .ok_or_else(|| post_missing(post))?;
+    Ok((file, at))
 }
 
 // ---- Sessions ------------------------------------------------------------------
 
-const SESSION_SELECT: &str = "SELECT s.id, s.agent, s.title, s.cwd, s.created_at, s.last_active_at,
-    (SELECT count(*) FROM posts p WHERE p.session = s.id) FROM sessions s";
-
-fn session_row(r: &Row) -> rusqlite::Result<Session> {
-    Ok(Session {
-        id: r.get(0)?,
-        agent: r.get(1)?,
-        title: r.get(2)?,
-        cwd: r.get(3)?,
-        created_at: r.get(4)?,
-        last_active_at: r.get(5)?,
-        post_count: r.get(6)?,
-    })
+fn session_of(f: &SessionFile) -> Session {
+    Session {
+        id: f.id.clone(),
+        agent: f.agent.clone(),
+        title: f.title.clone(),
+        cwd: f.cwd.clone(),
+        created_at: f.created_at,
+        last_active_at: f.last_active_at,
+        post_count: f.posts.len() as u32,
+    }
 }
 
-pub fn session_get(conn: &Connection, id: &str) -> Result<Session> {
-    conn.prepare_cached(&format!("{SESSION_SELECT} WHERE s.id = ?1"))
-        .and_then(|mut s| s.query_row([id], session_row).optional())
-        .db()?
-        .ok_or_else(|| not_found(format!("session \"{id}\" not found")))
+pub fn session_get(s: &Store, id: &str) -> Result<Session> {
+    Ok(session_of(&load(s, id)?))
 }
 
 fn create_session(
-    conn: &Connection,
+    s: &Store,
     agent: Option<&str>,
     title: Option<&str>,
     cwd: Option<&str>,
-) -> Result<Session> {
+) -> Result<SessionFile> {
     let at = now();
-    let session = Session {
-        id: new_id(conn)?,
+    Ok(SessionFile {
+        schema: SCHEMA,
+        id: new_id(s)?.into(),
         agent: reserved_agent(agent),
         title: trimmed(title, MAX_TITLE),
         cwd: cwd.map(Into::into),
         created_at: at,
         last_active_at: at,
-        post_count: 0,
-    };
-    conn.prepare_cached(
-        "INSERT INTO sessions (id, agent, title, cwd, created_at, last_active_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-    )
-    .and_then(|mut s| s.execute(params![session.id, session.agent, session.title, session.cwd, at]))
-    .db()?;
-    Ok(session)
+        agent_seq: 0,
+        posts: Vec::new(),
+        comments: Vec::new(),
+        trace: Vec::new(),
+    })
 }
 
-pub fn session_new(conn: &Connection, args: &SessionNewArgs) -> Result<Written<Session>> {
-    let session = create_session(
-        conn,
-        Some(&args.agent),
-        args.title.as_deref(),
-        args.cwd.as_deref(),
-    )?;
+pub fn session_new(s: &Store, args: &SessionNewArgs) -> Result<Written<Session>> {
+    let file = create_session(s, Some(&args.agent), args.title.as_deref(), args.cwd.as_deref())?;
+    let session = session_of(&file);
+    s.save(file)?;
     let ev = event("session-created", &session.id, Some(&session.id), None);
     Ok((session, vec![ev]))
 }
 
 /// Most recently active first.
-pub fn session_list(conn: &Connection) -> Result<Vec<Session>> {
-    let mut stmt = conn
-        .prepare_cached(&format!(
-            "{SESSION_SELECT} ORDER BY s.last_active_at DESC, s.rowid DESC"
-        ))
-        .db()?;
-    let rows = stmt.query_map([], session_row).db()?;
-    rows.collect::<rusqlite::Result<_>>().db()
+pub fn session_list(s: &Store) -> Result<Vec<Session>> {
+    let stage = s.stage();
+    let mut entries: Vec<_> = stage.sessions.values().collect();
+    entries.sort_by_key(|e| Reverse((e.data.last_active_at, e.ord)));
+    Ok(entries.into_iter().map(|e| session_of(&e.data)).collect())
 }
 
-/// An empty title clears it.
-pub fn session_rename(conn: &Connection, args: &SessionRenameArgs) -> Result<Written<Session>> {
-    let title = trimmed(Some(&args.title), MAX_TITLE);
-    let n = conn
-        .execute(
-            "UPDATE sessions SET title = ?1 WHERE id = ?2",
-            params![title, args.id],
-        )
-        .db()?;
-    if n == 0 {
-        return Err(not_found(format!("session \"{}\" not found", args.id)));
-    }
-    let session = session_get(conn, &args.id)?;
+/// An empty title clears it. The file name keeps the title it was created with.
+pub fn session_rename(s: &Store, args: &SessionRenameArgs) -> Result<Written<Session>> {
+    let mut file = load(s, &args.id)?;
+    file.title = trimmed(Some(&args.title), MAX_TITLE);
+    let session = session_of(&file);
+    s.save(file)?;
     Ok((
         session,
         vec![event("session-updated", &args.id, Some(&args.id), None)],
     ))
 }
 
-/// Deletes the session's posts, versions, comments and trace, and its assets
-/// unless a surviving post references them (assets are shared by content hash).
-pub fn session_delete(conn: &Connection, id: &str) -> Result<Vec<Event>> {
-    atomic(conn, || {
-        session_get(conn, id)?;
-        for sql in [
-            "DELETE FROM comments WHERE session = ?1",
-            "DELETE FROM post_versions WHERE post IN (SELECT id FROM posts WHERE session = ?1)",
-            "DELETE FROM asset_refs WHERE post IN (SELECT id FROM posts WHERE session = ?1)",
-            "DELETE FROM posts WHERE session = ?1",
-            "DELETE FROM trace_steps WHERE session = ?1",
-            "DELETE FROM assets WHERE session = ?1 AND id NOT IN (SELECT asset FROM asset_refs)",
-            "DELETE FROM sessions WHERE id = ?1",
-        ] {
-            conn.prepare_cached(sql)
-                .and_then(|mut s| s.execute([id]))
-                .db()?;
+/// Deletes the session's file, and its assets unless a surviving post
+/// references them (assets are shared by content hash).
+pub fn session_delete(s: &Store, id: &str) -> Result<Vec<Event>> {
+    load(s, id)?;
+    s.remove_session(&id.into())?;
+    let referenced = referenced_assets(s);
+    for meta in asset_metas(s) {
+        if meta.session.as_deref() == Some(id) && !referenced.contains(meta.id.as_str()) {
+            s.delete_asset_file(&s.asset_path(&meta.id))?;
+            s.delete_asset_file(&s.asset_path(&format!("{}.json", meta.id)))?;
         }
-        Ok(vec![event("session-deleted", id, Some(id), None)])
-    })
+    }
+    Ok(vec![event("session-deleted", id, Some(id), None)])
+}
+
+/// Sessions matching `query` by title, agent or cwd (best), or by post titles,
+/// part text and comments; most recently active first within a rank.
+pub fn session_search(s: &Store, args: &SessionSearchArgs) -> Result<Vec<SessionHit>> {
+    let query = args.query.trim().to_lowercase();
+    if query.is_empty() {
+        return Err(usage("session-search needs a query"));
+    }
+    let limit = args.limit.unwrap_or(50) as usize;
+    let stage = s.stage();
+    let mut hits: Vec<(u8, i64, u64, SessionHit)> = Vec::new();
+    // ponytail: a linear scan over every loaded session; an index when this shows up in profiles.
+    for e in stage.sessions.values() {
+        let f = &e.data;
+        let named = [Some(f.agent.as_str()), f.title.as_deref(), f.cwd.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|t| t.to_lowercase().contains(&query));
+        let found = if named { None } else { content_match(f, &query) };
+        if named || found.is_some() {
+            let (post, text) = found.unzip();
+            let hit = SessionHit {
+                session: session_of(f),
+                post: post.flatten(),
+                text,
+            };
+            hits.push((u8::from(!named), f.last_active_at, e.ord, hit));
+        }
+    }
+    hits.sort_by_key(|(rank, active, ord, _)| (*rank, Reverse(*active), Reverse(*ord)));
+    Ok(hits.into_iter().take(limit).map(|h| h.3).collect())
+}
+
+/// The first post title, text line or comment containing `query`.
+fn content_match(f: &SessionFile, query: &str) -> Option<(Option<PostId>, String)> {
+    let line_of = |text: &str| {
+        text.lines()
+            .find(|l| l.to_lowercase().contains(query))
+            .map(|l| clip(l.trim(), 200).to_owned())
+    };
+    for p in &f.posts {
+        if let Some(t) = line_of(&p.title) {
+            return Some((Some(p.id.clone()), t));
+        }
+        for part in &p.parts {
+            let text = match part {
+                Part::Markdown { markdown, .. } => Some(markdown.as_str()),
+                Part::Code { code, .. } => Some(code.as_str()),
+                Part::Terminal { text, .. } => Some(text.as_str()),
+                Part::Mermaid { mermaid, .. } => Some(mermaid.as_str()),
+                Part::Diff { patch, .. } => patch.as_deref(),
+                Part::Html { .. }
+                | Part::Image { .. }
+                | Part::Trace { .. }
+                | Part::Json { .. } => None,
+            };
+            if let Some(t) = text.and_then(line_of) {
+                return Some((Some(p.id.clone()), t));
+            }
+        }
+    }
+    f.comments
+        .iter()
+        .find_map(|c| line_of(&c.text).map(|t| (c.post.clone(), t)))
 }
 
 // ---- Posts ---------------------------------------------------------------------
 
-struct PostRow {
-    session: String,
-    title: String,
-    parts: String,
-    version: u64,
-    created_at: i64,
-    updated_at: i64,
+fn kinds_of(parts: &[Part]) -> Vec<String> {
+    parts.iter().map(|p| part_kind(p).to_owned()).collect()
 }
 
-fn post_row(conn: &Connection, id: &str) -> Result<PostRow> {
-    conn.prepare_cached(
-        "SELECT session, title, parts, version, created_at, updated_at FROM posts WHERE id = ?1",
-    )
-    .and_then(|mut s| {
-        s.query_row([id], |r| {
-            Ok(PostRow {
-                session: r.get(0)?,
-                title: r.get(1)?,
-                parts: r.get(2)?,
-                version: r.get(3)?,
-                created_at: r.get(4)?,
-                updated_at: r.get(5)?,
-            })
-        })
-        .optional()
-    })
-    .db()?
-    .ok_or_else(|| not_found(format!("post \"{id}\" not found")))
-}
-
-fn parse_parts(json: &str) -> Result<Vec<Part>> {
-    serde_json::from_str(json)
-        .map_err(|e| crate::error(notes_proto::ErrorCode::Other, format!("stored parts: {e}")))
-}
-
-fn kinds_of(parts: &[Part]) -> String {
-    parts.iter().map(part_kind).collect::<Vec<_>>().join(",")
-}
-
-fn summary(
-    id: &str,
-    session: &str,
-    title: &str,
-    kinds: &str,
-    version: u64,
-    updated_at: i64,
-) -> PostSummary {
+fn summary(session: &SessionId, p: &PostRec) -> PostSummary {
     PostSummary {
-        id: id.into(),
-        session: session.into(),
-        title: title.into(),
-        kinds: kinds
-            .split(',')
-            .filter(|k| !k.is_empty())
-            .map(Into::into)
-            .collect(),
-        version,
-        updated_at,
+        id: p.id.clone(),
+        session: session.clone(),
+        title: p.title.clone(),
+        kinds: kinds_of(&p.parts),
+        version: p.version,
+        updated_at: p.updated_at,
     }
 }
 
 /// Give every part without an id (or with a duplicate one) a fresh id.
-fn normalize_ids(conn: &Connection, parts: &mut [Part]) -> Result<()> {
+fn normalize_ids(s: &Store, parts: &mut [Part]) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
     for part in parts.iter_mut() {
         let slot = part_id_mut(part);
@@ -271,7 +277,7 @@ fn normalize_ids(conn: &Connection, parts: &mut [Part]) -> Result<()> {
             .as_deref()
             .is_none_or(|id| id.is_empty() || !seen.insert(id.to_owned()))
         {
-            let id = new_id(conn)?;
+            let id = new_id(s)?;
             seen.insert(id.clone());
             *slot = Some(id);
         }
@@ -279,199 +285,124 @@ fn normalize_ids(conn: &Connection, parts: &mut [Part]) -> Result<()> {
     Ok(())
 }
 
-fn add_asset_refs(conn: &Connection, post: &str, parts: &[Part]) -> Result<()> {
-    let mut stmt = conn
-        .prepare_cached("INSERT OR IGNORE INTO asset_refs (asset, post) VALUES (?1, ?2)")
-        .db()?;
-    for part in parts {
-        let asset = match part {
-            Part::Image { asset_id, .. } => Some(asset_id),
-            Part::Trace { asset_id, .. } => asset_id.as_ref(),
-            _ => None,
-        };
-        if let Some(asset) = asset {
-            stmt.execute(params![asset, post]).db()?;
-        }
-    }
-    Ok(())
-}
-
-fn comment_row(r: &Row) -> rusqlite::Result<Comment> {
-    let anchor: Option<String> = r.get(7)?;
-    Ok(Comment {
-        seq: r.get(0)?,
-        id: r.get(1)?,
-        session: r.get(2)?,
-        post: r.get(3)?,
-        author: r.get(4)?,
-        text: r.get(5)?,
-        created_at: r.get(6)?,
-        anchor: anchor.and_then(|a| serde_json::from_str(&a).ok()),
-    })
-}
-
-const COMMENT_COLS: &str = "seq, id, session, post, author, text, created_at, anchor";
-
 /// User comments in the session the agent hasn't seen, advancing the cursor
 /// past everything read (agent comments too), like sideshow's collectFeedback.
-fn collect_feedback(conn: &Connection, session: &str) -> Result<Vec<Comment>> {
-    let fresh: Vec<Comment> = conn
-        .prepare_cached(&format!(
-            "SELECT {COMMENT_COLS} FROM comments
-             WHERE session = ?1 AND seq > (SELECT agent_seq FROM sessions WHERE id = ?1) ORDER BY seq"
-        ))
-        .and_then(|mut s| s.query_map([session], comment_row)?.collect())
-        .db()?;
-    if let Some(last) = fresh.last() {
-        mark_seen(conn, session, last.seq)?;
+fn collect_feedback(f: &mut SessionFile) -> Vec<Comment> {
+    let fresh: Vec<Comment> = f
+        .comments
+        .iter()
+        .filter(|c| c.seq > f.agent_seq)
+        .cloned()
+        .collect();
+    if let Some(last) = fresh.iter().map(|c| c.seq).max() {
+        f.agent_seq = f.agent_seq.max(last);
     }
-    Ok(fresh.into_iter().filter(|c| c.author == "user").collect())
-}
-
-fn mark_seen(conn: &Connection, session: &str, seq: u64) -> Result<()> {
-    conn.prepare_cached("UPDATE sessions SET agent_seq = ?1 WHERE id = ?2 AND agent_seq < ?1")
-        .and_then(|mut s| s.execute(params![seq, session]))
-        .db()?;
-    Ok(())
+    fresh.into_iter().filter(|c| c.author == "user").collect()
 }
 
 /// Publish a post. With no `session`, reuses the newest session for
 /// (`agent`, `cwd`) — the request's caller — or creates one.
 pub fn post_new(
-    conn: &Connection,
+    s: &Store,
     args: &PostNewArgs,
     agent: Option<&str>,
     cwd: Option<&str>,
 ) -> Result<Written<PostWriteResult>> {
-    validate_parts(conn, &args.parts, None)?;
-    atomic(conn, || {
-        let mut events = Vec::new();
-        let session = match &args.session {
-            Some(id) => session_get(conn, id)?.id,
-            None => {
-                let agent = reserved_agent(agent);
-                let found: Option<String> = conn
-                    .prepare_cached(
-                        "SELECT id FROM sessions WHERE agent = ?1 AND cwd IS ?2
-                         ORDER BY last_active_at DESC, rowid DESC LIMIT 1",
-                    )
-                    .and_then(|mut s| s.query_row(params![agent, cwd], |r| r.get(0)).optional())
-                    .db()?;
-                match found {
-                    Some(id) => id,
-                    None => {
-                        let s = create_session(conn, Some(&agent), None, cwd)?;
-                        events.push(event("session-created", &s.id, Some(&s.id), None));
-                        s.id
-                    }
+    validate_parts(s, &args.parts, None)?;
+    let mut events = Vec::new();
+    let mut file = match &args.session {
+        Some(id) => load(s, id)?,
+        None => {
+            let agent = reserved_agent(agent);
+            let found = s
+                .stage()
+                .sessions
+                .values()
+                .filter(|e| e.data.agent == agent && e.data.cwd.as_deref() == cwd)
+                .max_by_key(|e| (e.data.last_active_at, e.ord))
+                .map(|e| e.data.clone());
+            match found {
+                Some(f) => f,
+                None => {
+                    let f = create_session(s, Some(&agent), None, cwd)?;
+                    events.push(event("session-created", &f.id, Some(&f.id), None));
+                    f
                 }
             }
-        };
-        let mut parts = args.parts.clone();
-        normalize_ids(conn, &mut parts)?;
-        let id = new_id(conn)?;
-        let title = trimmed(args.title.as_deref(), MAX_TITLE).unwrap_or_else(|| "Untitled".into());
-        let kinds = kinds_of(&parts);
-        let at = now();
-        let json = serde_json::to_string(&parts).expect("parts serialize");
-        conn.prepare_cached(
-            "INSERT INTO posts (id, session, title, parts, kinds, version, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6)",
-        )
-        .and_then(|mut s| s.execute(params![id, session, title, json, kinds, at]))
-        .db()?;
-        add_asset_refs(conn, &id, &parts)?;
-        touch(conn, &session)?;
-        let feedback = collect_feedback(conn, &session)?;
-        events.push(event("post-created", &id, Some(&session), Some(1)));
-        Ok((
-            PostWriteResult {
-                post: summary(&id, &session, &title, &kinds, 1, at),
-                feedback,
-            },
-            events,
-        ))
-    })
-}
-
-/// Archive the current version and write the next one. `parts: None` keeps
-/// the stored parts without re-serializing them.
-fn write_version(
-    conn: &Connection,
-    id: &str,
-    current: PostRow,
-    title: Option<&str>,
-    parts: Option<&[Part]>,
-) -> Result<Written<PostWriteResult>> {
-    let title = trimmed(title, MAX_TITLE).unwrap_or(current.title);
-    let version = current.version + 1;
-    let at = now();
-    conn.prepare_cached(
-        "INSERT OR REPLACE INTO post_versions (post, version, title, parts, at)
-         SELECT id, version, title, parts, updated_at FROM posts WHERE id = ?1",
-    )
-    .and_then(|mut s| s.execute([id]))
-    .db()?;
-    conn.prepare_cached("DELETE FROM post_versions WHERE post = ?1 AND version <= ?2")
-        .and_then(|mut s| s.execute(params![id, version.saturating_sub(HISTORY_LIMIT + 1)]))
-        .db()?;
-    let kinds = match parts {
-        Some(parts) => {
-            let json = serde_json::to_string(parts).expect("parts serialize");
-            let kinds = kinds_of(parts);
-            conn.prepare_cached("UPDATE posts SET title = ?1, parts = ?2, kinds = ?3, version = ?4, updated_at = ?5 WHERE id = ?6")
-                .and_then(|mut s| s.execute(params![title, json, kinds, version, at, id]))
-                .db()?;
-            add_asset_refs(conn, id, parts)?;
-            kinds
-        }
-        None => {
-            conn.prepare_cached(
-                "UPDATE posts SET title = ?1, version = ?2, updated_at = ?3 WHERE id = ?4",
-            )
-            .and_then(|mut s| s.execute(params![title, version, at, id]))
-            .db()?;
-            conn.prepare_cached("SELECT kinds FROM posts WHERE id = ?1")
-                .and_then(|mut s| s.query_row([id], |r| r.get(0)))
-                .db()?
         }
     };
-    touch(conn, &current.session)?;
-    let feedback = collect_feedback(conn, &current.session)?;
-    let ev = event("post-updated", id, Some(&current.session), Some(version));
-    Ok((
-        PostWriteResult {
-            post: summary(id, &current.session, &title, &kinds, version, at),
-            feedback,
-        },
-        vec![ev],
-    ))
+    let mut parts = args.parts.clone();
+    normalize_ids(s, &mut parts)?;
+    let at = now();
+    let post = PostRec {
+        id: new_id(s)?.into(),
+        title: trimmed(args.title.as_deref(), MAX_TITLE).unwrap_or_else(|| "Untitled".into()),
+        version: 1,
+        created_at: at,
+        updated_at: at,
+        parts,
+        history: Vec::new(),
+    };
+    let result = PostWriteResult {
+        post: summary(&file.id, &post),
+        feedback: Vec::new(),
+    };
+    events.push(event("post-created", &post.id, Some(&file.id), Some(1)));
+    file.posts.push(post);
+    file.last_active_at = at;
+    let feedback = collect_feedback(&mut file);
+    s.save(file)?;
+    Ok((PostWriteResult { feedback, ..result }, events))
+}
+
+/// Archive the current version and write the next one. `parts: None` keeps the parts.
+fn write_version(
+    s: &Store,
+    mut file: SessionFile,
+    at: usize,
+    title: Option<&str>,
+    parts: Option<Vec<Part>>,
+) -> Result<Written<PostWriteResult>> {
+    let time = now();
+    let p = &mut file.posts[at];
+    p.history.push(VersionRec {
+        version: p.version,
+        title: p.title.clone(),
+        at: p.updated_at,
+        parts: p.parts.clone(),
+    });
+    if let Some(title) = trimmed(title, MAX_TITLE) {
+        p.title = title;
+    }
+    if let Some(parts) = parts {
+        p.parts = parts;
+    }
+    p.version += 1;
+    p.updated_at = time;
+    let post = summary(&file.id, p);
+    file.last_active_at = time;
+    let feedback = collect_feedback(&mut file);
+    let ev = event("post-updated", &post.id, Some(&file.id), Some(post.version));
+    s.save(file)?;
+    Ok((PostWriteResult { post, feedback }, vec![ev]))
 }
 
 /// A new version with a new title and/or parts. Replacing the parts assigns
 /// fresh ids to parts that don't carry one.
-pub fn post_update(conn: &Connection, args: &PostUpdateArgs) -> Result<Written<PostWriteResult>> {
+pub fn post_update(s: &Store, args: &PostUpdateArgs) -> Result<Written<PostWriteResult>> {
     if let Some(parts) = &args.parts {
-        validate_parts(conn, parts, None)?;
+        validate_parts(s, parts, None)?;
     }
-    atomic(conn, || {
-        let current = post_row(conn, &args.id)?;
-        let parts = match &args.parts {
-            Some(parts) => {
-                let mut parts = parts.clone();
-                normalize_ids(conn, &mut parts)?;
-                Some(parts)
-            }
-            None => None,
-        };
-        write_version(
-            conn,
-            &args.id,
-            current,
-            args.title.as_deref(),
-            parts.as_deref(),
-        )
-    })
+    let (file, at) = load_post(s, &args.id)?;
+    let parts = match &args.parts {
+        Some(parts) => {
+            let mut parts = parts.clone();
+            normalize_ids(s, &mut parts)?;
+            Some(parts)
+        }
+        None => None,
+    };
+    write_version(s, file, at, args.title.as_deref(), parts)
 }
 
 /// A part id, else a 0-based index below `len`.
@@ -483,137 +414,119 @@ fn find_part(parts: &[Part], target: &str, len: usize) -> Option<usize> {
 }
 
 /// Add, replace or remove one part (a new version). `set` keeps the old part's id.
-pub fn post_part(conn: &Connection, args: &PostPartArgs) -> Result<Written<PostWriteResult>> {
-    atomic(conn, || {
-        let current = post_row(conn, &args.id)?;
-        let mut parts = parse_parts(&current.parts)?;
-        let missing = |t: &str| not_found(format!("post \"{}\" has no part \"{t}\"", args.id));
-        let need_part = || {
-            args.part
-                .clone()
-                .ok_or_else(|| usage(format!("post-part {:?} needs a part", args.op)))
-        };
-        let need_target = || {
-            args.target
-                .as_deref()
-                .ok_or_else(|| usage(format!("post-part {:?} needs a target", args.op)))
-        };
-        let changed = match args.op {
-            PartOp::Add => {
-                let at = match args.target.as_deref() {
-                    None => parts.len(),
-                    Some(t) => find_part(&parts, t, parts.len() + 1).ok_or_else(|| missing(t))?,
-                };
-                let mut part = need_part()?;
-                if part_id(&part).is_some_and(|id| parts.iter().any(|p| part_id(p) == Some(id))) {
-                    *part_id_mut(&mut part) = None;
-                }
-                parts.insert(at, part);
-                Some(at)
+pub fn post_part(s: &Store, args: &PostPartArgs) -> Result<Written<PostWriteResult>> {
+    let (file, at) = load_post(s, &args.id)?;
+    let mut parts = file.posts[at].parts.clone();
+    let missing = |t: &str| not_found(format!("post \"{}\" has no part \"{t}\"", args.id));
+    let need_part = || {
+        args.part
+            .clone()
+            .ok_or_else(|| usage(format!("post-part {:?} needs a part", args.op)))
+    };
+    let need_target = || {
+        args.target
+            .as_deref()
+            .ok_or_else(|| usage(format!("post-part {:?} needs a target", args.op)))
+    };
+    let changed = match args.op {
+        PartOp::Add => {
+            let i = match args.target.as_deref() {
+                None => parts.len(),
+                Some(t) => find_part(&parts, t, parts.len() + 1).ok_or_else(|| missing(t))?,
+            };
+            let mut part = need_part()?;
+            if part_id(&part).is_some_and(|id| parts.iter().any(|p| part_id(p) == Some(id))) {
+                *part_id_mut(&mut part) = None;
             }
-            PartOp::Set => {
-                let t = need_target()?;
-                let at = find_part(&parts, t, parts.len()).ok_or_else(|| missing(t))?;
-                let mut part = need_part()?;
-                *part_id_mut(&mut part) = part_id(&parts[at]).map(Into::into);
-                parts[at] = part;
-                Some(at)
-            }
-            PartOp::Rm => {
-                let t = need_target()?;
-                let at = find_part(&parts, t, parts.len()).ok_or_else(|| missing(t))?;
-                if parts.len() == 1 {
-                    return Err(usage("a post needs at least one part"));
-                }
-                parts.remove(at);
-                None
-            }
-        };
-        if let Some(i) = changed {
-            validate_parts(conn, &parts, Some(i))?;
+            parts.insert(i, part);
+            Some(i)
         }
-        normalize_ids(conn, &mut parts)?;
-        write_version(conn, &args.id, current, None, Some(&parts))
-    })
+        PartOp::Set => {
+            let t = need_target()?;
+            let i = find_part(&parts, t, parts.len()).ok_or_else(|| missing(t))?;
+            let mut part = need_part()?;
+            *part_id_mut(&mut part) = part_id(&parts[i]).map(Into::into);
+            parts[i] = part;
+            Some(i)
+        }
+        PartOp::Rm => {
+            let t = need_target()?;
+            let i = find_part(&parts, t, parts.len()).ok_or_else(|| missing(t))?;
+            if parts.len() == 1 {
+                return Err(usage("a post needs at least one part"));
+            }
+            parts.remove(i);
+            None
+        }
+    };
+    if let Some(i) = changed {
+        validate_parts(s, &parts, Some(i))?;
+    }
+    normalize_ids(s, &mut parts)?;
+    write_version(s, file, at, None, Some(parts))
 }
 
 /// Most recently updated first, optionally in one session.
-pub fn post_list(conn: &Connection, args: &PostListArgs) -> Result<Vec<PostSummary>> {
-    if let Some(s) = &args.session {
-        session_get(conn, s)?;
+pub fn post_list(s: &Store, args: &PostListArgs) -> Result<Vec<PostSummary>> {
+    if let Some(id) = &args.session {
+        load(s, id)?;
     }
-    let limit = args.limit.map_or(-1, i64::from);
-    let mut stmt = conn
-        .prepare_cached(
-            "SELECT id, session, title, kinds, version, updated_at FROM posts
-             WHERE ?1 IS NULL OR session = ?1 ORDER BY updated_at DESC, rowid DESC LIMIT ?2",
-        )
-        .db()?;
-    let rows = stmt
-        .query_map(params![args.session, limit], |r| {
-            Ok(summary(
-                &r.get::<_, String>(0)?,
-                &r.get::<_, String>(1)?,
-                &r.get::<_, String>(2)?,
-                &r.get::<_, String>(3)?,
-                r.get(4)?,
-                r.get(5)?,
-            ))
+    let stage = s.stage();
+    let mut posts: Vec<(i64, u64, PostSummary)> = stage
+        .sessions
+        .values()
+        .filter(|e| args.session.as_ref().is_none_or(|id| *id == e.data.id))
+        .flat_map(|e| {
+            e.data
+                .posts
+                .iter()
+                .map(|p| (p.updated_at, stage.index.post_ord(&p.id), summary(&e.data.id, p)))
         })
-        .db()?;
-    rows.collect::<rusqlite::Result<_>>().db()
+        .collect();
+    posts.sort_by_key(|(updated, ord, _)| Reverse((*updated, *ord)));
+    let limit = args.limit.map_or(usize::MAX, |l| l as usize);
+    Ok(posts.into_iter().take(limit).map(|p| p.2).collect())
 }
 
-/// The current version, or an older one still in history.
-pub fn post_show(conn: &Connection, args: &PostShowArgs) -> Result<Post> {
-    let current = post_row(conn, &args.id)?;
+/// The current version, or any older one.
+pub fn post_show(s: &Store, args: &PostShowArgs) -> Result<Post> {
+    let (file, at) = load_post(s, &args.id)?;
+    let p = &file.posts[at];
     let (title, parts, version, updated_at) = match args.version {
-        None => (current.title, current.parts, current.version, current.updated_at),
-        Some(v) if v == current.version => (current.title, current.parts, v, current.updated_at),
-        Some(v) => conn
-            .prepare_cached("SELECT title, parts, at FROM post_versions WHERE post = ?1 AND version = ?2")
-            .and_then(|mut s| s.query_row(params![args.id, v], |r| Ok((r.get(0)?, r.get(1)?, v, r.get(2)?))).optional())
-            .db()?
+        None => (&p.title, &p.parts, p.version, p.updated_at),
+        Some(v) if v == p.version => (&p.title, &p.parts, v, p.updated_at),
+        Some(v) => p
+            .history
+            .iter()
+            .find(|h| h.version == v)
+            .map(|h| (&h.title, &h.parts, v, h.at))
             .ok_or_else(|| {
                 not_found(format!(
-                    "post \"{}\" has no version {v} (current is {}; the last {HISTORY_LIMIT} are kept)",
-                    args.id, current.version
+                    "post \"{}\" has no version {v} (current is {})",
+                    args.id, p.version
                 ))
             })?,
     };
     Ok(Post {
-        id: args.id.clone(),
-        session: current.session,
-        title,
-        parts: parse_parts(&parts)?,
+        id: p.id.clone(),
+        session: file.id.clone(),
+        title: title.clone(),
+        parts: parts.clone(),
         version,
-        created_at: current.created_at,
+        created_at: p.created_at,
         updated_at,
     })
 }
 
 /// Deletes the post, its history and its comments.
-pub fn post_delete(conn: &Connection, id: &str) -> Result<Vec<Event>> {
-    atomic(conn, || {
-        let current = post_row(conn, id)?;
-        for sql in [
-            "DELETE FROM comments WHERE post = ?1",
-            "DELETE FROM post_versions WHERE post = ?1",
-            "DELETE FROM asset_refs WHERE post = ?1",
-            "DELETE FROM posts WHERE id = ?1",
-        ] {
-            conn.prepare_cached(sql)
-                .and_then(|mut s| s.execute([id]))
-                .db()?;
-        }
-        touch(conn, &current.session)?;
-        Ok(vec![event(
-            "post-deleted",
-            id,
-            Some(&current.session),
-            None,
-        )])
-    })
+pub fn post_delete(s: &Store, id: &str) -> Result<Vec<Event>> {
+    let (mut file, at) = load_post(s, id)?;
+    file.posts.remove(at);
+    file.comments.retain(|c| c.post.as_deref() != Some(id));
+    file.last_active_at = now();
+    let ev = event("post-deleted", id, Some(&file.id), None);
+    s.save(file)?;
+    Ok(vec![ev])
 }
 
 // ---- Comments ------------------------------------------------------------------
@@ -683,7 +596,7 @@ fn sanitize_anchor(
 /// defaults to `args.author`, then the request's `agent`, then the session's
 /// agent. The daemon should [`CommentSignal::notify`](crate::CommentSignal::notify) after this commits.
 pub fn comment_new(
-    conn: &Connection,
+    s: &Store,
     args: &CommentNewArgs,
     agent: Option<&str>,
 ) -> Result<Written<Comment>> {
@@ -691,97 +604,81 @@ pub fn comment_new(
     if text.is_empty() {
         return Err(usage("comment text is empty"));
     }
-    atomic(conn, || {
-        let (session, post, anchor) = match &args.post {
-            Some(post_id) => {
-                let post = post_row(conn, post_id)?;
-                if args.session.as_ref().is_some_and(|s| *s != post.session) {
-                    return Err(usage(format!(
-                        "post \"{post_id}\" is not in session \"{}\"",
-                        args.session.as_deref().unwrap_or("")
-                    )));
-                }
-                let anchor = match &args.anchor {
-                    Some(a) => Some(sanitize_anchor(
-                        a,
-                        parse_parts(&post.parts)?.len(),
-                        post.version,
-                    )?),
-                    None => None,
-                };
-                (post.session, Some(post_id.clone()), anchor)
+    let (mut file, post, anchor) = match &args.post {
+        Some(post_id) => {
+            let (file, at) = load_post(s, post_id)?;
+            if args.session.as_ref().is_some_and(|id| *id != file.id) {
+                return Err(usage(format!(
+                    "post \"{post_id}\" is not in session \"{}\"",
+                    args.session.as_deref().unwrap_or("")
+                )));
             }
-            None => {
-                let id = args
-                    .session
-                    .as_deref()
-                    .ok_or_else(|| usage("comment-new needs a post or a session"))?;
-                if args.anchor.is_some() {
-                    return Err(usage("an anchored comment needs a post"));
-                }
-                (session_get(conn, id)?.id, None, None)
+            let p = &file.posts[at];
+            let anchor = match &args.anchor {
+                Some(a) => Some(sanitize_anchor(a, p.parts.len(), p.version)?),
+                None => None,
+            };
+            (file, Some(post_id.clone()), anchor)
+        }
+        None => {
+            let id = args
+                .session
+                .as_deref()
+                .ok_or_else(|| usage("comment-new needs a post or a session"))?;
+            if args.anchor.is_some() {
+                return Err(usage("an anchored comment needs a post"));
             }
-        };
-        let author = match trimmed(args.author.as_deref(), 100).or_else(|| trimmed(agent, 100)) {
-            Some(a) => a,
-            None => session_get(conn, &session)?.agent,
-        };
-        let id = new_id(conn)?;
-        let created_at = now();
-        let anchor_json = anchor
-            .as_ref()
-            .map(|a| serde_json::to_string(a).expect("anchor serializes"));
-        conn.prepare_cached(
-            "INSERT INTO comments (id, session, post, author, text, created_at, anchor) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        )
-        .and_then(|mut s| s.execute(params![id, session, post, author, text, created_at, anchor_json]))
-        .db()?;
-        let seq = conn.last_insert_rowid() as u64;
-        touch(conn, &session)?;
-        let ev = event("comment-created", &id, Some(&session), None);
-        Ok((
-            Comment {
-                id,
-                seq,
-                session,
-                post,
-                author,
-                text,
-                created_at,
-                anchor,
-            },
-            vec![ev],
-        ))
-    })
+            (load(s, id)?, None, None)
+        }
+    };
+    let author = trimmed(args.author.as_deref(), 100)
+        .or_else(|| trimmed(agent, 100))
+        .unwrap_or_else(|| file.agent.clone());
+    let comment = Comment {
+        id: new_id(s)?.into(),
+        seq: s.stage().index.next_comment_seq(),
+        session: file.id.clone(),
+        post,
+        author,
+        text,
+        created_at: now(),
+        anchor,
+    };
+    file.comments.push(comment.clone());
+    file.last_active_at = comment.created_at;
+    let ev = event("comment-created", &comment.id, Some(&file.id), None);
+    s.save(file)?;
+    Ok((comment, vec![ev]))
 }
 
 /// Comments in seq order, filtered by session, post and/or `after_seq`.
-pub fn comment_list(conn: &Connection, args: &CommentListArgs) -> Result<Vec<Comment>> {
-    let mut stmt = conn
-        .prepare_cached(&format!(
-            "SELECT {COMMENT_COLS} FROM comments
-             WHERE (?1 IS NULL OR session = ?1) AND (?2 IS NULL OR post = ?2) AND seq > ?3 ORDER BY seq"
-        ))
-        .db()?;
-    let rows = stmt
-        .query_map(
-            params![args.session, args.post, args.after_seq.unwrap_or(0)],
-            comment_row,
-        )
-        .db()?;
-    rows.collect::<rusqlite::Result<_>>().db()
+pub fn comment_list(s: &Store, args: &CommentListArgs) -> Result<Vec<Comment>> {
+    let stage = s.stage();
+    let mut comments: Vec<Comment> = stage
+        .sessions
+        .values()
+        .filter(|e| args.session.as_ref().is_none_or(|id| *id == e.data.id))
+        .flat_map(|e| e.data.comments.iter())
+        .filter(|c| args.post.is_none() || c.post == args.post)
+        .filter(|c| c.seq > args.after_seq.unwrap_or(0))
+        .cloned()
+        .collect();
+    comments.sort_by_key(|c| c.seq);
+    Ok(comments)
 }
 
-pub fn comment_delete(conn: &Connection, id: &str) -> Result<Vec<Event>> {
-    atomic(conn, || {
-        let session: String = conn
-            .prepare_cached("DELETE FROM comments WHERE id = ?1 RETURNING session")
-            .and_then(|mut s| s.query_row([id], |r| r.get(0)).optional())
-            .db()?
-            .ok_or_else(|| not_found(format!("comment \"{id}\" not found")))?;
-        touch(conn, &session)?;
-        Ok(vec![event("comment-deleted", id, Some(&session), None)])
-    })
+pub fn comment_delete(s: &Store, id: &str) -> Result<Vec<Event>> {
+    let session = s
+        .stage()
+        .index
+        .comment_session(id)
+        .cloned()
+        .ok_or_else(|| not_found(format!("comment \"{id}\" not found")))?;
+    let mut file = load(s, &session)?;
+    file.comments.retain(|c| c.id != id);
+    file.last_active_at = now();
+    s.save(file)?;
+    Ok(vec![event("comment-deleted", id, Some(&session), None)])
 }
 
 /// The first `user` comment after `after_seq` (default: what the agent has
@@ -789,61 +686,34 @@ pub fn comment_delete(conn: &Connection, id: &str) -> Result<Vec<Event>> {
 /// given. Returning one advances the cursor past it, so it isn't re-delivered
 /// as feedback. Pair with [`CommentSignal::wait_for`](crate::CommentSignal::wait_for) for `wait`.
 pub fn next_user_comment(
-    conn: &Connection,
+    s: &Store,
     session: Option<&str>,
     post: Option<&str>,
     after_seq: Option<u64>,
 ) -> Result<Option<Comment>> {
-    let session = match (post, session) {
-        (Some(p), _) => post_row(conn, p)?.session,
-        (None, Some(s)) => s.to_owned(),
+    let mut file = match (post, session) {
+        (Some(p), _) => load_post(s, p)?.0,
+        (None, Some(id)) => load(s, id)?,
         (None, None) => return Err(usage("wait needs a session or a post")),
     };
-    let cursor: u64 = conn
-        .prepare_cached("SELECT agent_seq FROM sessions WHERE id = ?1")
-        .and_then(|mut s| s.query_row([&session], |r| r.get(0)).optional())
-        .db()?
-        .ok_or_else(|| not_found(format!("session \"{session}\" not found")))?;
-    let found = conn
-        .prepare_cached(&format!(
-            "SELECT {COMMENT_COLS} FROM comments
-             WHERE session = ?1 AND (?2 IS NULL OR post = ?2) AND author = 'user' AND seq > ?3 ORDER BY seq LIMIT 1"
-        ))
-        .and_then(|mut s| s.query_row(params![session, post, after_seq.unwrap_or(cursor)], comment_row).optional())
-        .db()?;
+    let after = after_seq.unwrap_or(file.agent_seq);
+    let found = file
+        .comments
+        .iter()
+        .filter(|c| c.author == "user" && c.seq > after)
+        .filter(|c| post.is_none() || c.post.as_deref() == post)
+        .min_by_key(|c| c.seq)
+        .cloned();
     if let Some(c) = &found {
-        mark_seen(conn, &session, c.seq)?;
+        if c.seq > file.agent_seq {
+            file.agent_seq = c.seq;
+            s.save(file)?;
+        }
     }
     Ok(found)
 }
 
 // ---- Assets --------------------------------------------------------------------
-
-fn kind_name(kind: AssetKind) -> &'static str {
-    match kind {
-        AssetKind::Image => "image",
-        AssetKind::Trace => "trace",
-        AssetKind::File => "file",
-    }
-}
-
-fn asset_info(r: &Row) -> rusqlite::Result<AssetInfo> {
-    let kind: String = r.get(1)?;
-    Ok(AssetInfo {
-        id: r.get(0)?,
-        kind: match kind.as_str() {
-            "image" => AssetKind::Image,
-            "trace" => AssetKind::Trace,
-            _ => AssetKind::File,
-        },
-        content_type: r.get(2)?,
-        byte_length: r.get(3)?,
-        filename: r.get(4)?,
-        created_at: r.get(5)?,
-    })
-}
-
-const ASSET_COLS: &str = "id, kind, content_type, byte_length, filename, created_at";
 
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
@@ -855,9 +725,62 @@ fn hex(bytes: &[u8]) -> String {
         })
 }
 
+fn info_of(m: &AssetMeta) -> AssetInfo {
+    AssetInfo {
+        id: m.id.clone(),
+        kind: m.kind,
+        content_type: m.content_type.clone(),
+        byte_length: m.byte_length,
+        filename: m.filename.clone(),
+        created_at: m.created_at,
+    }
+}
+
+fn asset_meta(s: &Store, id: &str) -> Option<AssetMeta> {
+    if !s.asset_exists(id) {
+        return None;
+    }
+    let bytes = fs::read(s.asset_path(&format!("{id}.json"))).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn asset_metas(s: &Store) -> Vec<AssetMeta> {
+    let Ok(entries) = fs::read_dir(s.root().join(crate::json_store::ASSETS)) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.strip_suffix(".json").map(str::to_owned))
+        .filter_map(|id| asset_meta(s, &id))
+        .collect()
+}
+
+/// Every asset id a post (current or past version) still points at.
+fn referenced_assets(s: &Store) -> std::collections::HashSet<String> {
+    let stage = s.stage();
+    let mut ids = std::collections::HashSet::new();
+    for e in stage.sessions.values() {
+        for p in &e.data.posts {
+            let versions = std::iter::once(&p.parts).chain(p.history.iter().map(|h| &h.parts));
+            for part in versions.flatten() {
+                match part {
+                    Part::Image { asset_id, .. } => {
+                        ids.insert(asset_id.to_string());
+                    }
+                    Part::Trace { asset_id: Some(a), .. } => {
+                        ids.insert(a.to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    ids
+}
+
 /// Store bytes under their SHA-256. Re-uploading the same bytes is a no-op
 /// that returns the original record (keeping its kind, filename and time).
-pub fn asset_put(conn: &Connection, args: &AssetPutArgs) -> Result<AssetInfo> {
+pub fn asset_put(s: &Store, args: &AssetPutArgs) -> Result<AssetInfo> {
     // Reject oversize before decoding: base64 is 4 chars per 3 bytes.
     if args.data_base64.len() / 4 * 3 > MAX_ASSET_BYTES + 3 {
         return Err(usage(format!("asset exceeds {MAX_ASSET_BYTES} bytes")));
@@ -871,59 +794,40 @@ pub fn asset_put(conn: &Connection, args: &AssetPutArgs) -> Result<AssetInfo> {
     if data.len() > MAX_ASSET_BYTES {
         return Err(usage(format!("asset exceeds {MAX_ASSET_BYTES} bytes")));
     }
-    if let Some(s) = &args.session {
-        session_get(conn, s)?;
+    if let Some(id) = &args.session {
+        load(s, id)?;
     }
     let id = hex(&Sha256::digest(&data));
-    let at = now();
+    if let Some(meta) = asset_meta(s, &id) {
+        return Ok(info_of(&meta));
+    }
     let content_type = match args.content_type.trim() {
         "" => "application/octet-stream",
         ct => clip(ct, MAX_TITLE),
     };
-    let inserted = conn
-        .prepare_cached(
-            "INSERT OR IGNORE INTO assets (id, session, kind, content_type, byte_length, filename, data, created_at, last_accessed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
-        )
-        .and_then(|mut s| {
-            s.execute(params![
-                id,
-                args.session,
-                kind_name(args.kind),
-                content_type,
-                data.len(),
-                args.filename.as_deref().map(|f| clip(f, MAX_TITLE)),
-                data,
-                at
-            ])
-        })
-        .db()?;
-    if inserted == 0 {
-        conn.prepare_cached("UPDATE assets SET last_accessed = ?1 WHERE id = ?2")
-            .and_then(|mut s| s.execute(params![at, id]))
-            .db()?;
-    }
-    conn.prepare_cached(&format!("SELECT {ASSET_COLS} FROM assets WHERE id = ?1"))
-        .and_then(|mut s| s.query_row([&id], asset_info))
-        .db()
+    let meta = AssetMeta {
+        schema: SCHEMA,
+        id: id.clone().into(),
+        session: args.session.clone(),
+        kind: args.kind,
+        content_type: content_type.into(),
+        byte_length: data.len() as u64,
+        filename: args.filename.as_deref().map(|f| clip(f, MAX_TITLE).to_owned()),
+        created_at: now(),
+    };
+    s.write_asset_file(&s.asset_path(&id), &data)?;
+    let mut json = serde_json::to_vec_pretty(&meta).expect("asset meta serializes");
+    json.push(b'\n');
+    s.write_asset_file(&s.asset_path(&format!("{id}.json")), &json)?;
+    Ok(info_of(&meta))
 }
 
-pub fn asset_get(conn: &Connection, id: &str) -> Result<AssetData> {
-    let (info, data) = conn
-        .prepare_cached(&format!(
-            "SELECT {ASSET_COLS}, data FROM assets WHERE id = ?1"
-        ))
-        .and_then(|mut s| {
-            s.query_row([id], |r| Ok((asset_info(r)?, r.get::<_, Vec<u8>>(6)?)))
-                .optional()
-        })
-        .db()?
-        .ok_or_else(|| not_found(format!("asset \"{id}\" not found")))?;
-    conn.prepare_cached("UPDATE assets SET last_accessed = ?1 WHERE id = ?2")
-        .and_then(|mut s| s.execute(params![now(), id]))
-        .db()?;
+pub fn asset_get(s: &Store, id: &str) -> Result<AssetData> {
+    let missing = || not_found(format!("asset \"{id}\" not found"));
+    let meta = asset_meta(s, id).ok_or_else(missing)?;
+    let data = fs::read(s.asset_path(id)).map_err(|_| missing())?;
     Ok(AssetData {
-        info,
+        info: info_of(&meta),
         data_base64: STANDARD.encode(data),
     })
 }
@@ -932,75 +836,45 @@ pub fn asset_get(conn: &Connection, id: &str) -> Result<AssetData> {
 
 /// Replace a session's trace. Fields are truncated and only the last
 /// [`MAX_TRACE_STEPS`] steps are kept. Returns the stored step count.
-pub fn trace_set(conn: &Connection, args: &TraceSetArgs) -> Result<Written<usize>> {
-    atomic(conn, || {
-        session_get(conn, &args.session)?;
-        conn.prepare_cached("DELETE FROM trace_steps WHERE session = ?1")
-            .and_then(|mut s| s.execute([&args.session]))
-            .db()?;
-        let skip = args.steps.len().saturating_sub(MAX_TRACE_STEPS);
-        let mut stmt = conn
-            .prepare_cached("INSERT INTO trace_steps (session, seq, kind, label, detail, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
-            .db()?;
-        for (seq, step) in args.steps[skip..].iter().enumerate() {
-            stmt.execute(params![
-                args.session,
-                seq,
-                step.kind.as_deref().map(|k| clip(k, MAX_STEP_KIND)),
-                clip(&step.label, MAX_STEP_LABEL),
-                step.detail.as_deref().map(|d| clip(d, MAX_STEP_DETAIL)),
-                step.ts,
-            ])
-            .db()?;
-        }
-        touch(conn, &args.session)?;
-        let count = args.steps.len() - skip;
-        Ok((
-            count,
-            vec![event(
-                "trace-updated",
-                &args.session,
-                Some(&args.session),
-                None,
-            )],
-        ))
-    })
+pub fn trace_set(s: &Store, args: &TraceSetArgs) -> Result<Written<usize>> {
+    let mut file = load(s, &args.session)?;
+    let skip = args.steps.len().saturating_sub(MAX_TRACE_STEPS);
+    file.trace = args.steps[skip..]
+        .iter()
+        .map(|step| TraceStep {
+            kind: step.kind.as_deref().map(|k| clip(k, MAX_STEP_KIND).to_owned()),
+            label: clip(&step.label, MAX_STEP_LABEL).to_owned(),
+            detail: step.detail.as_deref().map(|d| clip(d, MAX_STEP_DETAIL).to_owned()),
+            ts: step.ts.clone(),
+        })
+        .collect();
+    file.last_active_at = now();
+    let count = file.trace.len();
+    s.save(file)?;
+    Ok((
+        count,
+        vec![event("trace-updated", &args.session, Some(&args.session), None)],
+    ))
 }
 
-pub fn trace_list(conn: &Connection, session: &str) -> Result<Vec<TraceStep>> {
-    session_get(conn, session)?;
-    let mut stmt = conn
-        .prepare_cached(
-            "SELECT kind, label, detail, ts FROM trace_steps WHERE session = ?1 ORDER BY seq",
-        )
-        .db()?;
-    let rows = stmt
-        .query_map([session], |r| {
-            Ok(TraceStep {
-                kind: r.get(0)?,
-                label: r.get(1)?,
-                detail: r.get(2)?,
-                ts: r.get(3)?,
-            })
-        })
-        .db()?;
-    rows.collect::<rusqlite::Result<_>>().db()
+pub fn trace_list(s: &Store, session: &str) -> Result<Vec<TraceStep>> {
+    Ok(load(s, session)?.trace)
 }
 
 // ---- Settings ------------------------------------------------------------------
 
-pub fn setting_get(conn: &Connection, key: &str) -> Result<Option<String>> {
-    conn.prepare_cached("SELECT value FROM settings WHERE key = ?1")
-        .and_then(|mut s| s.query_row([key], |r| r.get(0)).optional())
+pub fn setting_get(s: &Store, key: &str) -> Result<Option<String>> {
+    s.db.prepare_cached("SELECT value FROM settings WHERE key = ?1")
+        .and_then(|mut st| st.query_row([key], |r| r.get(0)).optional())
         .db()
 }
 
-pub fn setting_set(conn: &Connection, args: &SettingSetArgs) -> Result<Vec<Event>> {
+pub fn setting_set(s: &Store, args: &SettingSetArgs) -> Result<Vec<Event>> {
     if args.key.trim().is_empty() {
         return Err(usage("setting key is empty"));
     }
-    conn.prepare_cached("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value")
-        .and_then(|mut s| s.execute(params![args.key, args.value]))
+    s.db.prepare_cached("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value")
+        .and_then(|mut st| st.execute(params![args.key, args.value]))
         .db()?;
     Ok(vec![event("setting-changed", &args.key, None, None)])
 }

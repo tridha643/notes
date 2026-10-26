@@ -80,7 +80,7 @@ fn call(d: &Daemon, verb: &Verb, author: &str, cwd: Option<&str>) -> R<Value> {
                 .wait_for(timeout, || {
                     d.unit(author, |tx| {
                         notes_posts::next_user_comment(
-                            tx.db,
+                            tx.store,
                             a.session.as_deref(),
                             a.post.as_deref(),
                             None,
@@ -204,6 +204,22 @@ fn watch(
     }
 }
 
+/// Envelope keys a request may carry. `Request` flattens `verb`, which serde can't
+/// combine with `deny_unknown_fields`, so the envelope is checked by hand; the
+/// verb's `args` structs reject unknown fields themselves.
+const ENVELOPE_KEYS: [&str; 6] = ["v", "id", "verb", "args", "cwd", "agent"];
+
+fn parse_request(line: &str) -> Result<Request, String> {
+    let value: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
+    if let Some(key) = value
+        .as_object()
+        .and_then(|o| o.keys().find(|k| !ENVELOPE_KEYS.contains(&k.as_str())))
+    {
+        return Err(format!("unknown field `{key}` in the request envelope"));
+    }
+    serde_json::from_value(value).map_err(|e| e.to_string())
+}
+
 fn serve(d: Arc<Daemon>, stream: UnixStream) {
     let Ok(read_half) = stream.try_clone() else {
         return;
@@ -219,7 +235,7 @@ fn serve(d: Arc<Daemon>, stream: UnixStream) {
         if line.trim().is_empty() {
             continue;
         }
-        let response = match serde_json::from_str::<Request>(&line) {
+        let response = match parse_request(&line) {
             Err(e) => {
                 let id = serde_json::from_str::<Value>(&line)
                     .ok()
@@ -344,9 +360,14 @@ fn run() -> Result<(), String> {
     let db_path = env::var_os("NOTES_DB")
         .map(PathBuf::from)
         .unwrap_or_else(|| notes_proto::app_support_dir().join("notes.db"));
-    let daemon = Arc::new(Daemon::open(vault, db_path, socket).map_err(|Fail(e)| e.message)?);
+    let stage = notes_proto::default_stage_path();
+    let daemon =
+        Arc::new(Daemon::open(vault, db_path, socket, stage).map_err(|Fail(e)| e.message)?);
     // Watch before reconciling, so nothing changed in between goes unseen.
     watcher::start(daemon.clone()).map_err(|e| format!("vault watcher: {e}"))?;
+    if let Err(e) = watcher::start_stage(daemon.clone()) {
+        eprintln!("notesd: session folder watcher: {e}");
+    }
     daemon.reconcile().map_err(|Fail(e)| e.message)?;
     eprintln!(
         "notesd: serving {} on {}",

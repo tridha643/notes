@@ -34,6 +34,12 @@ pub fn default_vault_path() -> PathBuf {
         .unwrap_or_else(|| home_dir().join("Notes"))
 }
 
+/// The sideshow session folder: one JSON file per session. Always
+/// `~/Desktop/Stage`; there's deliberately no override.
+pub fn default_stage_path() -> PathBuf {
+    home_dir().join("Desktop/Stage")
+}
+
 /// Directory for the daemon's SQLite database and other private state.
 pub fn app_support_dir() -> PathBuf {
     home_dir().join("Library/Application Support/Notes")
@@ -92,8 +98,9 @@ pub enum Verb {
     // Sideshow: sessions, posts, comments, assets, traces, kits, settings (see posts.rs)
     SessionNew(SessionNewArgs),
     SessionList,
+    SessionSearch(SessionSearchArgs),
     SessionRename(SessionRenameArgs),
-    SessionDelete(IdArgs),
+    SessionDelete(IdArgs<SessionId>),
     PostNew(PostNewArgs),
     PostUpdate(PostUpdateArgs),
     PostPart(PostPartArgs),
@@ -101,21 +108,22 @@ pub enum Verb {
     PostShow(PostShowArgs),
     /// Daemon-side render (highlighting, diff hunks, ANSI) for a post version.
     PostRender(PostShowArgs),
-    PostDelete(IdArgs),
+    PostDelete(IdArgs<PostId>),
     CommentNew(CommentNewArgs),
     CommentList(CommentListArgs),
-    CommentDelete(IdArgs),
+    CommentDelete(IdArgs<CommentId>),
     Wait(WaitArgs),
     AssetPut(AssetPutArgs),
-    AssetGet(IdArgs),
+    AssetGet(IdArgs<AssetId>),
     TraceSet(TraceSetArgs),
-    TraceList(IdArgs),
+    TraceList(IdArgs<SessionId>),
     Kits,
     SettingGet(SettingGetArgs),
     SettingSet(SettingSetArgs),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder: Option<String>,
@@ -137,6 +145,7 @@ pub enum ListSort {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FindArgs {
     pub query: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -144,6 +153,7 @@ pub struct FindArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SearchArgs {
     pub query: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -162,6 +172,7 @@ pub struct SearchArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadArgs {
     pub note: String,
     /// 1-based inclusive line range.
@@ -170,12 +181,14 @@ pub struct ReadArgs {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LineRange {
     pub start: u32,
     pub end: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NewArgs {
     pub path: String,
     #[serde(default)]
@@ -185,6 +198,7 @@ pub struct NewArgs {
 /// Exact find-and-replace edits, applied all-or-nothing. Each `old` must match
 /// exactly once unless `all` is set.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EditArgs {
     pub note: String,
     pub edits: Vec<Replacement>,
@@ -193,6 +207,7 @@ pub struct EditArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Replacement {
     pub old: String,
     pub new: String,
@@ -201,6 +216,7 @@ pub struct Replacement {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppendArgs {
     pub note: String,
     pub text: String,
@@ -212,6 +228,7 @@ pub struct AppendArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrependArgs {
     pub note: String,
     pub text: String,
@@ -221,6 +238,7 @@ pub struct PrependArgs {
 
 /// Replace the whole body. Requires `if_version` unless `force`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WriteArgs {
     pub note: String,
     pub body: String,
@@ -231,17 +249,20 @@ pub struct WriteArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MoveArgs {
     pub note: String,
     pub to: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FolderArgs {
     pub folder: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteArgs {
     pub note: String,
     /// Delete for good instead of moving to trash.
@@ -250,11 +271,13 @@ pub struct DeleteArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NoteArgs {
     pub note: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HistoryArgs {
     pub note: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -263,6 +286,7 @@ pub struct HistoryArgs {
 
 /// Unified diff between two versions; defaults to previous → current.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiffArgs {
     pub note: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -272,6 +296,7 @@ pub struct DiffArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RevertArgs {
     pub note: String,
     pub to: u64,
@@ -279,6 +304,7 @@ pub struct RevertArgs {
 
 /// Stream events after `since` (exclusive); `kinds` empty means all.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WatchArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<u64>,
@@ -291,6 +317,7 @@ pub struct WatchArgs {
 /// The result is a `Vec<BatchOutcome>`, one per op in order; an atomic batch
 /// stops at the first error, so its last outcome is that error.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BatchArgs {
     pub ops: Vec<Verb>,
     #[serde(default)]
@@ -505,6 +532,13 @@ pub struct DoctorResult {
     /// Render cache counters `{hits, misses, entries, bytes}` (hit rate = hits / (hits + misses)).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render_cache: Option<Value>,
+    /// Latest committed event seq: start a `watch` here, then list, and nothing
+    /// committed in between is missed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    /// Sideshow session folder `{path, sessions, skipped: [file…], migration}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<Value>,
 }
 
 /// Serialize one message as a protocol line (JSON + `\n`).

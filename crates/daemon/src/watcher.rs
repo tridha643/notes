@@ -212,3 +212,63 @@ pub fn start(daemon: Arc<Daemon>) -> io::Result<()> {
         })?;
     Ok(())
 }
+
+/// Watch the sideshow session folder (flat: session files plus `assets/`). Any change to
+/// its entries (a file added, removed, or atomically replaced) runs `Daemon::stage_refresh`,
+/// which ignores notesd's own writes.
+pub fn start_stage(daemon: Arc<Daemon>) -> io::Result<()> {
+    let fd = unsafe { libc::kqueue() };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let queue = unsafe { OwnedFd::from_raw_fd(fd) };
+    let root = daemon.stage_path();
+    let mut handles = BTreeMap::new();
+    arm(&queue, &root, &mut handles);
+    if handles.is_empty() {
+        return Err(io::Error::other(format!("can't watch {}", root.display())));
+    }
+    std::thread::Builder::new()
+        .name("notes-stage-kqueue".into())
+        .spawn(move || {
+            let mut received = [libc::kevent {
+                ident: 0,
+                filter: 0,
+                flags: 0,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            }; 16];
+            loop {
+                // NULL timeout: blocks in the kernel until the folder changes.
+                let n = unsafe {
+                    libc::kevent(
+                        queue.as_raw_fd(),
+                        std::ptr::null(),
+                        0,
+                        received.as_mut_ptr(),
+                        received.len() as i32,
+                        std::ptr::null(),
+                    )
+                };
+                if n < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    eprintln!("notesd: session folder watcher stopped: {error}");
+                    return;
+                }
+                if received[..n as usize]
+                    .iter()
+                    .any(|e| e.fflags & (libc::NOTE_DELETE | libc::NOTE_RENAME) != 0)
+                {
+                    // The folder itself went away or moved: re-arm on whatever is there now.
+                    let _ = fs::create_dir_all(&root);
+                    arm(&queue, &root, &mut handles);
+                }
+                daemon.stage_refresh();
+            }
+        })?;
+    Ok(())
+}

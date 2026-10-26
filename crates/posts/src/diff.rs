@@ -442,7 +442,7 @@ diff --git a/x.toml b/x.toml
         assert_eq!(names, ["src/new.rs", "docs/added.md", "gone.py", "x.toml"]);
         assert_eq!((files[0].added, files[0].removed), (1, 1));
         assert_eq!(files[0].language.as_deref(), Some("rust"));
-        assert_eq!(files[1].language, None);
+        assert_eq!(files[1].language.as_deref(), Some("markdown"));
         assert_eq!(
             (
                 files[2].added,

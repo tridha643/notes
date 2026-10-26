@@ -55,10 +55,11 @@ pub struct Daemon {
     pub vault: PathBuf,
     pub socket: PathBuf,
     pub db_path: PathBuf,
-    /// The SQLite connection; holding it is also the vault write lock.
+    /// SQLite plus the sideshow session folder; holding it is also the write lock for the
+    /// vault and the folder.
     /// ponytail: one lock for every note (per-note serialization falls out of it); per-note
     /// locks if writes to different notes ever need to run in parallel.
-    db: Mutex<Connection>,
+    db: Mutex<notes_posts::Store>,
     pub search: Search,
     /// Latest committed event seq; watchers wait on the condvar.
     bus: (Mutex<u64>, Condvar),
@@ -90,6 +91,8 @@ enum Undo {
 pub struct Tx<'a> {
     pub d: &'a Daemon,
     pub db: &'a Connection,
+    /// Sideshow verbs go through this; `db` is its connection.
+    pub store: &'a notes_posts::Store,
     pub author: &'a str,
     pub now: i64,
     undo: Vec<Undo>,
@@ -163,7 +166,7 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<Row> {
 const ROW: &str = "SELECT id, path, title, version, hash, created_at, updated_at FROM notes";
 
 impl Daemon {
-    pub fn open(vault: PathBuf, db_path: PathBuf, socket: PathBuf) -> R<Daemon> {
+    pub fn open(vault: PathBuf, db_path: PathBuf, socket: PathBuf, stage: PathBuf) -> R<Daemon> {
         let state = db_path.parent().unwrap_or(Path::new(".")).to_path_buf();
         fs::create_dir_all(&state)?;
         let db = Connection::open(&db_path)?;
@@ -173,8 +176,8 @@ impl Daemon {
         if !db.prepare("SELECT ext_id FROM events LIMIT 0").is_ok() {
             db.execute_batch("ALTER TABLE events ADD COLUMN ext_id TEXT; ALTER TABLE events ADD COLUMN session TEXT;")?;
         }
-        notes_posts::migrate(&db).map_err(Fail)?;
         let seq: Option<i64> = db.query_row("SELECT max(seq) FROM events", [], |r| r.get(0))?;
+        let db = notes_posts::Store::open(db, stage).map_err(Fail)?;
         let search = Search::open(&vault, &state.join("fff"))?;
         Ok(Daemon {
             vault,
@@ -190,14 +193,17 @@ impl Daemon {
 
     /// Run `f` as one unit: commit both SQLite and files, or roll back both.
     pub fn unit<T>(&self, author: &str, f: impl FnOnce(&mut Tx) -> R<T>) -> R<T> {
-        let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
+        let store = self.db.lock().unwrap_or_else(|e| e.into_inner());
+        let db = &store.db;
         if !db.is_autocommit() {
             let _ = db.execute_batch("ROLLBACK"); // left open by a thread that panicked mid-unit
         }
         db.execute_batch("BEGIN IMMEDIATE")?;
+        store.begin();
         let mut tx = Tx {
             d: self,
-            db: &db,
+            db,
+            store: &store,
             author,
             now: now(),
             undo: Vec::new(),
@@ -210,6 +216,9 @@ impl Daemon {
         if result.is_err() {
             let _ = db.execute_batch("ROLLBACK");
             tx.undo_files();
+            store.rollback();
+        } else {
+            store.commit();
         }
         self.search.update(&tx.touched);
         if tx.events && result.is_ok() {
@@ -225,8 +234,8 @@ impl Daemon {
 
     /// Committed events after `since`, oldest first.
     pub fn events_after(&self, since: u64, limit: u32) -> R<Vec<Event>> {
-        let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = db.prepare_cached(
+        let store = self.db.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = store.db.prepare_cached(
 "SELECT seq, kind, path, version, ext_id, session FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![since as i64, limit], |r| {
@@ -275,13 +284,28 @@ impl Daemon {
         }
     }
 
+    /// Pick up session files added, removed or replaced outside notesd.
+    pub fn stage_refresh(&self) {
+        let result = self.unit("external", |tx| {
+            let events = tx.store.refresh().map_err(Fail)?;
+            tx.post_events(events)
+        });
+        if let Err(Fail(e)) = result {
+            eprintln!("notesd: session folder refresh failed: {}", e.message);
+        }
+    }
+
+    pub fn stage_path(&self) -> PathBuf {
+        self.db.lock().unwrap_or_else(|e| e.into_inner()).root().to_path_buf()
+    }
+
     /// Startup: bring SQLite in line with the vault, drop stale temp files, purge old trash.
     pub fn reconcile(&self) -> R<()> {
         let mut rels = Vec::new();
         walk_notes(&self.vault, &self.vault, &mut rels, true);
         {
-            let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
-            let mut stmt = db.prepare("SELECT path FROM notes WHERE path IS NOT NULL")?;
+            let store = self.db.lock().unwrap_or_else(|e| e.into_inner());
+            let mut stmt = store.db.prepare("SELECT path FROM notes WHERE path IS NOT NULL")?;
             let known = stmt.query_map([], |r| r.get::<_, String>(0))?;
             for rel in known {
                 let rel = rel?;

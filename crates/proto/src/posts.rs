@@ -5,11 +5,74 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+// ---- Ids -------------------------------------------------------------------
+
+/// Typed record ids. On the wire each is a plain JSON string (`transparent`), so
+/// the protocol is unchanged; in Rust a post id can't be passed as a session id.
+macro_rules! id_type {
+    ($($(#[$doc:meta])* $name:ident),* $(,)?) => {$(
+        $(#[$doc])*
+        #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(pub String);
+
+        impl $name {
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+        impl std::ops::Deref for $name {
+            type Target = str;
+            fn deref(&self) -> &str {
+                &self.0
+            }
+        }
+        impl std::borrow::Borrow<str> for $name {
+            fn borrow(&self) -> &str {
+                &self.0
+            }
+        }
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+        impl From<String> for $name {
+            fn from(s: String) -> Self {
+                $name(s)
+            }
+        }
+        impl From<&str> for $name {
+            fn from(s: &str) -> Self {
+                $name(s.to_owned())
+            }
+        }
+        impl From<$name> for String {
+            fn from(id: $name) -> String {
+                id.0
+            }
+        }
+        impl PartialEq<str> for $name {
+            fn eq(&self, other: &str) -> bool {
+                self.0 == other
+            }
+        }
+        impl PartialEq<&str> for $name {
+            fn eq(&self, other: &&str) -> bool {
+                self.0 == *other
+            }
+        }
+    )*};
+}
+
+id_type!(SessionId, PostId, CommentId, AssetId);
+
 // ---- Parts ---------------------------------------------------------------
 
 /// One part of a post. Kinds match sideshow's surface kinds.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(deny_unknown_fields)]
 pub enum Part {
     /// Agent-authored markup, rendered sandboxed (WKWebView) with optional kits.
     Html {
@@ -42,7 +105,7 @@ pub enum Part {
         id: Option<String>,
     },
     Image {
-        asset_id: String,
+        asset_id: AssetId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         alt: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,7 +118,7 @@ pub enum Part {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         steps: Vec<TraceStep>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        asset_id: Option<String>,
+        asset_id: Option<AssetId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -91,6 +154,7 @@ pub enum Part {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiffFile {
     pub filename: String,
     pub before: String,
@@ -108,6 +172,7 @@ pub enum DiffLayout {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TraceStep {
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -122,7 +187,7 @@ pub struct TraceStep {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
-    pub id: String,
+    pub id: SessionId,
     pub agent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -136,8 +201,8 @@ pub struct Session {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Post {
-    pub id: String,
-    pub session: String,
+    pub id: PostId,
+    pub session: SessionId,
     pub title: String,
     pub parts: Vec<Part>,
     pub version: u64,
@@ -147,8 +212,8 @@ pub struct Post {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PostSummary {
-    pub id: String,
-    pub session: String,
+    pub id: PostId,
+    pub session: SessionId,
     pub title: String,
     /// Kind of each part, in order.
     pub kinds: Vec<String>,
@@ -167,12 +232,12 @@ pub struct PostWriteResult {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Comment {
-    pub id: String,
+    pub id: CommentId,
     /// Monotonic per daemon; `wait` and `comment-list --after` use it.
     pub seq: u64,
-    pub session: String,
+    pub session: SessionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub post: Option<String>,
+    pub post: Option<PostId>,
     /// `user` for the person in the app, otherwise the agent name.
     pub author: String,
     pub text: String,
@@ -184,6 +249,7 @@ pub struct Comment {
 /// Where on a post a comment points. `part` is the 0-based part index.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(deny_unknown_fields)]
 pub enum CommentAnchor {
     Point { part: u32, post_version: u64, x: f64, y: f64 },
     Rect { part: u32, post_version: u64, x: f64, y: f64, w: f64, h: f64 },
@@ -208,7 +274,7 @@ pub enum AssetKind {
 /// Asset metadata. `id` is the SHA-256 of the bytes, so uploads dedupe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssetInfo {
-    pub id: String,
+    pub id: AssetId,
     pub kind: AssetKind,
     pub content_type: String,
     pub byte_length: u64,
@@ -297,7 +363,7 @@ pub enum PartRender {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PostRender {
-    pub id: String,
+    pub id: PostId,
     pub version: u64,
     pub parts: Vec<PartRender>,
 }
@@ -305,6 +371,7 @@ pub struct PostRender {
 // ---- Verb arguments ----------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionNewArgs {
     pub agent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -313,23 +380,47 @@ pub struct SessionNewArgs {
     pub cwd: Option<String>,
 }
 
+/// Sessions whose title, agent or cwd matches `query`, or whose posts or
+/// comments contain it (case-insensitive). Best matches first.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSearchArgs {
+    pub query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// One `session-search` result. `post` and `text` locate the first content
+/// match; a title-only match leaves them empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionHit {
+    pub session: Session,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post: Option<PostId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionRenameArgs {
-    pub id: String,
+    pub id: SessionId,
     pub title: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct IdArgs {
-    pub id: String,
+#[serde(deny_unknown_fields)]
+pub struct IdArgs<T> {
+    pub id: T,
 }
 
 /// Create a post. With no `session`, the daemon uses (or creates) the
 /// caller's session for `Request.agent` + `Request.cwd`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PostNewArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session: Option<String>,
+    pub session: Option<SessionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub parts: Vec<Part>,
@@ -337,8 +428,9 @@ pub struct PostNewArgs {
 
 /// New version of a post; omitted fields keep their current value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PostUpdateArgs {
-    pub id: String,
+    pub id: PostId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -348,8 +440,9 @@ pub struct PostUpdateArgs {
 /// Edit one part (new post version). `target` is a part id or 0-based index;
 /// for `add` it is the insert position (default: append).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PostPartArgs {
-    pub id: String,
+    pub id: PostId,
     pub op: PartOp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
@@ -366,28 +459,31 @@ pub enum PartOp {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PostListArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session: Option<String>,
+    pub session: Option<SessionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
 
 /// Show a post, optionally an older version.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PostShowArgs {
-    pub id: String,
+    pub id: PostId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommentNewArgs {
     /// A post id; its session is implied. Without it, `session` is required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub post: Option<String>,
+    pub post: Option<PostId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session: Option<String>,
+    pub session: Option<SessionId>,
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<CommentAnchor>,
@@ -397,11 +493,12 @@ pub struct CommentNewArgs {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommentListArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session: Option<String>,
+    pub session: Option<SessionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub post: Option<String>,
+    pub post: Option<PostId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_seq: Option<u64>,
 }
@@ -409,19 +506,21 @@ pub struct CommentListArgs {
 /// Block until a `user` comment arrives in the session (or on the post) after
 /// what the agent has seen, then return it. `timeout_secs` 0 = no timeout.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WaitArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session: Option<String>,
+    pub session: Option<SessionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub post: Option<String>,
+    pub post: Option<PostId>,
     #[serde(default)]
     pub timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AssetPutArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session: Option<String>,
+    pub session: Option<SessionId>,
     pub kind: AssetKind,
     pub content_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -430,17 +529,20 @@ pub struct AssetPutArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TraceSetArgs {
-    pub session: String,
+    pub session: SessionId,
     pub steps: Vec<TraceStep>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SettingGetArgs {
     pub key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SettingSetArgs {
     pub key: String,
     pub value: String,

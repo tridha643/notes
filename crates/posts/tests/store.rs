@@ -9,11 +9,18 @@ use notes_posts::*;
 use notes_proto::{posts::*, ErrorCode};
 use rusqlite::Connection;
 
-fn db() -> Connection {
+/// A store over an in-memory database and a fresh temp session folder.
+fn db() -> Store {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "notes-posts-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
     let conn = Connection::open_in_memory().unwrap();
-    migrate(&conn).unwrap();
-    migrate(&conn).unwrap(); // idempotent
-    conn
+    migrate(&conn).unwrap(); // idempotent: Store::open runs it again
+    Store::open(conn, dir).unwrap()
 }
 
 fn md(text: &str) -> Part {
@@ -33,7 +40,7 @@ fn code(text: &str, lang: &str) -> Part {
     }
 }
 
-fn new_post(conn: &Connection, session: Option<&str>, parts: Vec<Part>) -> PostWriteResult {
+fn new_post(conn: &Store, session: Option<&str>, parts: Vec<Part>) -> PostWriteResult {
     let args = PostNewArgs {
         session: session.map(Into::into),
         title: Some("T".into()),
@@ -48,7 +55,7 @@ fn code_of(result: Result<impl std::fmt::Debug>) -> ErrorCode {
     result.expect_err("expected an error").code
 }
 
-fn ids(conn: &Connection, post: &str) -> Vec<String> {
+fn ids(conn: &Store, post: &str) -> Vec<String> {
     let p = post_show(
         conn,
         &PostShowArgs {
@@ -68,7 +75,7 @@ fn ids(conn: &Connection, post: &str) -> Vec<String> {
         .collect()
 }
 
-fn comment(conn: &Connection, post: &str, author: &str, text: &str) -> Comment {
+fn comment(conn: &Store, post: &str, author: &str, text: &str) -> Comment {
     let args = CommentNewArgs {
         post: Some(post.into()),
         session: None,
@@ -79,7 +86,7 @@ fn comment(conn: &Connection, post: &str, author: &str, text: &str) -> Comment {
     comment_new(conn, &args, Some("claude")).unwrap().0
 }
 
-fn put(conn: &Connection, bytes: &[u8], filename: &str) -> AssetInfo {
+fn put(conn: &Store, bytes: &[u8], filename: &str) -> AssetInfo {
     let args = AssetPutArgs {
         session: None,
         kind: AssetKind::Image,
@@ -416,7 +423,8 @@ fn updates_version_posts_and_keep_history() {
         ErrorCode::NotFound
     );
 
-    for _ in 0..HISTORY_LIMIT {
+    // Every version is kept: the session folder never prunes history.
+    for _ in 0..25 {
         post_update(
             &conn,
             &PostUpdateArgs {
@@ -427,13 +435,12 @@ fn updates_version_posts_and_keep_history() {
         )
         .unwrap();
     }
-    let current = 3 + HISTORY_LIMIT;
-    let oldest_kept = current - HISTORY_LIMIT;
+    let current = 3 + 25;
     assert!(post_show(
         &conn,
         &PostShowArgs {
             id: p.id.clone(),
-            version: Some(oldest_kept)
+            version: Some(1)
         }
     )
     .is_ok());
@@ -441,7 +448,7 @@ fn updates_version_posts_and_keep_history() {
         &conn,
         &PostShowArgs {
             id: p.id.clone(),
-            version: Some(oldest_kept - 1),
+            version: Some(current + 1),
         },
     )
     .unwrap_err();
@@ -849,10 +856,8 @@ fn assets_dedupe_by_content_hash() {
     );
     let again = put(&conn, b"hello", "second.png");
     assert_eq!(again, a, "dedupe keeps the original record");
-    let n: i64 = conn
-        .query_row("SELECT count(*) FROM assets", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(n, 1);
+    let stored = std::fs::read_dir(conn.root().join("assets")).unwrap().count();
+    assert_eq!(stored, 2, "one asset: its bytes and its metadata file");
     let got = asset_get(&conn, &a.id).unwrap();
     assert_eq!(
         (got.info, STANDARD.decode(got.data_base64).unwrap()),

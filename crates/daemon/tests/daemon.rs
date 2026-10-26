@@ -38,6 +38,8 @@ impl Notesd {
             .env("NOTES_VAULT", dir.join("vault"))
             .env("NOTES_DB", dir.join("state/notes.db"))
             .env("NOTES_SOCK", dir.join("s.sock"))
+            // The session folder is always ~/Desktop/Stage, so a temp HOME isolates it.
+            .env("HOME", dir.join("home"))
             .stderr(Stdio::null())
             .spawn()
             .unwrap()
@@ -733,4 +735,158 @@ fn trash_older_than_30_days_is_purged_on_startup() {
     d.crash_and_restart();
     d.err("not_found", "restore", json!({ "note": "old" }));
     d.ok("restore", json!({ "note": "recent" }));
+}
+
+impl Notesd {
+    fn stage(&self) -> PathBuf {
+        self.dir.join("home/Desktop/Stage")
+    }
+
+    fn session_files(&self) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(self.stage())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".json"))
+            .collect();
+        names.sort();
+        names
+    }
+}
+
+fn md(text: &str) -> Value {
+    json!({ "kind": "markdown", "markdown": text })
+}
+
+#[test]
+fn sessions_live_in_the_desktop_folder_and_doctor_reports_it() {
+    let d = Notesd::new();
+    let post = d.ok("post-new", json!({ "title": "Plan", "parts": [md("hi")] }));
+    let session = post["post"]["session"].as_str().unwrap();
+    let files = d.session_files();
+    assert_eq!(files.len(), 1);
+    assert!(files[0].ends_with(&format!("-{session}.json")), "{files:?}");
+    let doctor = d.ok("doctor", Value::Null);
+    assert_eq!(doctor["stage"]["sessions"], 1);
+    assert_eq!(doctor["stage"]["path"], d.stage().to_string_lossy().as_ref());
+    assert_eq!(doctor["stage"]["skipped"], json!([]));
+
+    // Survives a crash and restart.
+    let mut d = d;
+    d.crash_and_restart();
+    let shown = d.ok("post-show", json!({ "id": post["post"]["id"] }));
+    assert_eq!(shown["parts"][0]["markdown"], "hi");
+}
+
+#[test]
+fn atomic_batch_rolls_back_session_files() {
+    let d = Notesd::new();
+    d.ok("post-new", json!({ "title": "Kept", "parts": [md("a")] }));
+    let before = d.session_files();
+    let bytes = fs::read(d.stage().join(&before[0])).unwrap();
+    let outcomes = d.ok(
+        "batch",
+        json!({ "atomic": true, "ops": [
+            { "verb": "post-new", "args": { "title": "Dropped", "parts": [md("b")] } },
+            { "verb": "session-new", "args": { "agent": "codex" } },
+            { "verb": "post-show", "args": { "id": "missing" } },
+        ]}),
+    );
+    assert_eq!(outcomes.as_array().unwrap().len(), 3);
+    assert_eq!(outcomes[2]["error"]["code"], "not_found");
+    assert_eq!(d.session_files(), before);
+    assert_eq!(fs::read(d.stage().join(&before[0])).unwrap(), bytes);
+    let posts = d.ok("post-list", json!({}));
+    assert_eq!(posts.as_array().unwrap().len(), 1, "{posts}");
+}
+
+#[test]
+fn session_files_removed_or_added_outside_become_events() {
+    let d = Notesd::new();
+    let post = d.ok("post-new", json!({ "title": "P", "parts": [md("x")] }));
+    let session = post["post"]["session"].clone();
+    let name = d.session_files().remove(0);
+    let saved = fs::read(d.stage().join(&name)).unwrap();
+    // Start from doctor's seq: a watch with no `since` begins wherever notesd is when it
+    // registers, which can be after the delete below.
+    let since = d.ok("doctor", Value::Null)["seq"].clone();
+    let mut watch = d.watch(json!({ "since": since, "kinds": ["session"] }));
+
+    fs::remove_file(d.stage().join(&name)).unwrap();
+    let e = next_event(&mut watch);
+    assert_eq!((e["kind"].as_str(), &e["id"]), (Some("session-deleted"), &session));
+    d.err("not_found", "post-show", json!({ "id": post["post"]["id"] }));
+
+    fs::write(d.stage().join(&name), &saved).unwrap();
+    let e = next_event(&mut watch);
+    assert_eq!((e["kind"].as_str(), &e["id"]), (Some("session-created"), &session));
+    d.ok("post-show", json!({ "id": post["post"]["id"] }));
+}
+
+#[test]
+fn session_search_finds_titles_then_content() {
+    let d = Notesd::new();
+    let named = d.ok("session-new", json!({ "agent": "claude", "title": "Redirect bug" }));
+    let other = d.ok("session-new", json!({ "agent": "codex", "title": "Misc" }));
+    d.ok(
+        "post-new",
+        json!({ "session": other["id"], "title": "Notes", "parts": [md("the redirect loops")] }),
+    );
+    let hits = d.ok("session-search", json!({ "query": "redirect" }));
+    let ids: Vec<&Value> = hits.as_array().unwrap().iter().map(|h| &h["session"]["id"]).collect();
+    assert_eq!(ids, vec![&named["id"], &other["id"]]);
+    assert_eq!(hits[1]["text"], "the redirect loops");
+    d.err("usage", "session-search", json!({ "query": "" }));
+}
+
+#[test]
+fn unknown_fields_are_rejected_with_their_name() {
+    let d = Notesd::new();
+    let e = d.err("usage", "post-list", json!({ "sesion": "typo" }));
+    assert!(e["message"].as_str().unwrap().contains("sesion"), "{e}");
+    let e = d.err(
+        "usage",
+        "post-new",
+        json!({ "parts": [{ "kind": "markdown", "markdown": "x", "colour": "red" }] }),
+    );
+    assert!(e["message"].as_str().unwrap().contains("colour"), "{e}");
+
+    // The envelope is checked too.
+    let mut stream = UnixStream::connect(d.sock()).unwrap();
+    stream
+        .write_all(b"{\"v\":1,\"id\":7,\"verb\":\"session-list\",\"extra\":1}\n")
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).unwrap();
+    let r: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(r["error"]["code"], "usage", "{r}");
+    assert!(r["error"]["message"].as_str().unwrap().contains("extra"), "{r}");
+}
+
+#[test]
+fn sideshow_verbs_report_their_documented_error_codes() {
+    let d = Notesd::new();
+    for (verb, args) in [
+        ("post-show", json!({ "id": "nope" })),
+        ("post-render", json!({ "id": "nope" })),
+        ("post-update", json!({ "id": "nope", "title": "t" })),
+        ("post-delete", json!({ "id": "nope" })),
+        ("session-rename", json!({ "id": "nope", "title": "t" })),
+        ("session-delete", json!({ "id": "nope" })),
+        ("comment-delete", json!({ "id": "nope" })),
+        ("asset-get", json!({ "id": "nope" })),
+        ("trace-list", json!({ "id": "nope" })),
+        ("post-list", json!({ "session": "nope" })),
+    ] {
+        d.err("not_found", verb, args);
+    }
+    for (verb, args) in [
+        ("post-new", json!({ "parts": [] })),
+        ("comment-new", json!({ "text": "x" })),
+        ("comment-new", json!({ "session": "s", "text": " " })),
+        ("session-search", json!({ "query": " " })),
+        ("post-new", json!({})),
+    ] {
+        d.err("usage", verb, args);
+    }
 }

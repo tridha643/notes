@@ -1,0 +1,10 @@
+# p50 ceilings (ms) for `cargo bench -p stage --bench visuals`, about 2x the
+# measured p50 (2026-10-25, M-series, a busy machine). Lower a line when you
+# make that path faster; raise one only with a reason in the commit. Run it on a
+# quiet machine: a parallel build or test run can push restart html past its line.
+restart mermaid 60
+restart image 2
+restart html 180
+warm mermaid 40
+warm image 2
+warm html 160
