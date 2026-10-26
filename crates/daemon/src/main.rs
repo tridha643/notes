@@ -79,9 +79,18 @@ fn call(d: &Daemon, verb: &Verb, author: &str, cwd: Option<&str>) -> R<Value> {
                 .comments
                 .wait_for(timeout, || {
                     d.unit(author, |tx| {
+                        // No session: this conversation's; it hasn't posted yet, so nothing to wait on.
+                        let session = match (&a.session, &a.owner) {
+                            (Some(id), _) => Some(id.clone()),
+                            (None, Some(owner)) => match notes_posts::owned_session(tx.store, owner) {
+                                Some(id) => Some(id),
+                                None => return Ok(None),
+                            },
+                            (None, None) => None,
+                        };
                         notes_posts::next_user_comment(
                             tx.store,
-                            a.session.as_deref(),
+                            session.as_deref(),
                             a.post.as_deref(),
                             None,
                         )

@@ -36,6 +36,9 @@ pub struct SessionFile {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// The conversation that started it (see `PostNewArgs::owner`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     pub created_at: i64,
     pub last_active_at: i64,
     /// The agent's feedback cursor: comment seqs it has already seen.

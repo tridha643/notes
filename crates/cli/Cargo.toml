@@ -13,4 +13,5 @@ clap = { version = "4.6", features = ["derive"] }
 clap_complete = "4.6"
 notes-proto = { path = "../proto" }
 serde = { version = "1", default-features = false }
+libc = "0.2"
 serde_json = { version = "1", features = ["preserve_order"] }

@@ -45,6 +45,7 @@ fn new_post(conn: &Store, session: Option<&str>, parts: Vec<Part>) -> PostWriteR
         session: session.map(Into::into),
         title: Some("T".into()),
         parts,
+        ..Default::default()
     };
     post_new(conn, &args, Some("claude"), Some("/repo"))
         .unwrap()
@@ -152,12 +153,35 @@ fn sessions_crud_with_counts_and_events() {
 }
 
 #[test]
+fn each_conversation_gets_its_own_session_in_the_same_folder() {
+    let conn = db();
+    let post = |owner: &str, session_title: Option<&str>| {
+        let args = PostNewArgs {
+            parts: vec![md("x")],
+            owner: Some(owner.into()),
+            session_title: session_title.map(Into::into),
+            ..Default::default()
+        };
+        post_new(&conn, &args, Some("claude"), Some("/repo")).unwrap().0.post.session
+    };
+    let a = post("pid1:100", Some("Auth refactor"));
+    assert_eq!(post("pid1:100", Some("ignored later")), a, "same conversation, same thread");
+    let b = post("pid2:200", None);
+    assert_ne!(b, a, "another conversation in the same folder starts its own thread");
+    let s = session_get(&conn, &a).unwrap();
+    assert_eq!((s.title.as_deref(), s.post_count), (Some("Auth refactor"), 2));
+    assert_eq!(owned_session(&conn, "pid2:200"), Some(b));
+    assert_eq!(owned_session(&conn, "pid3:300"), None);
+}
+
+#[test]
 fn post_new_uses_the_callers_implicit_session() {
     let conn = db();
     let args = PostNewArgs {
         session: None,
         title: None,
         parts: vec![md("x")],
+        ..Default::default()
     };
     let (a, ev) = post_new(&conn, &args, Some("claude"), Some("/repo")).unwrap();
     assert_eq!(
@@ -201,6 +225,7 @@ fn validation_rules_reject_bad_parts() {
                 session: None,
                 title: None,
                 parts,
+                ..Default::default()
             },
             None,
             None,
@@ -318,6 +343,7 @@ fn titles_truncate_and_part_ids_are_assigned_and_kept() {
         session: None,
         title: Some("é".repeat(600)),
         parts: vec![md("a"), given.clone(), given],
+        ..Default::default()
     };
     let (r, _) = post_new(&conn, &args, None, None).unwrap();
     assert_eq!(r.post.title.chars().count(), MAX_TITLE);

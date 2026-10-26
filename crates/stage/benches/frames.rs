@@ -71,7 +71,7 @@ fn seed(sock: &Path) -> SessionId {
     ];
     let mut session = None;
     for (i, part) in parts.into_iter().enumerate() {
-        let r = agent(sock, Verb::PostNew(PostNewArgs { session: session.clone(), title: Some(format!("post {i}")), parts: vec![part] }));
+        let r = agent(sock, Verb::PostNew(PostNewArgs { session: session.clone(), title: Some(format!("post {i}")), parts: vec![part], ..Default::default() }));
         session = Some(r.post.session);
     }
     session.unwrap()

@@ -27,7 +27,7 @@ fn md(text: &str) -> Part {
 }
 
 fn publish(s: &Store, session: Option<&SessionId>, title: &str, text: &str) -> PostSummary {
-    let args = PostNewArgs { session: session.cloned(), title: Some(title.into()), parts: vec![md(text)] };
+    let args = PostNewArgs { session: session.cloned(), title: Some(title.into()), parts: vec![md(text)], ..Default::default() };
     post_new(s, &args, Some("claude"), Some("/repo")).unwrap().0.post
 }
 

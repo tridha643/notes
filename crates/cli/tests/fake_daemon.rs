@@ -67,6 +67,7 @@ fn serve(args: &[&str], stdin: &str, conns: &[&[&str]]) -> Run {
         .arg(&sock)
         .current_dir(&dir)
         .env("NOTES_AGENT", "tester")
+        .env("NOTES_OWNER", "")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -288,7 +289,8 @@ fn agent_howto_and_completions_work_without_a_daemon() {
     assert_eq!(howto.status.code(), Some(0));
     let text = String::from_utf8(howto.stdout).unwrap();
     assert!(
-        text.starts_with("## Notes (`notes` CLI)\n")
+        text.starts_with("## Posting to stage (`notes post`)\n")
+            && text.contains("notes wait --timeout 1")
             && text.contains("notes edit <ref> --old S --new S"),
         "{text}"
     );
@@ -402,7 +404,7 @@ fn post_prints_id_and_user_feedback_on_stderr() {
             r##""verb":"post-new","args":{"title":"Plan","parts":[{"kind":"markdown","markdown":"# Hi\n"}]}"##
         )
     );
-    assert_eq!(stdout(&run), "p1 v1\n");
+    assert_eq!(stdout(&run), "p1 v1 · session s1 · markdown\n");
     assert_eq!(stderr(&run), "feedback: #7 user on post p1: looks good\n");
     assert_eq!(run.out.status.code(), Some(0));
 
@@ -448,7 +450,7 @@ fn post_image_uploads_the_asset_then_posts_it() {
             r#""verb":"post-new","args":{"session":"s1","parts":[{"kind":"image","asset_id":"sha1","caption":"C"}]}"#
         )
     );
-    assert_eq!(stdout(&run), "p1 v1\n");
+    assert_eq!(stdout(&run), "p1 v1 · session s1 · markdown\n");
 }
 
 #[test]
@@ -560,27 +562,27 @@ fn sideshow_verbs_send_exact_requests_and_print_text() {
             "p1\tv2\tPlan\n  0\tmarkdown\tintro\n  1\tcode\t-\n".into(),
         ),
         (vec!["post", "delete", "p1"], "", r#""verb":"post-delete","args":{"id":"p1"}"#.into(), "null".into(), "".into()),
-        (vec!["post", "part", "p1", "rm", "1"], "", r#""verb":"post-part","args":{"id":"p1","op":"rm","target":"1"}"#.into(), POST_WRITE.into(), "p1 v1\n".into()),
+        (vec!["post", "part", "p1", "rm", "1"], "", r#""verb":"post-part","args":{"id":"p1","op":"rm","target":"1"}"#.into(), POST_WRITE.into(), "p1 v1 · session s1 · markdown\n".into()),
         (
             vec!["post", "part", "p1", "set", "0", "terminal", "-", "--cols", "80", "--term-title", "cargo"],
             "\u{1b}[31mred\u{1b}[0m",
             r#""verb":"post-part","args":{"id":"p1","op":"set","target":"0","part":{"kind":"terminal","text":"\u001b[31mred\u001b[0m","cols":80,"title":"cargo"}}"#.into(),
             POST_WRITE.into(),
-            "p1 v1\n".into(),
+            "p1 v1 · session s1 · markdown\n".into(),
         ),
         (
             vec!["post", "html", "-", "--kit", "slides,issues"],
             "<h1>x</h1>",
             r#""verb":"post-new","args":{"parts":[{"kind":"html","html":"<h1>x</h1>","kits":["slides","issues"]}]}"#.into(),
             POST_WRITE.into(),
-            "p1 v1\n".into(),
+            "p1 v1 · session s1 · markdown\n".into(),
         ),
         (
             vec!["post", "json", "-", "--title", "Data"],
             r#"{"a":[1,null]}"#,
             r#""verb":"post-new","args":{"title":"Data","parts":[{"kind":"json","data":{"a":[1,null]}}]}"#.into(),
             POST_WRITE.into(),
-            "p1 v1\n".into(),
+            "p1 v1 · session s1 · markdown\n".into(),
         ),
         (
             vec!["upload", upload.to_str().unwrap()],

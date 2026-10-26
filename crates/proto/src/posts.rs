@@ -414,9 +414,10 @@ pub struct IdArgs<T> {
     pub id: T,
 }
 
-/// Create a post. With no `session`, the daemon uses (or creates) the
-/// caller's session for `Request.agent` + `Request.cwd`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Create a post. With no `session`, it joins the calling conversation's
+/// session (`owner`), or without an owner the newest for `Request.agent` +
+/// `Request.cwd`; failing both, it starts one.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PostNewArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -424,6 +425,13 @@ pub struct PostNewArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub parts: Vec<Part>,
+    /// Title for the session this post creates; ignored when it joins one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_title: Option<String>,
+    /// The calling conversation (the CLI sets it). With no `session`, the post
+    /// joins this conversation's session, or starts one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 /// New version of a post; omitted fields keep their current value.
@@ -510,6 +518,9 @@ pub struct CommentListArgs {
 pub struct WaitArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionId>,
+    /// With no `session`: wait on this conversation's session (see `PostNewArgs::owner`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post: Option<PostId>,
     #[serde(default)]

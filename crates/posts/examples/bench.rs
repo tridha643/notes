@@ -240,6 +240,7 @@ fn main() {
         session: None,
         title: Some("Bench".into()),
         parts,
+        ..Default::default()
     };
     let mut ids = Vec::new();
     row(

@@ -87,6 +87,7 @@ impl Notesd {
             session: session.cloned(),
             title: Some(md.into()),
             parts: vec![Part::Markdown { markdown: md.into(), id: None }],
+            ..Default::default()
         }))
     }
 }
