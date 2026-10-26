@@ -141,6 +141,17 @@ private func page(_ html: String) throws -> String {
         try h.send(["op": "html-close", "id": 8])
     }
 
+    @Test func widePagesAreZoomedOutToFitTheCard() throws {
+        let path = try page("<body style='margin:0'><div style='width:1000px;height:500px;background:#89b4fa'></div></body>")
+        let h = try Helper()
+        try h.send(["op": "html-open", "id": 10, "path": path, "width": 400, "max_height": 1000, "scale": 1, "fps": 60])
+        let first = try #require(h.next())
+        shm_unlink(try #require(first["shm"] as? String))
+        // 1000 px wide into 400: zoom 0.4, so 500 px tall shows as 200.
+        #expect(first["w"] as? Int == 400 && first["h"] as? Int == 200, "\(first)")
+        try h.send(["op": "html-close", "id": 10])
+    }
+
     @Test func updatesPatchStylesAndTextInPlaceElseReload() throws {
         let v1 = "<style>p{color:#fff}</style><body style='margin:0'><p id=t>one</p><script>let x = 1</script></body>"
         let path = try page(v1)

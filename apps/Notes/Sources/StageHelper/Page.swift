@@ -208,16 +208,30 @@ final class Page: NSObject, WKNavigationDelegate {
         // Measure in a 1px-tall viewport: scrollHeight is never less than the viewport, and in
         // quirks mode the root box fills it, so only a tiny one shows the content's own height.
         setSize(width, 1)
-        web.evaluateJavaScript("document.documentElement.scrollHeight") { [weak self] h, _ in
+        web.pageZoom = 1
+        let measure = "[document.documentElement.scrollWidth, document.documentElement.scrollHeight]"
+        web.evaluateJavaScript(measure) { [weak self] size, _ in
             guard let self else { return }
-            let content = (h as? NSNumber)?.doubleValue ?? self.maxHeight
-            self.setSize(self.width, max(1, min(content, self.maxHeight)))
-            traceMark("html measured", since: self.opened)
-            // takeSnapshot waits for the next committed paint itself, so no rAF round trip first.
-            self.lastHash = nil
-            self.capture()
-            self.checkAnimating()
+            let size = (size as? [NSNumber])?.map(\.doubleValue) ?? []
+            // A page wider than the card (a fixed-width teardown, a wide table) is zoomed
+            // out to fit it, never in, and laid out again at that zoom.
+            let zoom = size.count == 2 ? max(0.3, min(1, self.width / max(size[0], 1))) : 1
+            guard zoom < 0.999 else { return self.show(height: size.count == 2 ? size[1] : self.maxHeight) }
+            self.web.pageZoom = zoom
+            self.web.evaluateJavaScript("document.documentElement.scrollHeight") { [weak self] h, _ in
+                self?.show(height: ((h as? NSNumber)?.doubleValue ?? 0) * zoom)
+            }
         }
+    }
+
+    /// Size the viewport to `height` points of content (capped) and capture.
+    private func show(height content: Double) {
+        setSize(width, max(1, min(content, maxHeight)))
+        traceMark("html measured", since: opened)
+        // takeSnapshot waits for the next committed paint itself, so no rAF round trip first.
+        lastHash = nil
+        capture()
+        checkAnimating()
     }
 
     private func setSize(_ w: Double, _ h: Double) {
