@@ -14,7 +14,7 @@ use crate::{ansi, diff, highlight, store::post_show, Result, Store};
 
 /// Part of every cache key. Bump it whenever render output changes (renderer
 /// code, class names, or a grammar crate upgrade) so old entries are never served.
-pub const RENDER_VERSION: &str = "notes-posts-render-1";
+pub const RENDER_VERSION: &str = "notes-posts-render-2";
 
 const MEMORY_BUDGET: usize = 64 << 20;
 const TABLE_BUDGET: i64 = 256 << 20;
