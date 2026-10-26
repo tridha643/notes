@@ -3,7 +3,7 @@
 //! helper each run; `warm` reuses one. Fixtures: benches/fixtures.
 //!
 //!   cargo build -p notesd && (cd apps/Notes && swift build -c release --product stage-helper)
-//!   cargo bench -p stage --bench visuals
+//!   cargo bench -p stage --bench visuals    # exits 1 when a p50 is over benches/budget.txt
 
 use std::{
     collections::HashMap,
@@ -50,7 +50,8 @@ fn round(g: &mut Gallery, rx: &mpsc::Receiver<Msg>, n: u64, asset: &str, fx: &Pa
     let mut asked: HashMap<VisualKey, (&'static str, Instant)> = HashMap::new();
     let mut done_now: HashMap<&'static str, f64> = HashMap::new();
     for (i, (kind, source)) in kinds.into_iter().enumerate() {
-        let key: VisualKey = (format!("bench-{kind}").into(), n, i);
+        // A post per round: reusing one would take the in-place update path for html.
+        let key: VisualKey = (format!("bench-{kind}-{n}").into(), n, i);
         asked.insert(key.clone(), (kind, Instant::now()));
         let mut sink = Vec::new();
         for m in g.need(&mut sink, key.clone(), source, target) {
@@ -155,12 +156,38 @@ fn main() {
         }
     }
     println!("visual request → transmitted (ms)        p50      p95");
+    let mut p50 = HashMap::new();
     for state in ["cold", "restart", "warm"] {
         for kind in ["mermaid", "image", "html"] {
             let v = results.get_mut(&(state, kind)).unwrap();
-            println!("  {state:<7} {kind:<8}                    {:7.1}  {:7.1}", pct(v, 0.5), pct(v, 0.95));
+            let (mid, high) = (pct(v, 0.5), pct(v, 0.95));
+            println!("  {state:<7} {kind:<8}                    {mid:7.1}  {high:7.1}");
+            p50.insert(format!("{state} {kind}"), mid);
         }
     }
     let _ = Command::new("pkill").arg("-f").arg(dir.to_string_lossy().as_ref()).status();
     let _ = std::fs::remove_dir_all(&dir);
+    // Ratchet: a run over any p50 ceiling in budget.txt fails, so a later change
+    // can't quietly undo a win. Cold is left out: it measures the machine (process
+    // launch, disk cache) more than this code.
+    let over = over_budget(include_str!("budget.txt"), &p50);
+    for line in &over {
+        eprintln!("over budget: {line}");
+    }
+    if !over.is_empty() {
+        std::process::exit(1);
+    }
+}
+
+/// Budget lines (`state kind ceiling_ms`) whose measured p50 is above the ceiling.
+fn over_budget(budget: &str, p50: &HashMap<String, f64>) -> Vec<String> {
+    budget
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let (name, ceiling) = l.rsplit_once(' ')?;
+            let (ceiling, got) = (ceiling.parse::<f64>().ok()?, *p50.get(name)?);
+            (got > ceiling).then(|| format!("{name} p50 {got:.1} ms > {ceiling} ms"))
+        })
+        .collect()
 }
