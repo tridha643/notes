@@ -39,8 +39,6 @@ pub enum Gfx {
     Raster { key: VisualKey, done: Result<(String, u32, u32), String> },
 }
 
-/// Mermaid SVG background: the card's own color, so the image has no seam.
-const BG: [u8; 4] = [0x1e, 0x1e, 0x2e, 0xff];
 /// CSS px → device px for helper renders (Retina).
 const SCALE: f64 = 2.0;
 
@@ -108,7 +106,7 @@ fn fonts() -> Arc<resvg::usvg::fontdb::Database> {
 }
 
 /// SVG → RGBA at the size it will be shown: within `width_px` × `height_px`
-/// (never past 2× its CSS size), over the card color.
+/// (never past 2× its CSS size), on a transparent background so glass shows through.
 pub fn rasterize(svg: &str, width_px: u32, height_px: u32) -> Result<(Vec<u8>, u32, u32), String> {
     let opt = resvg::usvg::Options { fontdb: fonts(), ..Default::default() };
     let tree = resvg::usvg::Tree::from_str(svg, &opt).map_err(|e| format!("svg: {e}"))?;
@@ -116,10 +114,13 @@ pub fn rasterize(svg: &str, width_px: u32, height_px: u32) -> Result<(Vec<u8>, u
     let scale = (width_px as f32 / size.width()).min(height_px as f32 / size.height()).min(SCALE as f32);
     let (w, h) = ((size.width() * scale).ceil() as u32, (size.height() * scale).ceil() as u32);
     let mut pixmap = resvg::tiny_skia::Pixmap::new(w.max(1), h.max(1)).ok_or("empty diagram")?;
-    pixmap.fill(resvg::tiny_skia::Color::from_rgba8(BG[0], BG[1], BG[2], BG[3]));
     resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
-    // Opaque background, so premultiplied RGBA is already straight RGBA.
-    Ok((pixmap.take(), w.max(1), h.max(1)))
+    // tiny-skia is premultiplied; kitty wants straight RGBA.
+    let rgba = pixmap.pixels().iter().flat_map(|p| {
+        let c = p.demultiply();
+        [c.red(), c.green(), c.blue(), c.alpha()]
+    });
+    Ok((rgba.collect(), w.max(1), h.max(1)))
 }
 
 /// One `STAGE_TRACE` line, when tracing.

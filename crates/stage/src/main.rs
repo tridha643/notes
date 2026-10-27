@@ -115,6 +115,8 @@ fn main() -> ExitCode {
     let mut app = App::new(want);
     if let Ok(size) = term.size() {
         app.size = (size.width, size.height);
+        // Through the loop too, so the starting card width reaches notesd.
+        let _ = tx.send(Msg::Resize(size.width, size.height));
     }
     let mut latency = Latency::from_env();
     let mut gallery = Gallery::new(tx.clone(), StageClient::new(sock.clone()), cache_dir(), notes_proto::default_stage_path(), app.target());

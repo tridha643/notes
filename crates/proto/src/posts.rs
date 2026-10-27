@@ -546,6 +546,10 @@ pub struct TraceSetArgs {
     pub steps: Vec<TraceStep>,
 }
 
+/// Setting stage writes on resize: how many cells of text fit in a card, so
+/// `notes post` and `notes guide` can tell agents what width to write for.
+pub const STAGE_CARD_COLS: &str = "stage.card_cols";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SettingGetArgs {

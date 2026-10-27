@@ -27,6 +27,8 @@ pub struct Card {
 
 pub enum CardBody {
     Lines(Vec<Line<'static>>),
+    /// Markdown source, laid out at the card's width so tables fit it.
+    Markdown(String),
     Tree(FoldTree),
     Placeholder(String),
     /// Preformatted rows (terminal output, code): never re-flowed. A row wider
@@ -121,7 +123,7 @@ fn card(part: &Part, render: Option<&PartRender>) -> Card {
     match (part, render) {
         (Part::Markdown { markdown, .. }, _) => Card {
             label: "markdown".into(),
-            body: CardBody::Lines(capped(markdown_lines(markdown), markdown.len())),
+            body: CardBody::Markdown(markdown.clone()),
         },
         (Part::Code { title, language, code, .. }, Some(PartRender::Code { line_start, lines, .. })) => Card {
             label: label("code", title.as_deref().or(language.as_deref())),
@@ -404,7 +406,9 @@ fn trace_tree(steps: &[TraceStep]) -> FoldTree {
 
 // ---- Markdown ------------------------------------------------------------------
 
-fn markdown_lines(src: &str) -> Vec<Line<'static>> {
+/// Markdown as styled lines for a card `width` cells wide. Prose is left for
+/// `wrap`; tables are fitted here, since only they need to know the width.
+fn markdown_lines(src: &str, width: usize) -> Vec<Line<'static>> {
     use comrak::{nodes::NodeValue, Arena, Options};
     let mut options = Options::default();
     options.extension.table = true;
@@ -415,7 +419,7 @@ fn markdown_lines(src: &str) -> Vec<Line<'static>> {
     let root = comrak::parse_document(&arena, src, &options);
     let mut out = Vec::new();
     for node in root.children() {
-        block(node, "", &mut out);
+        block(node, "", width, &mut out);
     }
     while out.last().is_some_and(|l: &Line| l.width() == 0) {
         out.pop();
@@ -434,10 +438,15 @@ fn markdown_lines(src: &str) -> Vec<Line<'static>> {
                 line.push(Span::styled(format!("[image: {}]", sanitize(&link.url)), ui::dim()));
             }
             NodeValue::Link(link) => {
+                let from = line.len();
                 for c in node.children() {
                     inline(c, style.fg(ui::BLUE).add_modifier(Modifier::UNDERLINED), line, lines);
                 }
-                line.push(Span::styled(format!(" ({})", sanitize(&link.url)), ui::dim()));
+                // An autolink's text is its url; don't print it twice.
+                let text: String = line[from..].iter().map(|s| s.content.as_ref()).collect();
+                if link.url.trim_start_matches("mailto:") != text {
+                    line.push(Span::styled(format!(" ({})", sanitize(&link.url)), ui::dim()));
+                }
             }
             other => {
                 let style = match other {
@@ -474,7 +483,7 @@ fn markdown_lines(src: &str) -> Vec<Line<'static>> {
         }
     }
 
-    fn block<'a>(node: comrak::Node<'a>, prefix: &str, out: &mut Vec<Line<'static>>) {
+    fn block<'a>(node: comrak::Node<'a>, prefix: &str, width: usize, out: &mut Vec<Line<'static>>) {
         let value = node.data().value.clone();
         match value {
             NodeValue::Paragraph => {
@@ -490,13 +499,13 @@ fn markdown_lines(src: &str) -> Vec<Line<'static>> {
                 out.push(Line::from(prefix.to_owned()));
             }
             NodeValue::CodeBlock(cb) => {
-                // A shaded block, like the code cards; boxed() fills the row's background.
-                let shade = Style::new().bg(ui::CODE_BG);
+                // A rule down the left marks the block; there is no fill to see on glass.
                 for l in sanitize::lines(cb.literal.trim_end_matches('\n')) {
-                    out.push(
-                        Line::from(vec![Span::raw(format!("{prefix} ")), Span::styled(l, Style::new().fg(ui::TEXT))])
-                            .style(shade),
-                    );
+                    out.push(Line::from(vec![
+                        Span::raw(prefix.to_owned()),
+                        Span::styled("▏ ", ui::border()),
+                        Span::styled(l, Style::new().fg(ui::GREEN)),
+                    ]));
                 }
                 out.push(Line::from(prefix.to_owned()));
             }
@@ -516,7 +525,7 @@ fn markdown_lines(src: &str) -> Vec<Line<'static>> {
                             let marker = format!("  {bullet}{}", task.unwrap_or(""));
                             para(child, Style::new().fg(ui::TEXT), prefix, &marker, out);
                         } else {
-                            block(child, &inner, out);
+                            block(child, &inner, width, out);
                         }
                     }
                 }
@@ -524,15 +533,15 @@ fn markdown_lines(src: &str) -> Vec<Line<'static>> {
             }
             NodeValue::BlockQuote | NodeValue::MultilineBlockQuote(_) => {
                 for child in node.children() {
-                    block(child, &format!("{prefix}│ "), out);
+                    block(child, &format!("{prefix}│ "), width, out);
                 }
             }
             NodeValue::ThematicBreak => {
                 out.push(Line::styled(format!("{prefix}────────"), ui::dim()));
                 out.push(Line::from(prefix.to_owned()));
             }
-            NodeValue::Table(_) => {
-                table(node, prefix, out);
+            NodeValue::Table(t) => {
+                table(node, &t.alignments, prefix, width, out);
                 out.push(Line::from(prefix.to_owned()));
             }
             NodeValue::HtmlBlock(h) => {
@@ -543,48 +552,99 @@ fn markdown_lines(src: &str) -> Vec<Line<'static>> {
             }
             _ => {
                 for child in node.children() {
-                    block(child, prefix, out);
+                    block(child, prefix, width, out);
                 }
             }
         }
     }
 
-    fn table<'a>(node: comrak::Node<'a>, prefix: &str, out: &mut Vec<Line<'static>>) {
-        let rows: Vec<(bool, Vec<String>)> = node
+    /// A fully bordered grid fitted to `width`: columns share what's left after
+    /// the borders, and a cell too long for its column wraps inside it.
+    fn table<'a>(
+        node: comrak::Node<'a>,
+        align: &[comrak::nodes::TableAlignment],
+        prefix: &str,
+        width: usize,
+        out: &mut Vec<Line<'static>>,
+    ) {
+        use comrak::nodes::TableAlignment;
+        let rows: Vec<Vec<Line<'static>>> = node
             .children()
             .map(|row| {
                 let header = matches!(row.data().value, NodeValue::TableRow(true));
-                let cells = row
-                    .children()
+                let style = if header { Style::new().fg(ui::BLUE).add_modifier(Modifier::BOLD) } else { Style::new().fg(ui::TEXT) };
+                row.children()
                     .map(|cell| {
                         let (mut line, mut lines) = (Vec::new(), Vec::new());
                         for c in cell.children() {
-                            inline(c, Style::new(), &mut line, &mut lines);
+                            inline(c, style, &mut line, &mut lines);
                         }
-                        line.iter().map(|s| s.content.as_ref()).collect::<String>()
+                        Line::from(line)
                     })
-                    .collect();
-                (header, cells)
+                    .collect()
             })
             .collect();
-        let cols = rows.iter().map(|r| r.1.len()).max().unwrap_or(0);
-        let widths: Vec<usize> = (0..cols)
-            .map(|c| rows.iter().filter_map(|r| r.1.get(c)).map(|s| s.width()).max().unwrap_or(0))
-            .collect();
-        let indent = format!("{prefix}  ");
-        for (header, cells) in &rows {
-            let mut spans = vec![Span::raw(indent.clone())];
-            for (c, w) in widths.iter().enumerate() {
-                let text = cells.get(c).map_or("", String::as_str);
-                let style = if *header { Style::new().fg(ui::TEXT).add_modifier(Modifier::BOLD) } else { Style::new().fg(ui::TEXT) };
-                spans.push(Span::styled(format!("{text}{}   ", " ".repeat(w - text.width())), style));
+        let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+        let natural: Vec<usize> =
+            (0..cols).map(|c| rows.iter().filter_map(|r| r.get(c)).map(Line::width).max().unwrap_or(0).max(1)).collect();
+        // Each column costs its width plus "│ " and " "; the last "│" closes the row.
+        let room = width.saturating_sub(prefix.width() + 3 * cols + 1);
+        let widths = fit_columns(&natural, room);
+        let rule = |out: &mut Vec<Line<'static>>, (l, m, r): (&str, &str, &str)| {
+            let parts: Vec<String> = widths.iter().map(|w| "─".repeat(w + 2)).collect();
+            out.push(Line::from(vec![
+                Span::raw(prefix.to_owned()),
+                Span::styled(format!("{l}{}{r}", parts.join(m)), ui::border()),
+            ]));
+        };
+        rule(out, ("┌", "┬", "┐"));
+        for (r, cells) in rows.iter().enumerate() {
+            let split: Vec<Vec<Line<'static>>> =
+                widths.iter().enumerate().map(|(c, w)| cells.get(c).map_or_else(Vec::new, |l| wrap(l, *w))).collect();
+            let height = split.iter().map(Vec::len).max().unwrap_or(1).max(1);
+            for y in 0..height {
+                let mut spans = vec![Span::raw(prefix.to_owned())];
+                for (c, w) in widths.iter().enumerate() {
+                    spans.push(Span::styled("│ ", ui::border()));
+                    let cell = split[c].get(y).cloned().unwrap_or_default();
+                    let pad = w.saturating_sub(cell.width());
+                    let left = match align.get(c) {
+                        Some(TableAlignment::Right) => pad,
+                        Some(TableAlignment::Center) => pad / 2,
+                        _ => 0,
+                    };
+                    spans.push(Span::raw(" ".repeat(left)));
+                    spans.extend(cell.spans);
+                    spans.push(Span::raw(" ".repeat(pad - left + 1)));
+                }
+                spans.push(Span::styled("│", ui::border()));
+                out.push(Line::from(spans));
             }
-            out.push(Line::from(spans));
-            if *header {
-                let rule: Vec<String> = widths.iter().map(|w| "─".repeat(*w)).collect();
-                out.push(Line::styled(format!("{indent}{}", rule.join("   ")), ui::border()));
-            }
+            rule(out, if r + 1 < rows.len() { ("├", "┼", "┤") } else { ("└", "┴", "┘") });
         }
+    }
+}
+
+/// Column widths within `room`: a column narrower than an even share keeps
+/// its natural width, and the rest split what's left. Never below 3 cells.
+fn fit_columns(natural: &[usize], room: usize) -> Vec<usize> {
+    let mut widths = natural.to_vec();
+    if natural.iter().sum::<usize>() <= room {
+        return widths;
+    }
+    let mut open: Vec<usize> = (0..natural.len()).collect();
+    let mut left = room;
+    loop {
+        let share = left / open.len().max(1);
+        let (fits, wide): (Vec<usize>, Vec<usize>) = open.iter().partition(|&&c| natural[c] <= share);
+        if fits.is_empty() {
+            for (i, c) in wide.iter().enumerate() {
+                widths[*c] = (share + usize::from(i < left % wide.len().max(1))).max(3);
+            }
+            return widths;
+        }
+        left -= fits.iter().map(|&c| natural[c]).sum::<usize>();
+        open = wide;
     }
 }
 
@@ -651,7 +711,7 @@ pub fn wrap(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
     // Continuation rows hang under the text, past any indent and list marker.
     let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
     let body = text.trim_start();
-    let marker = ["• ", "☐ ", "☑ ", "│ "].iter().find(|m| body.starts_with(**m)).map_or(0, |m| m.width());
+    let marker = ["• ", "☐ ", "☑ ", "│ ", "▏ "].iter().find(|m| body.starts_with(**m)).map_or(0, |m| m.width());
     let hang = (text.width() - body.width() + marker).min(width / 2);
     let mut out: Vec<Vec<Span<'static>>> = vec![Vec::new()];
     let mut used = 0;
@@ -733,6 +793,9 @@ pub fn layout(cards: &[Card], comments: &[Comment], width: u16, folds: &Folds, f
         push(&mut laid, bordered(&card.label, width), Hit::Card(c));
         let rows: Vec<(Line<'static>, Hit)> = match &card.body {
             CardBody::Lines(lines) => lines.iter().map(|l| (l.clone(), Hit::Card(c))).collect(),
+            CardBody::Markdown(src) => {
+                capped(markdown_lines(src, inner), src.len()).into_iter().map(|l| (l, Hit::Card(c))).collect()
+            }
             CardBody::Pre { lines, gutter, shade } => {
                 let shade = if *shade { Style::new().bg(ui::CODE_BG) } else { Style::new() };
                 for line in lines {
@@ -870,11 +933,33 @@ mod tests {
 │   • one                              │
 │   • two                              │
 │                                      │
-│   a   bb                             │
-│   ─   ──                             │
-│   1   2                              │
+│ ┌───┬────┐                           │
+│ │ a │ bb │                           │
+│ ├───┼────┤                           │
+│ │ 1 │ 2  │                           │
+│ └───┴────┘                           │
 ╰──────────────────────────────────────╯"
         );
+    }
+
+    #[test]
+    fn a_wide_table_fits_the_card() {
+        let md = "| step | what happens |\n|---|--:|\n| 1 | the agent posts a long markdown table |\n| 2 | ok |\n";
+        assert_eq!(
+            golden(Part::Markdown { markdown: md.into(), id: None }, PartRender::Native),
+            "╭─ markdown ───────────────────────────╮
+│ ┌──────┬───────────────────────────┐ │
+│ │ step │              what happens │ │
+│ ├──────┼───────────────────────────┤ │
+│ │ 1    │    the agent posts a long │ │
+│ │      │            markdown table │ │
+│ ├──────┼───────────────────────────┤ │
+│ │ 2    │                        ok │ │
+│ └──────┴───────────────────────────┘ │
+╰──────────────────────────────────────╯"
+        );
+        assert_eq!(fit_columns(&[4, 50], 30), vec![4, 26]);
+        assert_eq!(fit_columns(&[40, 40, 2], 32), vec![15, 15, 2]);
     }
 
     #[test]

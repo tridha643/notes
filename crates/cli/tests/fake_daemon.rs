@@ -51,9 +51,16 @@ fn serve(args: &[&str], stdin: &str, conns: &[&[&str]]) -> Run {
         conns
             .into_iter()
             .map(|responses| {
-                let (stream, _) = listener.accept().unwrap();
-                let mut request = String::new();
-                BufReader::new(&stream).read_line(&mut request).unwrap();
+                // `notes post` first asks for stage's card width; no stage has run here.
+                let (stream, request) = loop {
+                    let (stream, _) = listener.accept().unwrap();
+                    let mut request = String::new();
+                    BufReader::new(&stream).read_line(&mut request).unwrap();
+                    if !request.contains(r#""verb":"setting-get""#) {
+                        break (stream, request);
+                    }
+                    (&stream).write_all(format!("{}\n", ok("null")).as_bytes()).unwrap();
+                };
                 for response in responses {
                     (&stream).write_all(response.as_bytes()).unwrap();
                 }

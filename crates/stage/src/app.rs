@@ -79,6 +79,8 @@ pub enum StageRequest {
     PostRender(PostShowArgs),
     CommentNew(CommentNewArgs),
     CommentList(SessionId),
+    /// Record the card's text width for agents (`STAGE_CARD_COLS`).
+    CardCols(u16),
 }
 
 #[derive(Debug)]
@@ -90,6 +92,7 @@ pub enum Reply {
     Render(PostRender),
     Comments(SessionId, Vec<Comment>),
     Commented(Comment),
+    Saved,
     Failed(StageRequest, ErrorBody),
 }
 
@@ -177,6 +180,8 @@ pub struct App {
     pub sel: usize,
     pub mode: Mode,
     pub size: (u16, u16),
+    /// The card width last sent to notesd, so a resize only writes on change.
+    card_cols: u16,
     pub cell_px: (u16, u16),
     pub kitty: bool,
     pub toast: Option<String>,
@@ -236,6 +241,7 @@ impl App {
             sel: 0,
             mode: Mode::Nav,
             size: (80, 24),
+            card_cols: 0,
             cell_px: (8, 16),
             kitty: false,
             toast: None,
@@ -311,7 +317,14 @@ impl App {
             Msg::Mouse(m) => self.mouse(m),
             Msg::Resize(w, h) => {
                 self.size = (w, h);
-                vec![Effect::Redraw]
+                let mut fx = vec![Effect::Redraw];
+                // A card's text width: the feed column less its border and padding.
+                let cols = ui::geometry(self.size).main.width.saturating_sub(5);
+                if cols != self.card_cols {
+                    self.card_cols = cols;
+                    fx.push(Effect::Request(StageRequest::CardCols(cols)));
+                }
+                fx
             }
             Msg::CellPx(px) => {
                 if px == self.cell_px {
@@ -963,6 +976,7 @@ impl App {
     fn reply(&mut self, r: Reply) -> Vec<Effect> {
         let mut fx = Vec::new();
         match r {
+            Reply::Saved => return fx,
             Reply::Sessions(sessions) => {
                 let selected = self.rows().get(self.sel).copied().and_then(|r| match r {
                     Row::Session(i) => self.sessions.get(i).map(|s| (true, s.id.0.clone())),
@@ -1172,6 +1186,7 @@ mod tests {
                     parts: vec![notes_proto::posts::PartRender::Native],
                 }),
                 StageRequest::CommentList(s) => Reply::Comments(s.clone(), vec![]),
+                StageRequest::CardCols(_) => Reply::Saved,
                 StageRequest::SessionSearch(a) => Reply::Hits(
                     a.query.clone(),
                     self.sessions.iter().filter(|s| s.id.contains(a.query.as_str())).map(|s| SessionHit { session: s.clone(), post: None, text: None }).collect(),
@@ -1355,8 +1370,11 @@ mod tests {
     #[test]
     fn resize_is_exactly_one_redraw() {
         let mut app = booted(&fake());
-        assert_eq!(app.update(Msg::Resize(120, 40)), [Effect::Redraw]);
-        assert_eq!(app.size, (120, 40));
+        // A new card width is reported to notesd once; a height change only redraws.
+        let cols = ui::geometry((120, 40)).main.width - 5;
+        assert_eq!(app.update(Msg::Resize(120, 40)), [Effect::Redraw, Effect::Request(StageRequest::CardCols(cols))]);
+        assert_eq!(app.update(Msg::Resize(120, 50)), [Effect::Redraw]);
+        assert_eq!(app.size, (120, 50));
     }
 
     #[test]

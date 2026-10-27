@@ -134,6 +134,10 @@ impl StageClient {
             StageRequest::PostRender(a) => self.post_render(a).map_or_else(failed, Reply::Render),
             StageRequest::CommentNew(a) => self.comment_new(a).map_or_else(failed, Reply::Commented),
             StageRequest::CommentList(s) => self.comment_list(s.clone()).map_or_else(failed, |c| Reply::Comments(s, c)),
+            StageRequest::CardCols(n) => {
+                let set = notes_proto::posts::SettingSetArgs { key: notes_proto::posts::STAGE_CARD_COLS.into(), value: n.to_string() };
+                self.call::<serde::de::IgnoredAny>(Verb::SettingSet(set)).map_or_else(failed, |_| Reply::Saved)
+            }
         }
     }
 }
