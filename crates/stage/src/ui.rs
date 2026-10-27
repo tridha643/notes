@@ -17,9 +17,10 @@ pub const BORDER: Color = Color::Rgb(0x7f, 0x84, 0x9c);
 pub const FRAME: Color = Color::Rgb(0x58, 0x5b, 0x70);
 pub const TEXT: Color = Color::Rgb(0xcd, 0xd6, 0xf4);
 pub const TEAL: Color = Color::Rgb(0x94, 0xe2, 0xd5);
-/// Sidebar background, so the post list reads as its own column.
-pub const SIDEBAR: Color = Color::Rgb(0x1e, 0x1e, 0x2e);
-pub const CODE_BG: Color = Color::Rgb(0x1e, 0x1e, 0x2e);
+/// Surface fills are the pane's own background, so Rex's glass shows through:
+/// libghostty draws a cell with an explicit background as an opaque slab.
+pub const SIDEBAR: Color = Color::Reset;
+pub const CODE_BG: Color = Color::Reset;
 pub const BLUE: Color = Color::Rgb(0x89, 0xb4, 0xfa);
 pub const GREEN: Color = Color::Rgb(0xa6, 0xe3, 0xa1);
 pub const RED: Color = Color::Rgb(0xf3, 0x8b, 0xa8);
@@ -27,7 +28,7 @@ pub const CYAN: Color = Color::Rgb(0x89, 0xdc, 0xeb);
 pub const PEACH: Color = Color::Rgb(0xfa, 0xb3, 0x87);
 pub const MAUVE: Color = Color::Rgb(0xcb, 0xa6, 0xf7);
 pub const YELLOW: Color = Color::Rgb(0xf9, 0xe2, 0xaf);
-pub const BAR: Color = Color::Rgb(0x18, 0x18, 0x25);
+pub const BAR: Color = Color::Reset;
 pub const SELECTED: Color = Color::Rgb(0x31, 0x32, 0x44);
 /// The cursor line: a soft band, quieter than a selection.
 pub const CURSOR: Color = Color::Rgb(0x24, 0x25, 0x3a);

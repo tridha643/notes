@@ -15,6 +15,19 @@ Adapted from sideshow's agent design guide; `notes post` warns (on stderr,
 - To refine a post, update it (`notes post update <id> <kind> <file>`): same
   card, new version. Don't publish a near-duplicate.
 
+## Fit the card
+
+A card is read without scrolling sideways, and wider content wraps. Its
+width follows the user's pane: "Right now" at the end of this guide gives
+the live width when stage is open (80 otherwise), and `notes post` warns
+against it. Size posts to the card:
+
+- Markdown parts under 40 lines; past that, split into posts.
+- Paragraphs under 60 words: two or three sentences.
+- Tables up to 5 columns with short cells (a few words, no sentences).
+  Stage fits the table to the card and wraps long cells, which reads badly.
+- Fenced code lines under 80 characters.
+
 ## Pick the kind
 
 Each part is data the viewer renders, except html, which you draw.

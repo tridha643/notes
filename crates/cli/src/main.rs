@@ -496,9 +496,15 @@ fn env_session() -> Option<SessionId> {
     env::var("NOTES_SESSION").ok().filter(|s| !s.is_empty()).map(SessionId::from)
 }
 
+/// The card width stage last reported, if it has run.
+fn card_cols(ask: &mut Ask<'_>) -> Option<usize> {
+    let key = notes_proto::posts::SettingGetArgs { key: notes_proto::posts::STAGE_CARD_COLS.into() };
+    ask(Verb::SettingGet(key)).ok()?.as_str()?.parse().ok()
+}
+
 /// Print the design guide's warnings for a post about to be sent.
-fn warn(title: Option<&str>, parts: &[Part]) {
-    for w in lint::check(title, parts) {
+fn warn(title: Option<&str>, parts: &[Part], ask: &mut Ask<'_>) {
+    for w in lint::check(title, parts, card_cols(ask).unwrap_or(lint::CARD_COLS)) {
         eprintln!("warning: {w} (see `notes guide`)");
     }
 }
@@ -919,7 +925,7 @@ fn to_verb(
                     .chain(more.kinds())
                     .map(|k| build_part(k, &session, stdin, ask))
                     .collect::<Result<Vec<_>, _>>()?;
-                warn(title.as_deref(), &parts);
+                warn(title.as_deref(), &parts, ask);
                 Verb::PostNew(PostNewArgs { parts, session, title, session_title, owner: owner::key() })
             }
             PostCmd::Update { id, part } => {
@@ -929,7 +935,7 @@ fn to_verb(
                 } else {
                     Some(kinds.into_iter().map(|k| build_part(k, &session, stdin, ask)).collect::<Result<Vec<_>, _>>()?)
                 };
-                warn(title.as_deref(), parts.as_deref().unwrap_or_default());
+                warn(title.as_deref(), parts.as_deref().unwrap_or_default(), ask);
                 Verb::PostUpdate(PostUpdateArgs { id, title, parts })
             }
             PostCmd::Part { id, op } => {
@@ -941,7 +947,7 @@ fn to_verb(
                 let part = part
                     .map(|p| build_part(p, &session, stdin, ask))
                     .transpose()?;
-                warn(title.as_deref(), part.as_slice());
+                warn(title.as_deref(), part.as_slice(), ask);
                 Verb::PostPart(PostPartArgs {
                     id,
                     op,
@@ -1420,7 +1426,15 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Cmd::Guide => {
-            let _ = io::stdout().write_all(include_str!("guide.md").as_bytes());
+            let mut out = include_str!("guide.md").to_owned();
+            let sock = cli.sock.clone().unwrap_or_else(default_socket_path);
+            let request = |verb| Request { v: PROTOCOL_VERSION, id: 1, verb, cwd: None, agent: None };
+            if let Some(cols) = card_cols(&mut |verb| ask(&sock, &request(verb))) {
+                out.push_str(&format!(
+                    "\n## Right now\n\nThe user's stage card is {cols} cells wide. Write for that width: a\ntable row, code line or diagram label wider than {cols} wraps.\n"
+                ));
+            }
+            let _ = io::stdout().write_all(out.as_bytes());
             return ExitCode::SUCCESS;
         }
         Cmd::Completions { shell } => {
@@ -1459,8 +1473,10 @@ mod tests {
     fn verb(args: &[&str], stdin: &str) -> Result<Verb, ErrorBody> {
         let cli =
             Cli::try_parse_from(std::iter::once("notes").chain(args.iter().copied())).unwrap();
-        to_verb(cli.cmd, cli.if_version, &mut stdin.as_bytes(), &mut |_| {
-            panic!("unit tests have no daemon")
+        to_verb(cli.cmd, cli.if_version, &mut stdin.as_bytes(), &mut |v| match v {
+            // Lint asks for stage's card width and falls back without a daemon.
+            Verb::SettingGet(_) => Err(closed()),
+            _ => panic!("unit tests have no daemon"),
         })
     }
 
