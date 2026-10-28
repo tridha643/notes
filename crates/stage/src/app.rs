@@ -1,7 +1,7 @@
 //! All of stage's state and every decision, with no IO: `App::update` takes a
 //! message (a key, a mouse event, a notesd event or a reply) and returns the
 //! effects for `main` to perform. Requests are limited to [`StageRequest`], whose
-//! only write is `CommentNew`.
+//! writes are comments, session renames and deletes the user confirmed.
 
 use std::collections::{HashMap, HashSet};
 
@@ -9,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButto
 use notes_proto::{
     posts::{
         Comment, CommentNewArgs, Part, Post, PostId, PostRender, PostShowArgs, PostSummary, Session,
-        SessionHit, SessionId, SessionSearchArgs,
+        SessionHit, SessionId, SessionRenameArgs, SessionSearchArgs,
     },
     ErrorBody, ErrorCode, Event,
 };
@@ -69,7 +69,8 @@ pub struct OnScreen {
     pub total: u16,
 }
 
-/// The only requests stage can make. `CommentNew` is its only write.
+/// The only requests stage can make. Its writes are `CommentNew`, `SessionRename`
+/// and the deletes, each behind a key the user pressed (deletes after a `y`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum StageRequest {
     SessionList,
@@ -79,6 +80,9 @@ pub enum StageRequest {
     PostRender(PostShowArgs),
     CommentNew(CommentNewArgs),
     CommentList(SessionId),
+    SessionRename(SessionRenameArgs),
+    SessionDelete(SessionId),
+    PostDelete(PostId),
     /// Record the card's text width for agents (`STAGE_CARD_COLS`).
     CardCols(u16),
 }
@@ -132,12 +136,15 @@ pub enum Effect {
     NeedVisual { key: VisualKey, source: VisualSource, target: Target },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Mode {
     Nav,
     Search { query: String, hits: Vec<SessionHit>, sel: usize },
     Comment { input: String },
     Command { input: String },
+    Rename { id: SessionId, input: String },
+    /// Waiting for `y` to send `request`, which deletes `what`.
+    Delete { what: String, request: StageRequest },
 }
 
 /// A sidebar row: a session, or one of the open session's posts.
@@ -693,6 +700,41 @@ impl App {
             Mode::Search { query, hits, sel } => self.search_key(k, query, hits, sel),
             Mode::Comment { input } => self.comment_key(k, input),
             Mode::Command { input } => self.command_key(k, input),
+            Mode::Rename { id, input } => self.rename_key(k, id, input),
+            Mode::Delete { what, request } => match k.code {
+                KeyCode::Char('y') => {
+                    self.toast = Some(format!("deleted {what}"));
+                    vec![Effect::Request(request)]
+                }
+                _ => vec![],
+            },
+        }
+    }
+
+    /// `r`: retitle the selected session, else the open one.
+    fn start_rename(&mut self) {
+        let s = match self.rows().get(self.sel) {
+            Some(Row::Session(i)) => self.sessions.get(*i),
+            _ => self.open.as_ref().and_then(|id| self.sessions.iter().find(|s| &s.id == id)),
+        };
+        if let Some(s) = s {
+            self.mode = Mode::Rename { id: s.id.clone(), input: s.title.clone().unwrap_or_default() };
+        }
+    }
+
+    /// `d`: delete the selected session, else the shown post, once `y` confirms.
+    fn start_delete(&mut self) {
+        let clean = |t: &str| crate::sanitize::sanitize(t).into_owned();
+        let doomed = match self.rows().get(self.sel) {
+            Some(Row::Session(i)) => self.sessions.get(*i).map(|s| {
+                (format!("session “{}”", clean(s.title.as_deref().unwrap_or(&s.agent))), StageRequest::SessionDelete(s.id.clone()))
+            }),
+            _ => self.shown.as_ref().and_then(|id| self.posts.iter().find(|p| &p.id == id)).map(|p| {
+                (format!("post “{}”", clean(&p.title)), StageRequest::PostDelete(p.id.clone()))
+            }),
+        };
+        if let Some((what, request)) = doomed {
+            self.mode = Mode::Delete { what, request };
         }
     }
 
@@ -752,6 +794,14 @@ impl App {
             }
             KeyCode::Char('v') => self.cycle_version(),
             KeyCode::Char('o') => commands::run(self, "open"),
+            KeyCode::Char('r') => {
+                self.start_rename();
+                vec![]
+            }
+            KeyCode::Char('d') => {
+                self.start_delete();
+                vec![]
+            }
             _ => vec![],
         }
     }
@@ -833,6 +883,19 @@ impl App {
             _ => {
                 Self::edit(&mut input, &k);
                 self.mode = Mode::Comment { input };
+                vec![]
+            }
+        }
+    }
+
+    fn rename_key(&mut self, k: KeyEvent, id: SessionId, mut input: String) -> Vec<Effect> {
+        match k.code {
+            KeyCode::Esc => vec![],
+            // An empty title clears it (the sidebar falls back to the agent).
+            KeyCode::Enter => vec![Effect::Request(StageRequest::SessionRename(SessionRenameArgs { id, title: input }))],
+            _ => {
+                Self::edit(&mut input, &k);
+                self.mode = Mode::Rename { id, input };
                 vec![]
             }
         }
@@ -983,6 +1046,13 @@ impl App {
                     Row::Post(i) => self.posts.get(i).map(|p| (false, p.id.0.clone())),
                 });
                 self.sessions = sessions;
+                self.remembered.retain(|id, _| self.sessions.iter().any(|s| &s.id == id));
+                // The open session was deleted: drop it and open the newest.
+                if self.open.as_ref().is_some_and(|id| !self.sessions.iter().any(|s| &s.id == id)) {
+                    (self.open, self.shown, self.feed) = (None, None, None);
+                    self.posts.clear();
+                    self.comments.clear();
+                }
                 if self.open.is_none() {
                     let target = match self.want.take() {
                         Some(want) if !self.sessions.iter().any(|s| s.id == want) => {
@@ -1186,7 +1256,10 @@ mod tests {
                     parts: vec![notes_proto::posts::PartRender::Native],
                 }),
                 StageRequest::CommentList(s) => Reply::Comments(s.clone(), vec![]),
-                StageRequest::CardCols(_) => Reply::Saved,
+                StageRequest::CardCols(_)
+                | StageRequest::SessionRename(_)
+                | StageRequest::SessionDelete(_)
+                | StageRequest::PostDelete(_) => Reply::Saved,
                 StageRequest::SessionSearch(a) => Reply::Hits(
                     a.query.clone(),
                     self.sessions.iter().filter(|s| s.id.contains(a.query.as_str())).map(|s| SessionHit { session: s.clone(), post: None, text: None }).collect(),
@@ -1413,7 +1486,7 @@ mod tests {
     }
 
     #[test]
-    fn the_only_write_is_comment_new() {
+    fn browsing_writes_only_the_comment() {
         let db = fake();
         let mut app = booted(&db);
         let mut all = Vec::new();
@@ -1435,5 +1508,33 @@ mod tests {
         assert_eq!(writes.len(), 1, "{all:?}");
         let StageRequest::CommentNew(a) = writes[0] else { unreachable!() };
         assert_eq!((a.text.as_str(), a.author.as_deref()), (" hi", Some("user")));
+    }
+
+    #[test]
+    fn rename_and_delete_session_and_post() {
+        let mut db = fake();
+        let mut app = booted(&db);
+        // On post b, d asks about it; anything but y cancels.
+        app.update(key(KeyCode::Char('d')));
+        assert!(matches!(&app.mode, Mode::Delete { what, .. } if what == "post “b”"), "{:?}", app.mode);
+        assert!(requests(&app.update(key(KeyCode::Char('n')))).is_empty());
+        app.update(key(KeyCode::Char('d')));
+        assert_eq!(requests(&app.update(key(KeyCode::Char('y')))), [StageRequest::PostDelete("b".into())]);
+        // r renames the open session, starting from its title.
+        app.update(key(KeyCode::Char('r')));
+        app.update(key(KeyCode::Backspace));
+        app.update(key(KeyCode::Char('x')));
+        let rename = SessionRenameArgs { id: "s1".into(), title: "sx".into() };
+        assert_eq!(requests(&app.update(key(KeyCode::Enter))), [StageRequest::SessionRename(rename)]);
+        // On a session row, d deletes the session; once it's gone the next one opens.
+        app.sel = 0;
+        app.update(key(KeyCode::Char('d')));
+        assert_eq!(requests(&app.update(key(KeyCode::Char('y')))), [StageRequest::SessionDelete("s1".into())]);
+        db.sessions.remove(0);
+        let ev = Event { seq: 12, kind: "session-deleted".into(), path: None, version: None, id: Some("s1".into()), session: Some("s1".into()) };
+        let fx = app.update(Msg::Event(ev));
+        serve(&mut app, fx, &db);
+        assert_eq!((app.open.as_deref(), app.shown.as_deref()), (Some("s2"), Some("z")));
+        assert_eq!(app.rows(), [Row::Session(0), Row::Post(0)]);
     }
 }

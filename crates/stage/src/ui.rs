@@ -247,6 +247,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 ("enter", "fold"),
                 ("/", "search"),
                 ("c", "comment"),
+                ("r", "rename"),
+                ("d", "delete"),
                 (":", "command"),
                 ("q", "quit"),
             ]),
@@ -257,6 +259,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             prompt(&format!("comment on “{}”", clip(&on, 30)), input, &[("enter", "send"), ("esc", "cancel")])
         }
         Mode::Command { input } => prompt(":", input, &[("enter", "run"), ("esc", "cancel")]),
+        Mode::Rename { input, .. } => prompt("rename session", input, &[("enter", "save"), ("esc", "cancel")]),
+        Mode::Delete { what, .. } => {
+            let mut spans = vec![Span::styled(format!(" delete {}? ", clip(what, 50)), bold().fg(RED))];
+            spans.extend(chips(&[("y", "delete"), ("any key", "cancel")]).into_iter().skip(1));
+            spans
+        }
     };
     f.render_widget(bar(keys, g.keybar.width, BAR), g.keybar);
 }

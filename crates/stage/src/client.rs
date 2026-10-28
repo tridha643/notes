@@ -1,4 +1,5 @@
-//! `StageClient`: the notesd verbs stage may call (all reads, plus `comment-new`), and nothing else.
+//! `StageClient`: the notesd verbs stage may call (reads, `comment-new`, `session-rename`
+//! and the session and post deletes), and nothing else.
 //! Requests go over one connection; `watch` holds its own.
 
 use std::{
@@ -9,7 +10,7 @@ use std::{
 
 use notes_proto::{
     posts::{
-        AssetId, Comment, CommentListArgs, CommentNewArgs, Post, PostListArgs, PostRender, PostShowArgs,
+        AssetId, Comment, CommentListArgs, CommentNewArgs, IdArgs, Post, PostListArgs, PostRender, PostShowArgs,
         PostSummary, Session, SessionHit, SessionId, SessionSearchArgs,
     },
     to_line, ErrorBody, ErrorCode, Event, Request, Response, Verb, WatchArgs, PROTOCOL_VERSION,
@@ -134,11 +135,19 @@ impl StageClient {
             StageRequest::PostRender(a) => self.post_render(a).map_or_else(failed, Reply::Render),
             StageRequest::CommentNew(a) => self.comment_new(a).map_or_else(failed, Reply::Commented),
             StageRequest::CommentList(s) => self.comment_list(s.clone()).map_or_else(failed, |c| Reply::Comments(s, c)),
+            StageRequest::SessionRename(a) => self.saved(Verb::SessionRename(a), req),
+            StageRequest::SessionDelete(id) => self.saved(Verb::SessionDelete(IdArgs { id }), req),
+            StageRequest::PostDelete(id) => self.saved(Verb::PostDelete(IdArgs { id }), req),
             StageRequest::CardCols(n) => {
                 let set = notes_proto::posts::SettingSetArgs { key: notes_proto::posts::STAGE_CARD_COLS.into(), value: n.to_string() };
-                self.call::<serde::de::IgnoredAny>(Verb::SettingSet(set)).map_or_else(failed, |_| Reply::Saved)
+                self.saved(Verb::SettingSet(set), req)
             }
         }
+    }
+
+    /// A write whose answer stage ignores; the watch brings the change back.
+    fn saved(&mut self, verb: Verb, req: &StageRequest) -> Reply {
+        self.call::<serde::de::IgnoredAny>(verb).map_or_else(|e| Reply::Failed(req.clone(), e), |_| Reply::Saved)
     }
 }
 
