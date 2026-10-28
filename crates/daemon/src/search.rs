@@ -1,5 +1,5 @@
 //! fff-search 0.11.0 with its own watcher off (`watch: false`, no debounce timer):
-//! notesd tells it about every change through `update`. Config matches docs/fff-check.md's
+//! notesd tells it about every change through `update`. Config matches docs/research/fff-check.md's
 //! retest, except searches never stop early on a time budget.
 
 use std::{

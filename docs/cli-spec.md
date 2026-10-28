@@ -170,7 +170,7 @@ at its first error.
 
 - Folders only, no tags.
 - Trash keeps notes 30 days.
-- Search and find use fff's ranking (frecency). fff runs with its own watcher off (`watch: false`); `notesd` feeds it changes from its writes and its own watcher, so fff adds no idle timer. See docs/fff-check.md on codex/core.
+- Search and find use fff's ranking (frecency). fff runs with its own watcher off (`watch: false`); `notesd` feeds it changes from its writes and its own watcher, so fff adds no idle timer. See docs/research/fff-check.md on codex/core.
 - Search budget: median ≤20 ms. Searches always run to completion; a rare word or a miss reads the whole vault (~30–60 ms on a 103 MB vault, scaling with size).
 - `batch` exits with the first failed op's exit code, after printing every op's result.
 

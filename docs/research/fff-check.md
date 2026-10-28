@@ -12,7 +12,7 @@ Each recorded run starts a fresh resident Rust process, empty fff index and empt
 
 All 40 query cases (20 find, 20 search) run in the same process. Each gets two excluded warmups, then 50 timed samples, with rotating query order: 1,000 samples per verb per run. The timer includes query parsing, acquiring the shared read lock, fff execution and copying up to 50 returned paths or match lines into an owned JSON value. It excludes JSON serialization, stdin/stdout transport, CLI startup and UI work. Grep uses smart case, automatic regex detection, a first page of 50 matches, no context and no time budget. On zero matches the spike explicitly retries in fuzzy mode; both calls are included in the timing. These are first-page latencies, not exhaustive retrieval times or a notes CLI benchmark.
 
-Two final runs were sequential, with no build or profiler launched alongside their query phases. This was a working developer Mac, not an isolated benchmark host: `top` records system load, compressed memory and swap activity; its load averages can include the benchmark's preceding burst. An earlier diagnostic overlapped compilation and is excluded from the committed measurements. The complete final samples, correctness checks and OS output (with trailing whitespace removed) are in [results](../spikes/fff-check/results/).
+Two final runs were sequential, with no build or profiler launched alongside their query phases. This was a working developer Mac, not an isolated benchmark host: `top` records system load, compressed memory and swap activity; its load averages can include the benchmark's preceding burst. An earlier diagnostic overlapped compilation and is excluded from the committed measurements. The complete final samples, correctness checks and OS output (with trailing whitespace removed) are in [results](../../spikes/fff-check/results/).
 
 ## Cold scan and warm query results
 
@@ -45,7 +45,7 @@ Pooled percentiles use all 1,000 compatible raw samples for each verb, with equa
 
 The unique identifier is present in exactly one file, but its prefix is shared by all 10,000 notes and its digits also occur in wiki links. It stresses this identifier pattern, not rare-word search in general; no general selective-search conclusion follows from this one case. Common phrases often hit the page limit early. The typo `fermenttaion` has no literal match and must find `fermentation`; the impossible query scans the fuzzy fallback without finding a result. Those cases explain why a low median doesn't satisfy the warm latency target. Both two-character path queries and both two-character content queries return relevant matches, and both path typos find the intended title family.
 
-Per-query timings below are from run 1 (50 samples each); run 2 retains its complete per-query table and samples in [queries.json](../spikes/fff-check/results/run-2/queries.json). All times are milliseconds.
+Per-query timings below are from run 1 (50 samples each); run 2 retains its complete per-query table and samples in [queries.json](../../spikes/fff-check/results/run-2/queries.json). All times are milliseconds.
 
 ### find
 
@@ -157,7 +157,7 @@ For the USE check, utilization is measured by the idle CPU/RSS/I/O figures above
 
 ## Exact library calls used
 
-The executable implementation is [src/main.rs](../spikes/fff-check/src/main.rs); the following is its integration sequence with error/JSON handling omitted. All APIs are from [fff-search 0.11.0](https://docs.rs/fff-search/0.11.0/fff_search/).
+The executable implementation is [src/main.rs](../../spikes/fff-check/src/main.rs); the following is its integration sequence with error/JSON handling omitted. All APIs are from [fff-search 0.11.0](https://docs.rs/fff-search/0.11.0/fff_search/).
 
 ```rust
 use fff_search::{
@@ -272,7 +272,7 @@ Keep fff out of the daemon integration for now. Reconsider after an event-driven
 
 Measured on the same M5/macOS/toolchain as the first check, 2026-10-18. The first section and its result directories are preserved verbatim from `aac5d28`. The current spike reproduces this retest; use that commit's harness to reproduce the first check. The corpus generator is unchanged: seed 249, exactly 10,000 files and 108,509,770 bytes. The same 20 find and 20 content queries each receive two excluded warmups and 50 timed samples, rotating order. Percentiles are nearest rank over raw samples, with 1,000 samples per verb per run and 50 per individual query. All measurements are sequential resident-library calls on warm OS file caches, including parsing, locking and copying returned paths/lines, excluding serialization, pipes, CLI startup and UI rendering. These remain first-page measurements, not full retrieval or CLI round trips.
 
-Both final runs used `rex run` in the existing session, sequentially, with no compilation alongside either run. The primary query phase runs first on the original corpus; the supplementary enforced-budget phase runs second, also before mutations. No profiler runs during queries. Complete samples, per-call match counts and resume offsets, correctness checks, thread stacks, `ps -M`, `top`, resource snapshots and `/usr/bin/time -l` are retained in [retest results](../spikes/fff-check/results/retest/). The fixed phase order and working developer Mac limit causal comparisons between budget variants.
+Both final runs used `rex run` in the existing session, sequentially, with no compilation alongside either run. The primary query phase runs first on the original corpus; the supplementary enforced-budget phase runs second, also before mutations. No profiler runs during queries. Complete samples, per-call match counts and resume offsets, correctness checks, thread stacks, `ps -M`, `top`, resource snapshots and `/usr/bin/time -l` are retained in [retest results](../../spikes/fff-check/results/retest/). The fixed phase order and working developer Mac limit causal comparisons between budget variants.
 
 ```rust
 FilePickerOptions {
@@ -350,7 +350,7 @@ The identifier happens to appear in the first partial page in these runs; that d
 
 ## Update visibility: daemon knowledge and external writes
 
-The new [vault watcher](../spikes/fff-check/src/vault_watcher.rs) owns one kqueue thread, `notes-vault-kqueue`. It registers vnodes for every existing directory and Markdown file, then blocks in `kevent(..., timeout = NULL)`. A vnode event triggers a metadata snapshot and calls `handle_create_or_modify(path)` for additions/edits or `remove_file_by_path(path)` for removals under the shared write lock. Atomic replacements re-arm the vnode on the new inode. No fff watch subscription, fff rescan, debouncer or timed wait is used. `EVFILT_USER` wakes the watcher for shutdown, which joins the thread and closes its descriptors before the control.
+The new [vault watcher](../../spikes/fff-check/src/vault_watcher.rs) owns one kqueue thread, `notes-vault-kqueue`. It registers vnodes for every existing directory and Markdown file, then blocks in `kevent(..., timeout = NULL)`. A vnode event triggers a metadata snapshot and calls `handle_create_or_modify(path)` for additions/edits or `remove_file_by_path(path)` for removals under the shared write lock. Atomic replacements re-arm the vnode on the new inode. No fff watch subscription, fff rescan, debouncer or timed wait is used. `EVFILT_USER` wakes the watcher for shutdown, which joins the thread and closes its descriptors before the control.
 
 This is a bounded integration probe, not the production vault watcher: it uses roughly 10,050 vnode descriptors and scans vault metadata after an event, setting the process's soft fd limit to at most 20,000. It validates the required blocking/update path on this synthetic vault; rename storms, symlinks and deletion/recreation of watched directories need production handling. It performs no filesystem scans while idle.
 
@@ -416,6 +416,6 @@ cargo clippy -p fff-check -- -D warnings
 cargo build
 ```
 
-Use fresh output directories and never compile concurrently with either run. Both final Rex processes exited successfully. Release build, formatting, focused clippy and workspace `cargo build` passed. The only added dependency edge is the spike's direct use of the already-locked `libc`; core/UI sources are untouched. Read-only Claude CLI autoreview (`--mode local --engine claude --no-web-search --claude-allowed-tools Read,Grep,Glob`) recomputed the result tables and checked the source/API and idle controls. Its acknowledgment-label finding was corrected; the final review was clean and is retained in [review.txt](../spikes/fff-check/results/retest/review.txt).
+Use fresh output directories and never compile concurrently with either run. Both final Rex processes exited successfully. Release build, formatting, focused clippy and workspace `cargo build` passed. The only added dependency edge is the spike's direct use of the already-locked `libc`; core/UI sources are untouched. Read-only Claude CLI autoreview (`--mode local --engine claude --no-web-search --claude-allowed-tools Read,Grep,Glob`) recomputed the result tables and checked the source/API and idle controls. Its acknowledgment-label finding was corrected; the final review was clean and is retained in [review.txt](../../spikes/fff-check/results/retest/review.txt).
 
 Keep the timer finding closed: an unmodified `fff-search 0.11.0` can be indexed and idle without periodic wakeups when its watcher is disabled. The remaining NO-GO is the latency/completion contract. Using `enforce_time_budget: true` requires exposing partial pages and continuation explicitly, and fitting their complete CLI operation into an agreed budget; `time_budget_ms: 8` alone does neither. The present evidence does not require a debounce fork and does not establish that another engine would be faster.
