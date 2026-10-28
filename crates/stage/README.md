@@ -10,11 +10,12 @@ stage --session <id>  # open one
 
 ## Keys
 
-`j/k` post · `↑↓` line · `⏎` fold/open · `space/b` page · `g/G` top/bottom · `/` search
-sessions · `c` comment (anchored to the selected lines on code and diff) · `r` rename
-the selected (else open) session · `d` delete the selected session, else the card under the
-cursor, else the shown post (`y` confirms) · `v` older version · `o` open html in the browser · `:` commands (`open copy versions rerender help`) ·
-`q` quit.
+`j/k` next/previous post · `J/K` session · `↑↓` line · `⏎` fold, or open the selected session ·
+`space/b` page · `g/G` top/bottom · `/` search sessions · `c` comment (anchored to the selected
+lines on code and diff) · `r` rename the selected session · `d` delete the card under the
+cursor, else the shown post · `D` delete the selected session (deletes wait for `y`) · `v`
+older version · `o` open html in the browser · `:` commands (`open copy versions rerender
+help`) · `q` quit. The sidebar lists sessions only; a session's posts are in the feed.
 
 ## Structure
 

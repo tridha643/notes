@@ -149,13 +149,6 @@ pub enum Mode {
     Delete { what: String, request: StageRequest },
 }
 
-/// A sidebar row: a session, or one of the open session's posts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Row {
-    Session(usize),
-    Post(usize),
-}
-
 pub struct Loaded {
     pub post: Option<Post>,
     pub render: Option<PostRender>,
@@ -186,6 +179,7 @@ pub struct App {
     pub loaded: HashMap<(PostId, u64), Loaded>,
     pub views: HashMap<PostId, View>,
     pub shown: Option<PostId>,
+    /// The sidebar's selected session (index into `sessions`).
     pub sel: usize,
     pub mode: Mode,
     pub size: (u16, u16),
@@ -381,22 +375,6 @@ impl App {
 
     // ---- Sidebar ----------------------------------------------------------------
 
-    pub fn rows(&self) -> Vec<Row> {
-        let mut rows = Vec::new();
-        for (i, s) in self.sessions.iter().enumerate() {
-            rows.push(Row::Session(i));
-            if self.open.as_ref() == Some(&s.id) {
-                rows.extend((0..self.posts.len()).map(Row::Post));
-            }
-        }
-        rows
-    }
-
-    fn row_of_post(&self, id: &PostId) -> Option<usize> {
-        let i = self.posts.iter().position(|p| &p.id == id)?;
-        self.rows().iter().position(|r| *r == Row::Post(i))
-    }
-
     fn open_session(&mut self, id: SessionId) -> Vec<Effect> {
         self.unread.remove(&id);
         if self.open.as_ref() == Some(&id) {
@@ -428,7 +406,7 @@ impl App {
         }
         self.banner = None;
         if let Some(i) = self.sessions.iter().position(|s| s.id == id) {
-            self.sel = self.rows().iter().position(|r| *r == Row::Session(i)).unwrap_or(0);
+            self.sel = i;
         }
         vec![
             Effect::Request(StageRequest::PostList(id.clone())),
@@ -436,22 +414,31 @@ impl App {
         ]
     }
 
-    fn select_row(&mut self, row: usize, activate: bool) -> Vec<Effect> {
-        let rows = self.rows();
-        let Some(&r) = rows.get(row) else {
-            return vec![];
-        };
-        self.sel = row;
-        match r {
-            Row::Session(i) if activate => self.open_session(self.sessions[i].id.clone()),
-            Row::Session(_) => vec![],
-            Row::Post(i) => {
-                let id = self.posts[i].id.clone();
-                self.follow = i + 1 == self.posts.len();
-                self.jump = Some(id.clone());
-                self.show(id)
-            }
+    fn select_session(&mut self, i: usize, activate: bool) -> Vec<Effect> {
+        let Some(id) = self.sessions.get(i).map(|s| s.id.clone()) else { return vec![] };
+        self.sel = i;
+        if activate {
+            self.open_session(id)
+        } else {
+            vec![]
         }
+    }
+
+    /// `j`/`k`: bring the next post's title (or this one's, then the previous) to the top.
+    fn step_post(&mut self, forward: bool) {
+        let (cursor, page) = (self.cursor, self.page());
+        let feed = self.feed();
+        let Some(&(at, _)) = feed.hits.get(cursor) else { return };
+        let target = match (forward, cursor > feed.starts[at]) {
+            (true, _) => at + 1,
+            (false, true) => at,
+            (false, false) => at.saturating_sub(1),
+        };
+        let Some(&line) = feed.starts.get(target) else { return };
+        let max = feed.lines.len().saturating_sub(page);
+        self.follow = target + 1 == self.posts.len();
+        (self.cursor, self.scroll) = (line, line.min(max));
+        self.follow_cursor();
     }
 
     // ---- Posts ------------------------------------------------------------------
@@ -713,30 +700,27 @@ impl App {
         }
     }
 
-    /// `r`: retitle the selected session, else the open one.
+    /// `r`: retitle the selected session.
     fn start_rename(&mut self) {
-        let s = match self.rows().get(self.sel) {
-            Some(Row::Session(i)) => self.sessions.get(*i),
-            _ => self.open.as_ref().and_then(|id| self.sessions.iter().find(|s| &s.id == id)),
-        };
-        if let Some(s) = s {
+        if let Some(s) = self.sessions.get(self.sel) {
             self.mode = Mode::Rename { id: s.id.clone(), input: s.title.clone().unwrap_or_default() };
         }
     }
 
-    /// `d`: delete the selected session, else the card under the cursor, else
-    /// the shown post (a post's only card deletes the post), once `y` confirms.
-    fn start_delete(&mut self) {
+    /// `D`: delete the selected session; `d`: the card under the cursor, else the
+    /// shown post (a post's only card deletes the post). `y` confirms.
+    fn start_delete(&mut self, session: bool) {
         let clean = |t: &str| crate::sanitize::sanitize(t).into_owned();
         let card = match self.hit_at_cursor() {
             (Some(_), Hit::Card(c) | Hit::Node(c, _)) => Some(c),
             _ => None,
         };
-        let doomed = match self.rows().get(self.sel) {
-            Some(Row::Session(i)) => self.sessions.get(*i).map(|s| {
+        let doomed = match session.then(|| self.sessions.get(self.sel)).flatten() {
+            Some(s) => Some({
                 (format!("session “{}”", clean(s.title.as_deref().unwrap_or(&s.agent))), StageRequest::SessionDelete(s.id.clone()))
             }),
-            _ => {
+            None if session => return,
+            None => {
                 let Some(p) = self.shown.as_ref().and_then(|id| self.posts.iter().find(|p| &p.id == id)).cloned() else { return };
                 let cards = self.shown_cards().map_or(0, |c| c.len());
                 match card.filter(|_| cards > 1) {
@@ -762,12 +746,18 @@ impl App {
         let page = self.page() as isize;
         match k.code {
             KeyCode::Char('q') => vec![Effect::Quit],
-            KeyCode::Char('j') => self.select_row(self.sel + 1, false),
-            KeyCode::Char('k') => self.select_row(self.sel.saturating_sub(1), false),
-            KeyCode::Enter => match self.rows().get(self.sel) {
-                Some(Row::Session(i)) if self.open.as_ref() != Some(&self.sessions[*i].id) => {
-                    self.select_row(self.sel, true)
-                }
+            KeyCode::Char('j') => {
+                self.step_post(true);
+                vec![]
+            }
+            KeyCode::Char('k') => {
+                self.step_post(false);
+                vec![]
+            }
+            KeyCode::Char('J') => self.select_session(self.sel + 1, false),
+            KeyCode::Char('K') => self.select_session(self.sel.saturating_sub(1), false),
+            KeyCode::Enter => match self.sessions.get(self.sel) {
+                Some(s) if self.open.as_ref() != Some(&s.id) => self.select_session(self.sel, true),
                 _ => {
                     let hit = self.hit_at_cursor();
                     self.toggle(hit);
@@ -818,8 +808,8 @@ impl App {
                 self.start_rename();
                 vec![]
             }
-            KeyCode::Char('d') => {
-                self.start_delete();
+            KeyCode::Char(c @ ('d' | 'D')) => {
+                self.start_delete(c == 'D');
                 vec![]
             }
             _ => vec![],
@@ -949,7 +939,7 @@ impl App {
             }
             MouseEventKind::Down(MouseButton::Left) if inside(g.sidebar) => {
                 let row = (m.row - g.sidebar.y) as usize + ui::sidebar_offset(self, g.sidebar.height);
-                self.select_row(row, true)
+                self.select_session(row, true)
             }
             // In the feed: press starts a selection, drag extends it, release
             // copies it; a press and release in one place is a click.
@@ -1061,10 +1051,7 @@ impl App {
         match r {
             Reply::Saved => return fx,
             Reply::Sessions(sessions) => {
-                let selected = self.rows().get(self.sel).copied().and_then(|r| match r {
-                    Row::Session(i) => self.sessions.get(i).map(|s| (true, s.id.0.clone())),
-                    Row::Post(i) => self.posts.get(i).map(|p| (false, p.id.0.clone())),
-                });
+                let selected = self.sessions.get(self.sel).map(|s| s.id.clone());
                 self.sessions = sessions;
                 self.remembered.retain(|id, _| self.sessions.iter().any(|s| &s.id == id));
                 // The open session was deleted: drop it and open the newest.
@@ -1084,15 +1071,11 @@ impl App {
                     if let Some(id) = target {
                         fx.extend(self.open_session(id));
                     }
-                } else if let Some((is_session, id)) = selected {
-                    // Keep the selection on the same thing as rows move.
-                    let rows = self.rows();
-                    if let Some(row) = rows.iter().position(|r| match r {
-                        Row::Session(i) => is_session && self.sessions[*i].id.0 == id,
-                        Row::Post(i) => !is_session && self.posts[*i].id.0 == id,
-                    }) {
-                        self.sel = row;
-                    }
+                } else {
+                    // Keep the selection on the same session as rows move.
+                    self.sel = selected
+                        .and_then(|id| self.sessions.iter().position(|s| s.id == id))
+                        .unwrap_or(self.sel.min(self.sessions.len().saturating_sub(1)));
                 }
             }
             Reply::Hits(query, found) => {
@@ -1136,10 +1119,7 @@ impl App {
                     if self.follow {
                         self.jump = Some(id.clone());
                     }
-                    fx.extend(self.show(id.clone()));
-                    if let Some(row) = self.row_of_post(&id) {
-                        self.sel = row;
-                    }
+                    fx.extend(self.show(id));
                 } else {
                     self.shown = None;
                 }
@@ -1322,8 +1302,7 @@ mod tests {
         assert_eq!(app.open.as_deref(), Some("s1"));
         assert_eq!(app.posts.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
         assert_eq!(app.shown.as_deref(), Some("b"));
-        assert_eq!(app.rows(), [Row::Session(0), Row::Post(0), Row::Post(1), Row::Session(1)]);
-        assert_eq!(app.sel, 2);
+        assert_eq!(app.sel, 0);
         assert!(app.shown_cards().is_some());
     }
 
@@ -1337,21 +1316,21 @@ mod tests {
     }
 
     #[test]
-    fn jk_moves_across_sessions_and_posts() {
+    fn jk_moves_posts_and_shift_jk_sessions() {
         let db = fake();
         let mut app = booted(&db);
         let fx = app.update(key(KeyCode::Char('k')));
         assert_eq!(app.shown.as_deref(), Some("a"));
-        // The feed loaded every post when the session opened, so picking one asks for nothing.
+        let first = app.feed().starts[0];
+        assert_eq!(app.cursor, first);
+        // The feed loaded every post when the session opened, so moving asks for nothing.
         assert!(requests(&fx).is_empty());
-        assert!(app.loaded.contains_key(&(PostId::from("a"), 1)));
-        app.update(key(KeyCode::Char('k')));
-        assert_eq!(app.rows()[app.sel], Row::Session(0));
-        // j past the posts lands on session 2; enter opens it.
-        for _ in 0..3 {
-            app.update(key(KeyCode::Char('j')));
-        }
-        assert_eq!(app.rows()[app.sel], Row::Session(1));
+        app.update(key(KeyCode::Char('j')));
+        assert_eq!(app.shown.as_deref(), Some("b"));
+        // J moves the sidebar to session 2; enter opens it.
+        app.update(key(KeyCode::Char('J')));
+        assert_eq!(app.sel, 1);
+        assert_eq!(app.open.as_deref(), Some("s1"));
         let fx = app.update(key(KeyCode::Enter));
         assert_eq!(requests(&fx), [StageRequest::PostList("s2".into()), StageRequest::CommentList("s2".into())]);
         serve(&mut app, fx, &db);
@@ -1559,15 +1538,14 @@ mod tests {
         app.update(key(KeyCode::Char('x')));
         let rename = SessionRenameArgs { id: "s1".into(), title: "sx".into() };
         assert_eq!(requests(&app.update(key(KeyCode::Enter))), [StageRequest::SessionRename(rename)]);
-        // On a session row, d deletes the session; once it's gone the next one opens.
-        app.sel = 0;
-        app.update(key(KeyCode::Char('d')));
+        // D deletes the selected session; once it's gone the next one opens.
+        app.update(key(KeyCode::Char('D')));
         assert_eq!(requests(&app.update(key(KeyCode::Char('y')))), [StageRequest::SessionDelete("s1".into())]);
         db.sessions.remove(0);
         let ev = Event { seq: 12, kind: "session-deleted".into(), path: None, version: None, id: Some("s1".into()), session: Some("s1".into()) };
         let fx = app.update(Msg::Event(ev));
         serve(&mut app, fx, &db);
         assert_eq!((app.open.as_deref(), app.shown.as_deref()), (Some("s2"), Some("z")));
-        assert_eq!(app.rows(), [Row::Session(0), Row::Post(0)]);
+        assert_eq!((app.sel, app.posts.len()), (0, 1));
     }
 }
