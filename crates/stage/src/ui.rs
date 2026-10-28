@@ -9,7 +9,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Mode, Row};
+use crate::app::{App, Mode};
 
 /// Dim text (versions, metadata, key descriptions).
 pub const BORDER: Color = Color::Rgb(0x7f, 0x84, 0x9c);
@@ -243,10 +243,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             Some(t) => vec![Span::styled(format!(" {t}"), Style::new().fg(YELLOW))],
             None => chips(&[
                 ("j/k", "post"),
+                ("J/K", "session"),
                 ("↑↓", "scroll"),
                 ("enter", "fold"),
                 ("/", "search"),
                 ("c", "comment"),
+                ("r", "rename"),
+                ("d", "delete"),
                 (":", "command"),
                 ("q", "quit"),
             ]),
@@ -257,6 +260,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             prompt(&format!("comment on “{}”", clip(&on, 30)), input, &[("enter", "send"), ("esc", "cancel")])
         }
         Mode::Command { input } => prompt(":", input, &[("enter", "run"), ("esc", "cancel")]),
+        Mode::Rename { input, .. } => prompt("rename session", input, &[("enter", "save"), ("esc", "cancel")]),
+        Mode::Delete { what, .. } => {
+            let mut spans = vec![Span::styled(format!(" delete {}? ", clip(what, 50)), bold().fg(RED))];
+            spans.extend(chips(&[("y", "delete"), ("any key", "cancel")]).into_iter().skip(1));
+            spans
+        }
     };
     f.render_widget(bar(keys, g.keybar.width, BAR), g.keybar);
 }
@@ -322,48 +331,20 @@ fn sidebar(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let offset = sidebar_offset(app, area.height);
-    for (i, row) in app.rows().into_iter().enumerate().skip(offset).take(area.height as usize) {
+    for (i, s) in app.sessions.iter().enumerate().skip(offset).take(area.height as usize) {
         let selected = i == app.sel;
         let mark = if selected { Span::styled("▌", Style::new().fg(BLUE)) } else { Span::raw(" ") };
         let row_bg = if selected { Style::new().bg(SELECTED) } else { Style::new() };
-        let line = match row {
-            // A session is a section label, like the demo's POSTS heading.
-            Row::Session(s) => {
-                let s = &app.sessions[s];
-                let open = app.open.as_ref() == Some(&s.id);
-                let title = crate::sanitize::sanitize(s.title.as_deref().unwrap_or(&s.agent)).into_owned();
-                let dot = if app.unread.contains(&s.id) { " ●" } else { "" };
-                let room = w.saturating_sub(2 + dot.width());
-                let style = if open { bold().fg(TEXT) } else { dim() };
-                Line::from(vec![
-                    mark,
-                    Span::styled(format!("{:<room$}", clip(&title, room)), style.patch(row_bg)),
-                    Span::styled(format!("{dot} "), Style::new().fg(MAUVE).patch(row_bg)),
-                ])
-            }
-            Row::Post(p) => {
-                let p = &app.posts[p];
-                let shown = app.shown.as_ref() == Some(&p.id);
-                let comments = app.comments.iter().filter(|c| c.post.as_ref() == Some(&p.id)).count();
-                let version = format!("v{}", p.version);
-                let count = if comments > 0 { format!(" ●{comments}") } else { String::new() };
-                let room = w.saturating_sub(3 + version.width() + count.width());
-                let title = crate::sanitize::sanitize(&p.title).into_owned();
-                let title_style = match (selected || shown, app.unseen.contains(&p.id)) {
-                    (true, _) => bold().fg(TEXT),
-                    (false, true) => Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
-                    (false, false) => Style::new().fg(TEXT),
-                };
-                let version_style = if app.unseen.contains(&p.id) { Style::new().fg(MAUVE) } else { dim() };
-                Line::from(vec![
-                    mark,
-                    Span::styled(format!("{:<room$} ", clip(&title, room)), title_style.patch(row_bg)),
-                    Span::styled(version, version_style.patch(row_bg)),
-                    Span::styled(count, bold().fg(MAUVE).patch(row_bg)),
-                    Span::styled(" ", row_bg),
-                ])
-            }
-        };
+        let open = app.open.as_ref() == Some(&s.id);
+        let title = crate::sanitize::sanitize(s.title.as_deref().unwrap_or(&s.agent)).into_owned();
+        let dot = if app.unread.contains(&s.id) { " ●" } else { "" };
+        let room = w.saturating_sub(2 + dot.width());
+        let style = if open { bold().fg(TEXT) } else { dim() };
+        let line = Line::from(vec![
+            mark,
+            Span::styled(format!("{:<room$}", clip(&title, room)), style.patch(row_bg)),
+            Span::styled(format!("{dot} "), Style::new().fg(MAUVE).patch(row_bg)),
+        ]);
         lines.push(line);
     }
     if app.sessions.is_empty() {

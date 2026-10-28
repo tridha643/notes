@@ -10,10 +10,12 @@ stage --session <id>  # open one
 
 ## Keys
 
-`j/k` post · `↑↓` line · `⏎` fold/open · `space/b` page · `g/G` top/bottom · `/` search
-sessions · `c` comment (anchored to the selected lines on code and diff) · `v` older
-version · `o` open html in the browser · `:` commands (`open copy versions rerender help`) ·
-`q` quit.
+`j/k` next/previous post · `J/K` session · `↑↓` line · `⏎` fold, or open the selected session ·
+`space/b` page · `g/G` top/bottom · `/` search sessions · `c` comment (anchored to the selected
+lines on code and diff) · `r` rename the selected session · `d` delete the card under the
+cursor, else the shown post · `D` delete the selected session (deletes wait for `y`) · `v`
+older version · `o` open html in the browser · `:` commands (`open copy versions rerender
+help`) · `q` quit. The sidebar lists sessions only; a session's posts are in the feed.
 
 ## Structure
 
@@ -25,7 +27,9 @@ The code splits IO from decisions, so nearly everything is testable without a te
 - **[`cards.rs`](src/cards.rs)** builds a card once per (post, version) from `post-show` and
   `post-render`, then lays it out to the pane width with borders and folds.
 - **[`client.rs`](src/client.rs)**, the `StageClient`, can only call read verbs plus
-  `comment-new`. stage can't modify a post even if it has a bug.
+  `comment-new`, `session-rename`, `session-delete`, `post-delete` and `post-part rm`. stage
+  can't add to or change a post even if it has a bug, and it deletes only after the user
+  presses `y`.
 - **[`main.rs`](src/main.rs)** handles the terminal and the event loop. crossterm's reader and
   the notesd `watch` stream feed one channel, and the loop blocks on it, drains everything
   pending, then draws once. An idle stage never wakes, and a 240-key paste is one frame.
