@@ -1,5 +1,5 @@
-//! `StageClient`: the notesd verbs stage may call (reads, `comment-new`, `session-rename`
-//! and the session and post deletes), and nothing else.
+//! `StageClient`: the notesd verbs stage may call (reads, `comment-new`, `session-rename`,
+//! the session and post deletes and `post-part rm`), and nothing else.
 //! Requests go over one connection; `watch` holds its own.
 
 use std::{
@@ -10,7 +10,7 @@ use std::{
 
 use notes_proto::{
     posts::{
-        AssetId, Comment, CommentListArgs, CommentNewArgs, IdArgs, Post, PostListArgs, PostRender, PostShowArgs,
+        AssetId, Comment, CommentListArgs, CommentNewArgs, IdArgs, PartOp, Post, PostListArgs, PostPartArgs, PostRender, PostShowArgs,
         PostSummary, Session, SessionHit, SessionId, SessionSearchArgs,
     },
     to_line, ErrorBody, ErrorCode, Event, Request, Response, Verb, WatchArgs, PROTOCOL_VERSION,
@@ -138,6 +138,10 @@ impl StageClient {
             StageRequest::SessionRename(a) => self.saved(Verb::SessionRename(a), req),
             StageRequest::SessionDelete(id) => self.saved(Verb::SessionDelete(IdArgs { id }), req),
             StageRequest::PostDelete(id) => self.saved(Verb::PostDelete(IdArgs { id }), req),
+            StageRequest::PartDelete(id, i) => {
+                let rm = PostPartArgs { id, op: PartOp::Rm, target: Some(i.to_string()), part: None };
+                self.saved(Verb::PostPart(rm), req)
+            }
             StageRequest::CardCols(n) => {
                 let set = notes_proto::posts::SettingSetArgs { key: notes_proto::posts::STAGE_CARD_COLS.into(), value: n.to_string() };
                 self.saved(Verb::SettingSet(set), req)

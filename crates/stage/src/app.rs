@@ -83,6 +83,8 @@ pub enum StageRequest {
     SessionRename(SessionRenameArgs),
     SessionDelete(SessionId),
     PostDelete(PostId),
+    /// Remove one part (card) of a post's latest version: `post-part rm`.
+    PartDelete(PostId, usize),
     /// Record the card's text width for agents (`STAGE_CARD_COLS`).
     CardCols(u16),
 }
@@ -722,16 +724,34 @@ impl App {
         }
     }
 
-    /// `d`: delete the selected session, else the shown post, once `y` confirms.
+    /// `d`: delete the selected session, else the card under the cursor, else
+    /// the shown post (a post's only card deletes the post), once `y` confirms.
     fn start_delete(&mut self) {
         let clean = |t: &str| crate::sanitize::sanitize(t).into_owned();
+        let card = match self.hit_at_cursor() {
+            (Some(_), Hit::Card(c) | Hit::Node(c, _)) => Some(c),
+            _ => None,
+        };
         let doomed = match self.rows().get(self.sel) {
             Some(Row::Session(i)) => self.sessions.get(*i).map(|s| {
                 (format!("session “{}”", clean(s.title.as_deref().unwrap_or(&s.agent))), StageRequest::SessionDelete(s.id.clone()))
             }),
-            _ => self.shown.as_ref().and_then(|id| self.posts.iter().find(|p| &p.id == id)).map(|p| {
-                (format!("post “{}”", clean(&p.title)), StageRequest::PostDelete(p.id.clone()))
-            }),
+            _ => {
+                let Some(p) = self.shown.as_ref().and_then(|id| self.posts.iter().find(|p| &p.id == id)).cloned() else { return };
+                let cards = self.shown_cards().map_or(0, |c| c.len());
+                match card.filter(|_| cards > 1) {
+                    // Card indexes are the shown version's; post-part edits the latest.
+                    Some(_) if self.shown_version() != Some(p.version) => {
+                        self.toast = Some("cards delete from the latest version (v cycles back to it)".into());
+                        return;
+                    }
+                    Some(c) => {
+                        let label = self.shown_cards().and_then(|cs| cs.get(c)).map_or(String::new(), |c| c.label.clone());
+                        Some((format!("card “{label}” from “{}”", clean(&p.title)), StageRequest::PartDelete(p.id.clone(), c)))
+                    }
+                    None => Some((format!("post “{}”", clean(&p.title)), StageRequest::PostDelete(p.id.clone()))),
+                }
+            }
         };
         if let Some((what, request)) = doomed {
             self.mode = Mode::Delete { what, request };
@@ -1259,7 +1279,8 @@ mod tests {
                 StageRequest::CardCols(_)
                 | StageRequest::SessionRename(_)
                 | StageRequest::SessionDelete(_)
-                | StageRequest::PostDelete(_) => Reply::Saved,
+                | StageRequest::PostDelete(_)
+                | StageRequest::PartDelete(..) => Reply::Saved,
                 StageRequest::SessionSearch(a) => Reply::Hits(
                     a.query.clone(),
                     self.sessions.iter().filter(|s| s.id.contains(a.query.as_str())).map(|s| SessionHit { session: s.clone(), post: None, text: None }).collect(),
@@ -1520,6 +1541,18 @@ mod tests {
         assert!(requests(&app.update(key(KeyCode::Char('n')))).is_empty());
         app.update(key(KeyCode::Char('d')));
         assert_eq!(requests(&app.update(key(KeyCode::Char('y')))), [StageRequest::PostDelete("b".into())]);
+        // With the cursor on one of b's two cards, d deletes that card; with one card, the post.
+        let two = Post { parts: vec![Part::Markdown { markdown: "x".into(), id: None }; 2], ..post("b", "s1", 2, "") };
+        let r = PostRender { id: "b".into(), version: 2, parts: vec![notes_proto::posts::PartRender::Native; 2] };
+        app.loaded.get_mut(&(PostId::from("b"), 2)).unwrap().cards = Some(build_cards(&two, &r));
+        app.loaded.get_mut(&(PostId::from("b"), 2)).unwrap().post = Some(two);
+        app.views.get_mut(&PostId::from("b")).unwrap().laid = None;
+        app.feed = None;
+        let b = app.posts.iter().position(|p| p.id == "b").unwrap();
+        app.cursor = app.feed().starts[b] + 2;
+        assert_eq!(app.hit_at_cursor(), (Some(b), Hit::Card(0)));
+        app.update(key(KeyCode::Char('d')));
+        assert_eq!(requests(&app.update(key(KeyCode::Char('y')))), [StageRequest::PartDelete("b".into(), 0)]);
         // r renames the open session, starting from its title.
         app.update(key(KeyCode::Char('r')));
         app.update(key(KeyCode::Backspace));
