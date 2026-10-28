@@ -21,7 +21,7 @@ startup dominates.
 - Each case gets 5 excluded warmups, then 200 samples (50 for `move`). Percentiles are
   nearest rank. Write verbs run against the same vault, so later cases see slightly larger
   notes and more history.
-- fff runs with the retest config from docs/fff-check.md (`watch: false`, content indexing,
+- fff runs with the retest config from docs/research/fff-check.md (`watch: false`, content indexing,
   mmap cache, `FFFMode::Ai`). One change: `time_budget_ms: 0`, so every search runs to
   completion, as docs/cli-spec.md requires. Fuzzy only runs with `fuzzy: true`.
 
@@ -121,7 +121,7 @@ The process has 12 threads at the end (`ps -M`):
 - main, blocked in `accept`
 - `notes-vault-kqueue`, in `kevent` with a NULL timeout
 - `notesd-frecency`, in a channel `recv`
-- fff's 5 + 4 Rayon pool threads, in untimed condvar waits (docs/fff-check.md)
+- fff's 5 + 4 Rayon pool threads, in untimed condvar waits (docs/research/fff-check.md)
 
 An open watch adds two threads: one in an untimed condvar wait for new events, and one
 blocked in `read` to notice the client hanging up. Neither shows up in the counters. Nothing

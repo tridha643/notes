@@ -3,7 +3,18 @@
 # launchd owns the socket and starts notesd on the first connection; nothing runs before that.
 set -eu
 cd "$(dirname "$0")/.."
-. "$HOME/.cargo/env"
+case "$(uname -s)" in
+  Darwin) ;;
+  Linux)
+    echo "notesd doesn't run on Linux yet: it needs kqueue and launchd, and stage-helper needs WebKit." >&2
+    echo "See README.md#linux for what a port involves." >&2
+    exit 1 ;;
+  *) echo "unsupported OS: $(uname -s)" >&2; exit 1 ;;
+esac
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+for tool in cargo swift; do
+  command -v "$tool" >/dev/null || { echo "missing $tool: install Rust (https://rustup.rs) and Xcode" >&2; exit 1; }
+done
 cargo build --release -p notesd -p notes-cli -p stage
 bin="$HOME/.local/bin"
 support="$HOME/Library/Application Support/Notes"

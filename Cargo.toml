@@ -1,3 +1,5 @@
 [workspace]
 resolver = "2"
 members = ["crates/*", "spikes/fff-check"]
+# The fff spike builds only on request (`cargo build -p fff-check`).
+default-members = ["crates/*"]
