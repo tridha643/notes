@@ -10,3 +10,8 @@ before calling a feature verified.
 | Scrolling to visuals that weren't on screen | [scroll.md](scroll.md) |
 | Card focus (`z`, `Esc`) | [card-focus.md](card-focus.md) |
 | Sidebar toggle (`s`) | [sidebar.md](sidebar.md) |
+
+Heavy diagrams: `scripts/heavy.py` makes a "stage verify heavy" session (real charts from
+pstack's /statechart corpus, an 80-state statechart, a 160-node architecture flowchart, a
+30-class diagram). Drive any feature above against it too; pele lays these out far wider
+than the card (DieHard: 2280 CSS px), so check text size, not only `one_to_one`.
