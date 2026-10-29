@@ -44,7 +44,7 @@ pub enum Gfx {
 pub type RasterTarget = (u32, u32, (u16, u16), Option<ZoomView>);
 
 /// CSS px → device px for helper renders (Retina).
-const SCALE: f64 = 2.0;
+pub const SCALE: f64 = 2.0;
 /// Limit very large diagrams without shrinking ordinary tall ones to the viewport.
 const MAX_MERMAID_HEIGHT_PX: u32 = 4096;
 /// Diagram pixels the terminal holds for stage. Past this, the diagrams shown least
@@ -365,7 +365,7 @@ impl Gallery {
     }
 
     fn html_size(&self) -> (f64, f64) {
-        (self.target.width_px as f64 / SCALE, self.target.max_height_px as f64 / SCALE)
+        (self.target.width_px as f64 / SCALE, self.target.html_height_px as f64 / SCALE)
     }
 
     fn resize_pages(&mut self) {
@@ -954,7 +954,7 @@ mod tests {
     #[test]
     fn html_frame_from_before_a_resize_is_never_transmitted() {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 800, max_height_px: 400, cell_px: (1, 1) });
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 800, max_height_px: 400, cell_px: (1, 1), html_height_px: 400 });
         let key: VisualKey = ("page".into(), 1, 0);
         gallery.pages.insert(9, key.clone());
         let mut out = Vec::new();
@@ -969,7 +969,7 @@ mod tests {
     #[test]
     fn live_frames_reuse_the_placed_pixel_rect() {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut g = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 660, max_height_px: 360, cell_px: (10, 20) });
+        let mut g = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 660, max_height_px: 360, cell_px: (10, 20), html_height_px: 360 });
         let key: VisualKey = ("p".into(), 1, 0);
         g.pages.insert(9, key.clone());
         let frame = |n: u64| Gfx::Helper(format!(r#"{{"id":9,"frame":{n},"shm":"/stg-test-{n}","w":660,"h":360}}"#));
@@ -985,7 +985,7 @@ mod tests {
     #[test]
     fn resized_html_keeps_old_pixels_until_the_card_moves_to_its_new_width() {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 600, max_height_px: 400, cell_px: (1, 1) });
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 600, max_height_px: 400, cell_px: (1, 1), html_height_px: 400 });
         let key: VisualKey = ("page".into(), 1, 0);
         gallery.pages.insert(9, key.clone());
         let frame = |number, width| Gfx::Helper(format!(r#"{{"id":9,"frame":{number},"shm":"/stg-test-{number}","w":{width},"h":200}}"#));
@@ -1016,7 +1016,7 @@ mod tests {
         // z→z with the sidebar shown: the full-width raster is still on screen in the
         // normal column (same cell rect) when the normal-width one lands.
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 950, max_height_px: 400, cell_px: (10, 20) });
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 950, max_height_px: 400, cell_px: (10, 20), html_height_px: 400 });
         let key: VisualKey = ("diagram".into(), 1, 0);
         let shms: Vec<String> = [(950, 400), (690, 300)].iter().map(|(w, h)| kitty::shm_write(&vec![0; w * h * 4]).unwrap()).collect();
         let raster = |shm: &str, w, h| Gfx::Raster { key: key.clone(), made_for: (950, MAX_MERMAID_HEIGHT_PX, (10, 20), None), done: Ok((shm.to_owned(), w, h)) };
@@ -1048,7 +1048,7 @@ mod tests {
     #[test]
     fn only_diagrams_on_screen_rasterize_and_only_the_focused_one_while_focused() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let normal = Target { width_px: 100, max_height_px: 100, cell_px: (1, 1) };
+        let normal = Target { width_px: 100, max_height_px: 100, cell_px: (1, 1), html_height_px: 100 };
         let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), normal);
         let (first, second, off): (VisualKey, VisualKey, VisualKey) = (("first".into(), 1, 0), ("second".into(), 1, 0), ("off".into(), 1, 0));
         let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="#89b4fa"/></svg>"##;
@@ -1093,7 +1093,7 @@ mod tests {
         // Vector: zooming re-rasterizes as large as the pane allows (width and height, so
         // nothing to scroll) instead of stopping at 2x the diagram's own size.
         let (tx, rx) = std::sync::mpsc::channel();
-        let target = Target { width_px: 1000, max_height_px: 400, cell_px: (1, 1) };
+        let target = Target { width_px: 1000, max_height_px: 400, cell_px: (1, 1), html_height_px: 400 };
         let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), target);
         let key: VisualKey = ("small".into(), 1, 0);
         gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
@@ -1113,7 +1113,7 @@ mod tests {
     #[test]
     fn closing_focus_puts_the_feed_pixels_back_without_a_new_raster() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let target = Target { width_px: 1000, max_height_px: 400, cell_px: (1, 1) };
+        let target = Target { width_px: 1000, max_height_px: 400, cell_px: (1, 1), html_height_px: 400 };
         let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), target);
         let key: VisualKey = ("small".into(), 1, 0);
         gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
@@ -1144,7 +1144,7 @@ mod tests {
     #[test]
     fn a_zoom_made_ahead_shows_in_the_first_focused_frame() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let feed = Target { width_px: 800, max_height_px: 400, cell_px: (1, 1) };
+        let feed = Target { width_px: 800, max_height_px: 400, cell_px: (1, 1), html_height_px: 400 };
         let focus = Target { width_px: 1000, ..feed };
         let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), feed);
         let key: VisualKey = ("chart".into(), 1, 0);
@@ -1164,7 +1164,7 @@ mod tests {
     #[test]
     fn diagrams_past_the_budget_are_dropped_least_recent_first_and_come_back() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let target = Target { width_px: 4096, max_height_px: 400, cell_px: (1, 1) };
+        let target = Target { width_px: 4096, max_height_px: 400, cell_px: (1, 1), html_height_px: 400 };
         let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), target);
         // 16 MB each: nine of them are past the 128 MB budget.
         let keys: Vec<VisualKey> = (0..9).map(|i| (format!("d{i}").into(), 1, 0)).collect();
@@ -1191,7 +1191,7 @@ mod tests {
         // Found by the stage-pixels model: z, z before a draw, then z again showed
         // zoomed pixels squeezed into the feed layout, because the app forgot the size.
         let (tx, rx) = std::sync::mpsc::channel();
-        let feed = Target { width_px: 800, max_height_px: 400, cell_px: (1, 1) };
+        let feed = Target { width_px: 800, max_height_px: 400, cell_px: (1, 1), html_height_px: 400 };
         let focus = Target { width_px: 1000, ..feed };
         let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), feed);
         let key: VisualKey = ("chart".into(), 1, 0);
@@ -1227,7 +1227,7 @@ mod tests {
     #[test]
     fn resize_cannot_replace_crisp_pixels_with_an_older_raster() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let at = |width_px| Target { width_px, max_height_px: 100, cell_px: (1, 1) };
+        let at = |width_px| Target { width_px, max_height_px: 100, cell_px: (1, 1), html_height_px: 100 };
         let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), at(120));
         let key: VisualKey = ("diagram".into(), 1, 0);
         gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
@@ -1249,7 +1249,7 @@ mod tests {
     #[test]
     fn a_dropped_raster_is_asked_for_again_when_its_width_comes_back() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let at = |width_px| Target { width_px, max_height_px: 100, cell_px: (1, 1) };
+        let at = |width_px| Target { width_px, max_height_px: 100, cell_px: (1, 1), html_height_px: 100 };
         let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), at(100));
         let key: VisualKey = ("diagram".into(), 1, 0);
         gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());

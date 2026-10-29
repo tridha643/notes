@@ -142,8 +142,9 @@ impl StageClient {
                 let rm = PostPartArgs { id, op: PartOp::Rm, target: Some(i.to_string()), part: None };
                 self.saved(Verb::PostPart(rm), req)
             }
-            StageRequest::CardCols(n) => {
-                let set = notes_proto::posts::SettingSetArgs { key: notes_proto::posts::STAGE_CARD_COLS.into(), value: n.to_string() };
+            StageRequest::Space(space) => {
+                let value = serde_json::to_string(&space).expect("plain numbers");
+                let set = notes_proto::posts::SettingSetArgs { key: notes_proto::posts::STAGE_SPACE.into(), value };
                 self.saved(Verb::SettingSet(set), req)
             }
         }

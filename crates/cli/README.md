@@ -32,8 +32,10 @@ on that, so two conversations in the same folder never share a thread. `NOTES_OW
 
 After `notes post`, comments the user left since the last call print on stderr as
 `feedback:` lines, so the agent sees them without polling. [`lint.rs`](src/lint.rs) checks a post
-against [`guide.md`](src/guide.md) before sending and prints `warning:` lines. It never blocks
-the post.
+against [`guide.md`](src/guide.md) and the space stage last reported for its cards (the
+`stage.space` setting). A post that can't fit the card (a table wider than it, an html page wider
+or taller than its viewport) is refused with `error:` lines and exit 2; style slips only print
+`warning:` lines. Until stage has reported a space, overflow only warns too.
 
 `agent-howto` and `guide` are compiled into the binary, so the instructions an agent reads
 always match the CLI it's running.

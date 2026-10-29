@@ -9,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButto
 use notes_proto::{
     posts::{
         Comment, CommentNewArgs, Part, Post, PostId, PostRender, PostShowArgs, PostSummary, Session,
-        SessionHit, SessionId, SessionRenameArgs, SessionSearchArgs,
+        SessionHit, SessionId, SessionRenameArgs, SessionSearchArgs, StageSpace,
     },
     ErrorBody, ErrorCode, Event,
 };
@@ -54,6 +54,8 @@ pub enum VisualState {
 pub struct Target {
     pub width_px: u32,
     pub max_height_px: u32,
+    /// An html page's height cap: the whole feed below the post's title.
+    pub html_height_px: u32,
     /// Cell size in px: rasters are padded to whole cells so kitty never resamples them.
     pub cell_px: (u16, u16),
 }
@@ -106,8 +108,8 @@ pub enum StageRequest {
     PostDelete(PostId),
     /// Remove one part (card) of a post's latest version: `post-part rm`.
     PartDelete(PostId, usize),
-    /// Record the card's text width for agents (`STAGE_CARD_COLS`).
-    CardCols(u16),
+    /// Record the room a card gives a post, for agents (`STAGE_SPACE`).
+    Space(StageSpace),
 }
 
 #[derive(Debug)]
@@ -220,8 +222,8 @@ pub struct App {
     /// Whether the session sidebar is hidden outside card focus.
     pub sidebar_hidden: bool,
     pub size: (u16, u16),
-    /// The card width last sent to notesd, so a resize only writes on change.
-    card_cols: u16,
+    /// The space last sent to notesd, so a resize only writes on change.
+    space: Option<StageSpace>,
     pub cell_px: (u16, u16),
     pub kitty: bool,
     pub toast: Option<String>,
@@ -302,7 +304,7 @@ impl App {
             mode: Mode::Nav,
             sidebar_hidden: false,
             size: (80, 24),
-            card_cols: 0,
+            space: None,
             cell_px: (8, 16),
             kitty: false,
             toast: None,
@@ -360,6 +362,7 @@ impl App {
         Target {
             width_px: inner * self.cell_px.0 as u32,
             max_height_px: rows.max(1) as u32 * self.cell_px.1 as u32,
+            html_height_px: self.page().saturating_sub(3).max(1) as u32 * self.cell_px.1 as u32,
             cell_px: self.cell_px,
         }
     }
@@ -445,7 +448,7 @@ impl App {
             Msg::Resize(w, h) => {
                 self.size = (w, h);
                 let mut fx = vec![Effect::Redraw];
-                fx.extend(self.report_card_width());
+                fx.extend(self.report_space());
                 fx
             }
             Msg::CellPx(px) => {
@@ -453,7 +456,9 @@ impl App {
                     return vec![];
                 }
                 self.cell_px = px;
-                vec![Effect::Redraw]
+                let mut fx = vec![Effect::Redraw];
+                fx.extend(self.report_space());
+                fx
             }
             Msg::Event(e) => self.event(e),
             Msg::Reply(r) => self.reply(r),
@@ -694,6 +699,7 @@ impl App {
                     // a focused one shows its pixels 1:1 until the full-width raster lands.
                     let rows = match &cards[c].body {
                         CardBody::Visual { source: VisualSource::Mermaid(_), .. } => u16::MAX,
+                        CardBody::Visual { source: VisualSource::Html(_), .. } => page.saturating_sub(3),
                         _ => rows,
                     };
                     fit_cells((*w, *h), *max_scale, inner, rows, cell)
@@ -900,7 +906,7 @@ impl App {
         self.scroll = 0;
         self.cursor = 0;
         self.follow_cursor();
-        self.report_card_width()
+        self.report_space()
     }
 
     fn toggle_sidebar(&mut self) -> Vec<Effect> {
@@ -919,7 +925,7 @@ impl App {
             return vec![];
         }
         self.sidebar_hidden = hidden;
-        self.report_card_width()
+        self.report_space()
     }
 
     /// After each draw: a sidebar change still waiting on an HTML card that has since
@@ -935,7 +941,7 @@ impl App {
             self.sidebar_hidden = hidden;
             self.visuals.extend(self.pending_sidebar_frames.drain());
             self.visual_gen += 1;
-            fx.extend(self.report_card_width());
+            fx.extend(self.report_space());
             fx.push(Effect::Redraw);
         }
         fx.extend(self.request_visuals());
@@ -969,6 +975,7 @@ impl App {
         Target {
             width_px: inner * self.cell_px.0 as u32,
             max_height_px: self.page().saturating_sub(3).max(1) as u32 * self.cell_px.1 as u32,
+            html_height_px: self.page().saturating_sub(3).max(1) as u32 * self.cell_px.1 as u32,
             cell_px: self.cell_px,
         }
     }
@@ -994,15 +1001,24 @@ impl App {
         self.pending_sidebar = None;
         self.visuals.extend(self.pending_sidebar_frames.drain());
         self.visual_gen += 1;
-        self.report_card_width()
+        self.report_space()
     }
 
     /// A card's text width (the feed column less its border and padding), sent to notesd on change.
-    fn report_card_width(&mut self) -> Vec<Effect> {
-        let cols = ui::geometry_for(self).main.width.saturating_sub(5);
-        if cols == self.card_cols { return vec![]; }
-        self.card_cols = cols;
-        vec![Effect::Request(StageRequest::CardCols(cols))]
+    fn report_space(&mut self) -> Vec<Effect> {
+        let (cols, rows) = (ui::geometry_for(self).main.width.saturating_sub(5), self.page() as u16);
+        let css = |cells: u16, px: u16| (cells as f64 * px as f64 / crate::gallery::SCALE) as u32;
+        let space = StageSpace {
+            cols,
+            rows,
+            html_width: css(cols.max(1), self.cell_px.0),
+            html_height: css(rows.saturating_sub(3).max(1), self.cell_px.1),
+        };
+        if self.space == Some(space) {
+            return vec![];
+        }
+        self.space = Some(space);
+        vec![Effect::Request(StageRequest::Space(space))]
     }
 
     /// `z` focuses the card at the cursor; `z` or Escape restores the feed.
@@ -1012,7 +1028,7 @@ impl App {
         if self.pending_html_focus.take().is_some() { return vec![]; }
         if self.focused_card.is_some() {
             self.leave_focus();
-            return self.report_card_width();
+            return self.report_space();
         }
         let Some(key) = self.card_at_cursor() else { return vec![] };
         let Some(selected) = self.loaded.get(&(key.0.clone(), key.1)).and_then(|loaded| loaded.cards.as_ref()?.get(key.2)) else { return vec![] };
@@ -1604,7 +1620,7 @@ pub fn fit_cells((w, h): (u32, u32), max_scale: f32, cols: u16, rows: u16, (cw, 
         .min(rows.max(1) as f32 * ch as f32 / h as f32);
     Fit::Ready {
         cols: ((w as f32 * scale / cw as f32).ceil() as u16).clamp(1, cols.max(1)),
-        rows: ((h as f32 * scale / ch as f32).ceil() as u16).max(1),
+        rows: ((h as f32 * scale / ch as f32).ceil() as u16).clamp(1, rows.max(1)),
     }
 }
 
@@ -1670,7 +1686,7 @@ mod tests {
                     parts: vec![notes_proto::posts::PartRender::Native],
                 }),
                 StageRequest::CommentList(s) => Reply::Comments(s.clone(), vec![]),
-                StageRequest::CardCols(_)
+                StageRequest::Space(_)
                 | StageRequest::SessionRename(_)
                 | StageRequest::SessionDelete(_)
                 | StageRequest::PostDelete(_)
@@ -1762,7 +1778,7 @@ mod tests {
         let page = app.page() as u16;
         let slots = &app.feed().slots;
         assert!(slots[0].1.rows > page, "the Mermaid card must scroll instead of shrinking to half a screen");
-        assert!(slots[1].1.rows <= page / 2, "live HTML still fits within half a screen");
+        assert!(slots[1].1.rows > page / 2 && slots[1].1.rows <= page - 3, "live HTML gets the feed below its title, not half a screen");
     }
 
     #[test]
@@ -1961,7 +1977,7 @@ mod tests {
         let hidden = app.update(key(KeyCode::Char('s')));
         assert!(app.sidebar_hidden);
         assert_eq!(ui::geometry_for(&app).main.width, 100);
-        assert!(hidden.contains(&Effect::Request(StageRequest::CardCols(95))));
+        assert_eq!(reported_cols(&hidden), Some(95));
         term.draw(|f| ui::draw(f, &mut app)).unwrap();
         let click = Msg::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 2, row: 0, modifiers: KeyModifiers::NONE });
         app.update(click);
@@ -1993,7 +2009,7 @@ mod tests {
         let effects = app.update(key(KeyCode::Char('s')));
         assert!(!app.sidebar_hidden);
         assert_eq!(ui::geometry_for(&app).main, old_geometry);
-        assert!(!effects.iter().any(|e| matches!(e, Effect::Request(StageRequest::CardCols(_)))));
+        assert_eq!(reported_cols(&effects), None);
         app.after_draw();
         assert!(app.pending_sidebar.is_some(), "a redraw with the card still on screen keeps waiting");
         let wide = app.target().width_px;
@@ -2004,7 +2020,7 @@ mod tests {
         assert!(app.sidebar_hidden);
         assert_eq!(ui::geometry_for(&app).main.width, 100);
         assert_eq!(app.target().width_px, wide);
-        assert!(effects.contains(&Effect::Request(StageRequest::CardCols(95))));
+        assert_eq!(reported_cols(&effects), Some(95));
 
         term.draw(|f| ui::draw(f, &mut app)).unwrap();
         app.update(key(KeyCode::Char('s')));
@@ -2021,7 +2037,7 @@ mod tests {
         let effects = app.after_draw();
         assert!(app.pending_sidebar.is_none(), "scrolling away cannot leave the toggle waiting forever");
         assert!(app.sidebar_hidden, "and the toggle the user asked for still happens");
-        assert!(effects.contains(&Effect::Request(StageRequest::CardCols(95))));
+        assert_eq!(reported_cols(&effects), Some(95));
         term.draw(|f| ui::draw(f, &mut app)).unwrap();
         app.update(key(KeyCode::Char('s')));
         assert!(app.pending_sidebar.is_some());
@@ -2222,9 +2238,12 @@ mod tests {
     #[test]
     fn resize_is_exactly_one_redraw() {
         let mut app = booted(&fake());
-        // A new card width is reported to notesd once; a height change only redraws.
+        // A new card size is reported to notesd once; the same size again only redraws.
         let cols = ui::geometry((120, 40)).main.width - 5;
-        assert_eq!(app.update(Msg::Resize(120, 40)), [Effect::Redraw, Effect::Request(StageRequest::CardCols(cols))]);
+        let fx = app.update(Msg::Resize(120, 40));
+        assert_eq!((fx[0].clone(), reported_cols(&fx)), (Effect::Redraw, Some(cols)));
+        let Some(Effect::Request(StageRequest::Space(space))) = app.update(Msg::Resize(120, 50)).pop() else { panic!("taller pane not reported") };
+        assert_eq!((space.cols, space.rows, space.html_height), (cols, app.page() as u16, (app.page() as u32 - 3) * 16 / 2));
         assert_eq!(app.update(Msg::Resize(120, 50)), [Effect::Redraw]);
         assert_eq!(app.size, (120, 50));
     }
@@ -2251,6 +2270,13 @@ mod tests {
         serve(&mut app, fx, &db);
         assert!(app.unread.contains("s2"));
         assert_eq!(app.builds, builds + 1);
+    }
+
+    fn reported_cols(fx: &[Effect]) -> Option<u16> {
+        fx.iter().find_map(|e| match e {
+            Effect::Request(StageRequest::Space(s)) => Some(s.cols),
+            _ => None,
+        })
     }
 
     fn post_event(kind: &str, id: &str, version: u64) -> Msg {
