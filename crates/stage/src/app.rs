@@ -55,6 +55,8 @@ pub enum VisualState {
 pub struct Target {
     pub width_px: u32,
     pub max_height_px: u32,
+    /// Cell size in px: rasters are padded to whole cells so kitty never resamples them.
+    pub cell_px: (u16, u16),
 }
 
 /// A visual on screen this frame: top-left cell, size in cells, and how many
@@ -273,43 +275,68 @@ impl App {
         vec![Effect::Request(StageRequest::SessionList)]
     }
 
-    pub fn update(&mut self, msg: Msg) -> Vec<Effect> {
-        let mut fx = self.step(msg);
-        fx.extend(self.request_visuals());
-        fx
-    }
-
     /// Pixel budget for visual cards at the current pane size.
     pub fn target(&self) -> Target {
         let inner = ui::geometry(self.size).main.width.saturating_sub(5).max(1) as u32;
         Target {
             width_px: inner * self.cell_px.0 as u32,
             max_height_px: (self.page() as u32 / 2).max(1) * self.cell_px.1 as u32,
+            cell_px: self.cell_px,
         }
     }
 
-    /// Ask once for the pixels of each visual card in the open session's posts.
-    fn request_visuals(&mut self) -> Vec<Effect> {
+    /// Ask once for the pixels of the visual cards on screen and, once none of
+    /// those is still rendering, of the nearest one within a page above and
+    /// below, so off-screen diagrams never compete with visible ones for CPU.
+    /// `main` calls this after each draw, when the feed is laid out for what's shown.
+    pub fn request_visuals(&mut self) -> Vec<Effect> {
+        let page = self.page();
+        self.feed();
+        let (scroll, Some((_, feed))) = (self.scroll, &self.feed) else { return vec![] };
+        let hits = &feed.hits;
+        let end = (scroll + page).min(hits.len());
+        let at = |i: usize| self.visual_key(hits[i]);
+        let mut want: Vec<VisualKey> = Vec::new();
+        for key in (scroll..end).filter_map(at) {
+            if !want.contains(&key) {
+                want.push(key);
+            }
+        }
+        let rendering = want.iter().any(|k| matches!(self.visuals.get(k), None | Some(VisualState::Pending)));
+        if !rendering {
+            want.extend((end..(end + page).min(hits.len())).find_map(at));
+            want.extend((scroll.saturating_sub(page)..scroll.min(hits.len())).rev().find_map(at));
+        }
         let target = self.target();
         let mut fx = Vec::new();
-        let posts: Vec<(PostId, u64)> =
-            self.posts.iter().filter_map(|p| Some((p.id.clone(), self.version_of(&p.id)?))).collect();
-        for (id, version) in posts {
-            let Some(cards) = self.loaded.get(&(id.clone(), version)).and_then(|l| l.cards.as_ref()) else { continue };
-            for (c, card) in cards.iter().enumerate() {
-                if let CardBody::Visual { source, .. } = &card.body {
-                    let key = (id.clone(), version, c);
-                    if !self.visuals.contains_key(&key) {
-                        self.visuals.insert(key.clone(), VisualState::Pending);
-                        fx.push(Effect::NeedVisual { key, source: source.clone(), target });
-                    }
-                }
+        for key in want {
+            if self.visuals.contains_key(&key) {
+                continue;
+            }
+            if let Some(source) = self.visual_source(&key) {
+                fx.push(Effect::NeedVisual { key: key.clone(), source: source.clone(), target });
+                self.visuals.insert(key, VisualState::Pending);
             }
         }
         fx
     }
 
-    fn step(&mut self, msg: Msg) -> Vec<Effect> {
+    /// The visual card a feed line belongs to, if it belongs to one.
+    fn visual_key(&self, (p, hit): (usize, Hit)) -> Option<VisualKey> {
+        let Hit::Card(c) = hit else { return None };
+        let id = &self.posts.get(p)?.id;
+        let key = (id.clone(), self.version_of(id)?, c);
+        self.visual_source(&key).map(|_| key)
+    }
+
+    fn visual_source(&self, (id, version, c): &VisualKey) -> Option<&VisualSource> {
+        match &self.loaded.get(&(id.clone(), *version))?.cards.as_ref()?.get(*c)?.body {
+            CardBody::Visual { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+
+    pub fn update(&mut self, msg: Msg) -> Vec<Effect> {
         match msg {
             Msg::Key(k) if k.kind != KeyEventKind::Release => {
                 self.toast = None;
@@ -1301,6 +1328,42 @@ mod tests {
         let start = app.start();
         serve(&mut app, start, db);
         app
+    }
+
+    #[test]
+    fn visuals_render_on_screen_first_then_their_nearest_neighbors() {
+        let mut app = booted(&fake());
+        let mut post = post("b", "s1", 2, "");
+        post.parts = (0..8).map(|i| Part::Mermaid { mermaid: format!("graph TD\nA{i}-->B"), id: None }).collect();
+        let render = PostRender { id: "b".into(), version: 2, parts: vec![notes_proto::posts::PartRender::Native; 8] };
+        app.loaded.get_mut(&("b".into(), 2)).unwrap().cards = Some(cards::build_cards(&post, &render));
+        app.views.get_mut(&PostId::from("b")).unwrap().laid = None;
+        app.feed = None;
+        // As `main` does: update, draw, then ask for what the drawn feed shows.
+        let needed = |app: &mut App, msg: Msg| -> Vec<usize> {
+            app.update(msg);
+            app.request_visuals().into_iter().filter_map(|e| match e { Effect::NeedVisual { key, .. } => Some(key.2), _ => None }).collect()
+        };
+        let first = needed(&mut app, Msg::Resize(100, 30));
+        let (scroll, page) = (app.scroll, app.page());
+        let shown: HashSet<usize> = app.feed().hits[scroll..scroll + page].iter().filter_map(|h| match h.1 { Hit::Card(c) => Some(c), _ => None }).collect();
+        assert!(!first.is_empty() && first.iter().all(|c| shown.contains(c)), "{first:?} vs on screen {shown:?}");
+        // Nothing off screen starts while an on-screen diagram is still rendering.
+        assert!(needed(&mut app, Msg::Resize(100, 30)).is_empty());
+        for &c in &first {
+            app.update(Msg::VisualReady { key: ("b".into(), 2, c), w: 80, h: 40, max_scale: 1.0 });
+        }
+        let mut asked: HashSet<usize> = first.iter().copied().collect();
+        asked.extend(needed(&mut app, Msg::Resize(100, 30)));
+        assert!(asked.len() <= first.len() + 2, "the nearest one above and below, not the whole session: {asked:?}");
+        // Scrolling to the end reaches the last diagram.
+        for _ in 0..8 {
+            asked.extend(needed(&mut app, key(KeyCode::Char('G'))));
+            for c in asked.clone() {
+                app.update(Msg::VisualReady { key: ("b".into(), 2, c), w: 80, h: 40, max_scale: 1.0 });
+            }
+        }
+        assert!(asked.contains(&7), "{asked:?}");
     }
 
     #[test]

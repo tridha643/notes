@@ -109,24 +109,29 @@ fn fonts() -> Arc<resvg::usvg::fontdb::Database> {
 }
 
 /// SVG → RGBA at up to 2× its CSS size, within the supplied pixel budget,
-/// on a transparent background so glass shows through.
-pub fn rasterize(svg: &str, width_px: u32, height_px: u32) -> Result<(Vec<u8>, u32, u32), String> {
+/// on a transparent background so glass shows through. The canvas is padded
+/// (diagram centered) to whole `cell` px, so kitty shows it 1:1 instead of
+/// stretching it to the cells it rounds up to.
+pub fn rasterize(svg: &str, width_px: u32, height_px: u32, (cw, ch): (u16, u16)) -> Result<(Vec<u8>, u32, u32), String> {
     let opt = resvg::usvg::Options { fontdb: fonts(), ..Default::default() };
     let tree = resvg::usvg::Tree::from_str(svg, &opt).map_err(|e| format!("svg: {e}"))?;
     let size = tree.size();
     let scale = (width_px as f32 / size.width()).min(height_px as f32 / size.height()).min(SCALE as f32);
     let (w, h) = (
-        ((size.width() * scale).ceil() as u32).min(width_px),
-        ((size.height() * scale).ceil() as u32).min(height_px),
+        ((size.width() * scale).ceil() as u32).clamp(1, width_px.max(1)),
+        ((size.height() * scale).ceil() as u32).clamp(1, height_px.max(1)),
     );
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(w.max(1), h.max(1)).ok_or("empty diagram")?;
-    resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+    let (cw, ch) = (cw.max(1) as u32, ch.max(1) as u32);
+    let (pw, ph) = (w.div_ceil(cw) * cw, h.div_ceil(ch) * ch);
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(pw, ph).ok_or("empty diagram")?;
+    let at = resvg::tiny_skia::Transform::from_scale(scale, scale).post_translate(((pw - w) / 2) as f32, ((ph - h) / 2) as f32);
+    resvg::render(&tree, at, &mut pixmap.as_mut());
     // tiny-skia is premultiplied; kitty wants straight RGBA.
     let rgba = pixmap.pixels().iter().flat_map(|p| {
         let c = p.demultiply();
         [c.red(), c.green(), c.blue(), c.alpha()]
     });
-    Ok((rgba.collect(), w.max(1), h.max(1)))
+    Ok((rgba.collect(), pw, ph))
 }
 
 /// One `STAGE_TRACE` line, when tracing.
@@ -347,9 +352,9 @@ impl Gallery {
         if target == self.target {
             return;
         }
-        let width_changed = target.width_px != self.target.width_px;
+        let rerender = (target.width_px, target.cell_px) != (self.target.width_px, self.target.cell_px);
         self.target = target;
-        if width_changed {
+        if rerender {
             self.raster_epoch += 1;
             for (key, svg) in self.svgs.clone() {
                 self.raster(key, svg);
@@ -372,10 +377,10 @@ impl Gallery {
     }
 
     fn raster(&self, key: VisualKey, svg: String) {
-        let (tx, width, epoch) = (self.tx.clone(), self.target.width_px, self.raster_epoch);
+        let (tx, width, cell, epoch) = (self.tx.clone(), self.target.width_px, self.target.cell_px, self.raster_epoch);
         thread::spawn(move || {
             let t0 = std::time::Instant::now();
-            let raster = rasterize(&svg, width, MAX_MERMAID_HEIGHT_PX);
+            let raster = rasterize(&svg, width, MAX_MERMAID_HEIGHT_PX, cell);
             if std::env::var_os("STAGE_HELPER_TRACE").is_some() {
                 eprintln!("resvg {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0);
             }
@@ -617,7 +622,7 @@ mod tests {
     #[test]
     fn live_frames_reuse_the_placed_pixel_rect() {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut g = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 660, max_height_px: 360 });
+        let mut g = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 660, max_height_px: 360, cell_px: (10, 20) });
         let key: VisualKey = ("p".into(), 1, 0);
         g.pages.insert(9, key.clone());
         let frame = |n: u64| Gfx::Helper(format!(r#"{{"id":9,"frame":{n},"shm":"/stg-test-{n}","w":660,"h":360}}"#));
@@ -633,22 +638,22 @@ mod tests {
     #[test]
     fn rasterizes_svg_at_the_card_width() {
         let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="#89b4fa"/></svg>"##;
-        let (px, w, h) = rasterize(svg, 150, 1000).unwrap();
+        let (px, w, h) = rasterize(svg, 150, 1000, (1, 1)).unwrap();
         assert_eq!((w, h), (150, 75));
         assert_eq!(&px[..4], &[0x89, 0xb4, 0xfa, 0xff]);
         // Never past 2× the SVG's own size or the explicit height budget.
-        assert_eq!(rasterize(svg, 1000, 1000).unwrap().1, 200);
-        assert_eq!(rasterize(svg, 1000, 40).unwrap().2, 40);
+        assert_eq!(rasterize(svg, 1000, 1000, (1, 1)).unwrap().1, 200);
+        assert_eq!(rasterize(svg, 1000, 40, (1, 1)).unwrap().2, 40);
     }
 
     #[test]
     fn resize_cannot_replace_crisp_pixels_with_an_older_raster() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 100, max_height_px: 100 });
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 100, max_height_px: 100, cell_px: (1, 1) });
         let key: VisualKey = ("diagram".into(), 1, 0);
         gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
-        gallery.retarget(Target { width_px: 120, max_height_px: 100 });
-        gallery.retarget(Target { width_px: 180, max_height_px: 100 });
+        gallery.retarget(Target { width_px: 120, max_height_px: 100, cell_px: (1, 1) });
+        gallery.retarget(Target { width_px: 180, max_height_px: 100, cell_px: (1, 1) });
         let jobs = [rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(), rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap()];
         let mut old = None;
         let mut latest = None;
@@ -670,7 +675,24 @@ mod tests {
     #[test]
     fn tall_mermaid_retains_card_width_instead_of_shrinking_to_viewport() {
         let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="650" height="816"><rect width="650" height="816"/></svg>"#;
-        let (_, w, h) = rasterize(svg, 700, MAX_MERMAID_HEIGHT_PX).unwrap();
+        let (_, w, h) = rasterize(svg, 700, MAX_MERMAID_HEIGHT_PX, (1, 1)).unwrap();
         assert_eq!((w, h), (700, 879));
+    }
+
+    #[test]
+    fn mermaid_fills_whole_cells_so_kitty_never_resamples() {
+        // 420×415.5 CSS px at 2× is 840×831; with 10×20 px cells that rounded up
+        // to 84×42 cells (840×840 px) and kitty stretched it ~1% vertically.
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="420" height="415.5"><rect width="420" height="415.5" fill="red"/></svg>"#;
+        let cell = (10, 20);
+        let (px, w, h) = rasterize(svg, 840, MAX_MERMAID_HEIGHT_PX, cell).unwrap();
+        assert_eq!((w, h), (840, 840));
+        // The padding is transparent: the last row was not drawn on.
+        assert!(px[((h - 1) * w * 4) as usize..].chunks(4).all(|p| p[3] == 0));
+        let crate::cards::Fit::Ready { cols, rows } = crate::app::fit_cells((w, h), 1.0, 84, u16::MAX, cell) else { panic!("fits") };
+        assert_eq!((cols as u32 * 10, rows as u32 * 20), (w, h), "one image px per screen px");
+        // A 25-row crop scrolled 3 rows in: exactly 25 cells of source pixels.
+        let p = crop(&Place { col: 0, row: 0, cols, rows: 25, src: (0, 3, 0, rows as u32) }, (w, h));
+        assert_eq!(p.src, (0, 60, 840, 500));
     }
 }
