@@ -36,7 +36,7 @@ pub enum Gfx {
     Helper(String),
     HelperExited,
     /// A mermaid diagram rasterized into shared memory (or why it couldn't be).
-    Raster { key: VisualKey, done: Result<(String, u32, u32), String> },
+    Raster { key: VisualKey, epoch: u64, done: Result<(String, u32, u32), String> },
 }
 
 /// CSS px → device px for helper renders (Retina).
@@ -77,6 +77,9 @@ pub struct Gallery {
     /// Mermaid SVG by visual, kept so a resize can rasterize it again crisply.
     svgs: HashMap<VisualKey, String>,
     target: Target,
+    focused: Option<VisualKey>,
+    /// Invalidates raster jobs started for an earlier focus or pane size.
+    raster_epoch: u64,
     cache: PathBuf,
     /// The session folder; assets are read straight from its `assets/` (notesd only writes it).
     stage: PathBuf,
@@ -162,6 +165,8 @@ impl Gallery {
             images: HashMap::new(),
             svgs: HashMap::new(),
             target,
+            focused: None,
+            raster_epoch: 0,
             cache,
             stage,
             trace: std::env::var_os("STAGE_TRACE").and_then(|p| std::fs::File::create(p).ok()),
@@ -335,15 +340,17 @@ impl Gallery {
         Ok(())
     }
 
-    /// The card width or pane height changed: re-render what depends on it.
-    pub fn retarget(&mut self, target: Target) {
-        if target == self.target {
+    /// Re-render only the focused Mermaid card when its full-width target changes.
+    /// Other cards retain their pixels until focus closes; then they render at
+    /// the normal target again. This avoids competing with the card the user sees.
+    pub fn retarget(&mut self, target: Target, focused: Option<&VisualKey>) {
+        if target == self.target && focused == self.focused.as_ref() {
             return;
         }
         self.target = target;
-        for (key, svg) in self.svgs.clone() {
-            self.raster(key, svg);
-        }
+        self.focused = focused.cloned();
+        self.raster_epoch += 1;
+        self.raster_target();
         let (width, max_height) = self.html_size();
         for page in self.pages.keys().copied().collect::<Vec<_>>() {
             let _ = self.send(json!({"op": "html-resize", "id": page, "width": width, "max_height": max_height, "scale": SCALE}));
@@ -360,8 +367,20 @@ impl Gallery {
         Ok(())
     }
 
+    fn raster_target(&self) {
+        if let Some(key) = &self.focused {
+            if let Some(svg) = self.svgs.get(key) {
+                self.raster(key.clone(), svg.clone());
+            }
+        } else {
+            for (key, svg) in &self.svgs {
+                self.raster(key.clone(), svg.clone());
+            }
+        }
+    }
+
     fn raster(&self, key: VisualKey, svg: String) {
-        let (tx, width, height) = (self.tx.clone(), self.target.width_px, self.target.max_height_px);
+        let (tx, width, height, epoch) = (self.tx.clone(), self.target.width_px, self.target.max_height_px, self.raster_epoch);
         thread::spawn(move || {
             let t0 = std::time::Instant::now();
             let raster = rasterize(&svg, width, height);
@@ -371,7 +390,7 @@ impl Gallery {
             let done = raster.and_then(|(px, w, h)| {
                 kitty::shm_write(&px).map(|shm| (shm, w, h)).map_err(|e| format!("shared memory: {e}"))
             });
-            let _ = tx.send(Msg::Gfx(Gfx::Raster { key, done }));
+            let _ = tx.send(Msg::Gfx(Gfx::Raster { key, epoch, done }));
         });
     }
 
@@ -443,8 +462,18 @@ impl Gallery {
                 msgs.extend(self.pages.drain().map(|(_, key)| Msg::VisualFailed { key, reason: "stage-helper stopped".into() }));
                 msgs
             }
-            Gfx::Raster { key, done } => match done {
-                Ok((shm, w, h)) => self.show(out, key, &shm, (w, h), None, None).into_iter().collect(),
+            Gfx::Raster { epoch, done, .. } if epoch != self.raster_epoch => {
+                if let Ok((shm, ..)) = done { kitty::unlink(&shm); }
+                vec![]
+            }
+            Gfx::Raster { key, done, .. } => match done {
+                Ok((shm, w, h)) => {
+                    // Even if the dimensions match, the focused preview is now
+                    // crisp and must return to its natural pixel scale.
+                    let ready = self.show(out, key.clone(), &shm, (w, h), None, None)
+                        .unwrap_or(Msg::VisualReady { key, w, h, max_scale: 1.0 });
+                    vec![ready]
+                },
                 Err(reason) => vec![Msg::VisualFailed { key, reason }],
             },
             Gfx::Helper(line) => {
@@ -471,7 +500,9 @@ impl Gallery {
                     Some(Pending::Mermaid(key)) => {
                         let svg = v["svg"].as_str().unwrap_or_default().to_owned();
                         self.svgs.insert(key.clone(), svg.clone());
-                        self.raster(key, svg);
+                        if self.focused.as_ref().is_none_or(|focused| focused == &key) {
+                            self.raster(key, svg);
+                        }
                         vec![]
                     }
                     Some(Pending::Image(key, path)) => match (v["shm"].as_str(), dims()) {
@@ -531,8 +562,10 @@ impl Gallery {
 
     /// The screen was cleared (a resize). Placements are gone, and Rex drops the
     /// images too, so send every one again (at `target`); the next `place` shows them.
-    pub fn replace_all(&mut self, out: &mut impl Write, target: Target) {
+    pub fn replace_all(&mut self, out: &mut impl Write, target: Target, focused: Option<&VisualKey>) {
         self.target = target;
+        self.focused = focused.cloned();
+        self.raster_epoch += 1;
         note(&mut self.trace, format_args!("clear: sending {} images again", self.images.len()));
         let mut decode = Vec::new();
         for (key, img) in self.images.iter_mut() {
@@ -548,9 +581,7 @@ impl Gallery {
         for (key, file) in decode {
             let _ = self.decode(key, file);
         }
-        for (key, svg) in self.svgs.clone() {
-            self.raster(key, svg);
-        }
+        self.raster_target();
         // A resize makes each page measure again and send a fresh frame.
         let (width, max_height) = self.html_size();
         for page in self.pages.keys().copied().collect::<Vec<_>>() {
@@ -612,6 +643,33 @@ mod tests {
         g.handle(&mut out, frame(2));
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("a=T") && s.contains("x=0,y=0,w=660,h=360,c=40,r=10"), "{s}");
+    }
+
+    #[test]
+    fn focusing_rasterizes_only_the_selected_mermaid_and_ignores_old_pixels() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let normal = Target { width_px: 100, max_height_px: 100 };
+        let focused_target = Target { width_px: 200, max_height_px: 200 };
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), normal);
+        let first: VisualKey = ("first".into(), 1, 0);
+        let second: VisualKey = ("second".into(), 1, 0);
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="#89b4fa"/></svg>"##;
+        gallery.svgs.insert(first.clone(), svg.into());
+        gallery.svgs.insert(second.clone(), svg.into());
+        gallery.retarget(focused_target, Some(&second));
+        let Msg::Gfx(Gfx::Raster { key, epoch, done }) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap() else { panic!("no raster") };
+        assert_eq!(key, second);
+        assert!(rx.try_recv().is_err(), "offscreen Mermaid cards must not render during focus");
+        let (shm, ..) = done.unwrap();
+        assert!(gallery.handle(&mut Vec::new(), Gfx::Raster { key, epoch: epoch - 1, done: Ok((shm.clone(), 200, 100)) }).is_empty());
+        assert!(!gallery.images.contains_key(&second));
+        // The stale completion owns its shm and must unlink it.
+        assert!(kitty::shm_read(&shm, 1).is_err());
+        gallery.retarget(normal, None);
+        let mut keys = [rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(), rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap()]
+            .into_iter().map(|msg| match msg { Msg::Gfx(Gfx::Raster { key, done: Ok((shm, ..)), .. }) => { kitty::unlink(&shm); key }, _ => panic!("no raster") }).collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(keys, [first, second]);
     }
 
     #[test]

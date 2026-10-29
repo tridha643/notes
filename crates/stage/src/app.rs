@@ -43,9 +43,9 @@ pub type VisualKey = (PostId, u64, usize);
 #[derive(Debug, Clone, PartialEq)]
 pub enum VisualState {
     Pending,
-    /// Pixels exist at `w`×`h`; `max_scale` caps upscaling (1 for photos,
-    /// 2 for vector diagrams rendered at 2× CSS px).
-    Ready { w: u32, h: u32, max_scale: f32 },
+    /// Pixels exist at `w`×`h` for `rendered_at`; `max_scale` normally
+    /// prevents upscaling, except for a temporary focused Mermaid preview.
+    Ready { w: u32, h: u32, max_scale: f32, rendered_at: Target },
     Failed(String),
 }
 
@@ -284,6 +284,12 @@ impl App {
         fx
     }
 
+    /// The visual key selected for full-width card focus, if any.
+    pub fn focused_visual(&self) -> Option<VisualKey> {
+        let (id, card) = self.focused_card.as_ref()?;
+        Some((id.clone(), self.version_of(id)?, *card))
+    }
+
     /// Pixel budget for visual cards at the current pane size.
     pub fn target(&self) -> Target {
         let inner = ui::geometry_for(self).main.width.saturating_sub(5).max(1) as u32;
@@ -367,7 +373,7 @@ impl App {
                 vec![Effect::Redraw]
             }
             Msg::VisualReady { key, w, h, max_scale } => {
-                self.visuals.insert(key, VisualState::Ready { w, h, max_scale });
+                self.visuals.insert(key, VisualState::Ready { w, h, max_scale, rendered_at: self.target() });
                 self.visual_gen += 1;
                 vec![Effect::Redraw]
             }
@@ -511,7 +517,7 @@ impl App {
     fn post_laid(&mut self, id: &PostId, version: u64, width: u16, page: u16) -> Option<&Laid> {
         let comments = self.comments_on(id);
         let cards = self.loaded.get(&(id.clone(), version))?.cards.as_ref()?;
-        let (cell, visuals) = (self.cell_px, &self.visuals);
+        let (cell, visuals, target) = (self.cell_px, &self.visuals, self.target());
         let view = self.views.entry(id.clone()).or_default();
         let selected = self.focused_card.as_ref().filter(|(post, _)| post == id).map(|(_, card)| *card);
         let key = (version, width, page, cell, self.comments_gen, view.fold_gen, self.visual_gen, selected);
@@ -519,7 +525,14 @@ impl App {
             let inner = width.saturating_sub(4).max(1);
             let rows = if selected.is_some() { page.saturating_sub(3) } else { page / 2 };
             let fit = |c: usize| match visuals.get(&(id.clone(), version, c)) {
-                Some(VisualState::Ready { w, h, max_scale }) => fit_cells((*w, *h), *max_scale, inner, rows, cell),
+                Some(VisualState::Ready { w, h, max_scale, rendered_at }) => {
+                    // Reuse the old pixels as a full-size preview while the
+                    // focused Mermaid re-rasterizes crisply in the background.
+                    let preview = selected == Some(c) && *rendered_at != target
+                        && matches!(&cards[c].body, CardBody::Visual { source: VisualSource::Mermaid(_), .. });
+                    let scale = if preview { max_scale * 2.0 } else { *max_scale };
+                    fit_cells((*w, *h), scale, inner, rows, cell)
+                },
                 Some(VisualState::Failed(why)) => Fit::Failed(why.clone()),
                 // Hold about the room a diagram or page usually takes.
                 Some(VisualState::Pending) | None => Fit::Pending { rows: (page / 3).clamp(3, 12) },
@@ -1536,6 +1549,31 @@ mod tests {
         assert_eq!(app.focused_card, None);
         assert_eq!((app.scroll, app.cursor), original);
         assert!(app.feed().lines.iter().any(|line| line.to_string().contains("first card")));
+    }
+
+    #[test]
+    fn focused_mermaid_uses_existing_pixels_as_a_full_size_preview() {
+        let mut app = booted(&fake());
+        let id = PostId::from("b");
+        let post_key = (id.clone(), 2);
+        let p = Post { parts: vec![Part::Mermaid { mermaid: "flowchart TD\n A-->B".into(), id: None }], ..post("b", "s1", 2, "") };
+        let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
+        app.loaded.get_mut(&post_key).unwrap().cards = Some(build_cards(&p, &r));
+        app.loaded.get_mut(&post_key).unwrap().post = Some(p);
+        let visual = (id, 2, 0);
+        let normal = app.target();
+        app.visuals.insert(visual.clone(), VisualState::Ready { w: 200, h: 200, max_scale: 1.0, rendered_at: normal });
+        app.feed = None;
+        let post_index = app.posts.iter().position(|p| p.id == visual.0).unwrap();
+        app.cursor = app.feed().starts[post_index];
+        let normal_slot = app.feed().slots.iter().find(|(key, _)| key == &visual).unwrap().1;
+        app.update(key(KeyCode::Char('z')));
+        let preview_slot = app.feed().slots.iter().find(|(key, _)| key == &visual).unwrap().1;
+        assert!(preview_slot.cols > normal_slot.cols && preview_slot.rows > normal_slot.rows);
+        app.update(Msg::VisualReady { key: visual.clone(), w: 380, h: 380, max_scale: 1.0 });
+        let crisp_slot = app.feed().slots.iter().find(|(key, _)| key == &visual).unwrap().1;
+        assert!(crisp_slot.cols >= preview_slot.cols);
+        assert_eq!(app.visuals[&visual], VisualState::Ready { w: 380, h: 380, max_scale: 1.0, rendered_at: app.target() });
     }
 
     #[test]

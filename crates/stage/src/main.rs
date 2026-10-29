@@ -126,11 +126,12 @@ fn main() -> ExitCode {
         let _ = term.draw(|f| ui::draw(f, app));
         // A resize makes ratatui clear the screen (inside `draw`), and Rex frees the
         // images with it: send them again after the clear, before placing them.
+        let focused = app.focused_visual();
         if app.size != drawn_size {
-            gallery.replace_all(term.backend_mut(), app.target());
+            gallery.replace_all(term.backend_mut(), app.target(), focused.as_ref());
             drawn_size = app.size;
         } else {
-            gallery.retarget(app.target());
+            gallery.retarget(app.target(), focused.as_ref());
         }
         gallery.place(term.backend_mut(), &app.on_screen);
         let _ = term.backend_mut().write_all(b"\x1b[?2026l");
