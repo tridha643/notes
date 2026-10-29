@@ -118,7 +118,7 @@ pub struct Gallery {
     zoom: Option<Unzoomed>,
     prefetch: Option<Prefetch>,
     /// Prefetched zoomed pixels to show at the next `place`, the first frame of focus.
-    ready_zoom: Option<(VisualKey, (String, u32, u32))>,
+    ready_zoom: Option<(VisualKey, RasterTarget, (String, u32, u32))>,
     /// Images to delete at the next `place` (which has the terminal).
     dead: Vec<u32>,
     /// Counts `place` calls, for `Img::shown_at`.
@@ -483,11 +483,13 @@ impl Gallery {
         }
         self.focused = focused.cloned();
         if let Some(ahead) = self.prefetch.take_if(|ahead| focused == Some(&ahead.key)) {
-            if ahead.made_for == self.raster_target(&ahead.key) {
-                // Made for exactly this: no raster job; a pending one lands as the focused raster.
+            let (width, height, cell, _) = self.raster_target(&ahead.key);
+            if (ahead.made_for.0, ahead.made_for.1, ahead.made_for.2) == (width, height, cell) {
+                // Made for this pane (fitted): shown at once, even if the view already moved
+                // on, since the app laid the card out at its size; `place` then asks for the view.
                 self.zoom = Some(Unzoomed { key: ahead.key.clone(), made_for: self.rastered.get(&ahead.key).copied(), img: None });
                 self.rastered.insert(ahead.key.clone(), ahead.made_for);
-                self.ready_zoom = ahead.done.map(|done| (ahead.key, done));
+                self.ready_zoom = ahead.done.map(|done| (ahead.key, ahead.made_for, done));
             } else if let Some((shm, ..)) = ahead.done {
                 kitty::unlink(&shm);
             }
@@ -760,14 +762,14 @@ impl Gallery {
     /// Match kitty placements to what's on screen this frame. Call between a
     /// frame's synchronized-output brackets, after ratatui drew it.
     pub fn place(&mut self, out: &mut impl Write, on_screen: &[OnScreen]) {
-        if let Some((key, (shm, w, h))) = self.ready_zoom.take() {
+        if let Some((key, made_for, (shm, w, h))) = self.ready_zoom.take() {
             if on_screen.iter().any(|o| o.key == key && o.px == (w, h)) {
                 // The app laid the card out at this size (`Msg::ZoomReady`): show it in this frame.
                 self.park(&key);
                 let _ = self.show(out, key, &shm, (w, h), None, None);
             } else {
-                // The app doesn't know its size yet: hand it over like a raster just made.
-                let made_for = self.raster_target(&key);
+                // The app doesn't know its size yet: hand it over like a raster just made
+                // (for what it was made for: if the view changed since, it's dropped).
                 let _ = self.tx.send(Msg::Gfx(Gfx::Raster { key, made_for, done: Ok((shm, w, h)) }));
             }
         }
@@ -878,7 +880,7 @@ impl Gallery {
         // The terminal dropped every image: diagrams rasterize again as they come on screen.
         self.rastered.clear();
         let ahead = self.prefetch.take().and_then(|ahead| ahead.done);
-        for (shm, ..) in ahead.into_iter().chain(self.ready_zoom.take().map(|(_, done)| done)) {
+        for (shm, ..) in ahead.into_iter().chain(self.ready_zoom.take().map(|(_, _, done)| done)) {
             kitty::unlink(&shm);
         }
         if let Some(zoom) = self.zoom.as_mut() {
