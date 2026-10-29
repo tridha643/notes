@@ -225,6 +225,9 @@ pub struct App {
     /// Feed position to restore when the focus view closes.
     /// Feed position and follow to restore when the focus view closes.
     before_focus: Option<(usize, usize, bool)>,
+    /// A focused diagram's feed-size pixels: the gallery puts them back when focus
+    /// closes, and the layout must match them in that same frame.
+    unzoomed: Option<(VisualKey, VisualState)>,
     feed: Option<(FeedKey, Feed)>,
     /// A post to bring to the top on the next layout (a sidebar pick, a follow).
     jump: Option<PostId>,
@@ -283,6 +286,7 @@ impl App {
             pending_sidebar: None,
             pending_sidebar_frames: HashMap::new(),
             before_focus: None,
+            unzoomed: None,
             feed: None,
             jump: None,
             remembered: HashMap::new(),
@@ -471,7 +475,7 @@ impl App {
             };
             self.remembered.insert(old, r);
         }
-        self.focused_card = None;
+        self.leave_focus();
         self.pending_html_focus = None;
         self.pending_sidebar = None;
         self.pending_sidebar_frames.clear();
@@ -793,6 +797,9 @@ impl App {
         // Following would jump the focused view to each new post.
         self.before_focus = Some((self.scroll, self.cursor, self.follow));
         self.follow = false;
+        let key = self.version_of(&id).map(|version| (id.clone(), version, card));
+        self.unzoomed = key.filter(|key| matches!(self.visual_source(key), Some(VisualSource::Mermaid(_))))
+            .and_then(|key| Some((key.clone(), self.visuals.get(&key)?.clone())));
         self.focused_card = Some((id, card));
         self.feed = None;
         self.scroll = 0;
@@ -894,6 +901,10 @@ impl App {
     fn leave_focus(&mut self) {
         self.focused_card = None;
         self.feed = None;
+        if let Some((key, state)) = self.unzoomed.take() {
+            self.visuals.insert(key, state);
+            self.visual_gen += 1;
+        }
         if let Some((scroll, cursor, follow)) = self.before_focus.take() {
             (self.scroll, self.cursor, self.follow) = (scroll, cursor, follow);
         }
@@ -1281,10 +1292,9 @@ impl App {
                 self.remembered.retain(|id, _| self.sessions.iter().any(|s| &s.id == id));
                 // The open session was deleted: drop it and open the newest.
                 if self.open.as_ref().is_some_and(|id| !self.sessions.iter().any(|s| &s.id == id)) {
+                    self.leave_focus();
                     (self.open, self.shown, self.feed) = (None, None, None);
-                    self.focused_card = None;
                     self.pending_html_focus = None;
-                    self.before_focus = None;
                     self.posts.clear();
                     self.comments.clear();
                 }
@@ -1941,6 +1951,26 @@ mod tests {
         let crisp_slot = app.feed().slots.iter().find(|(key, _)| key == &visual).unwrap().1;
         assert!(crisp_slot.cols > preview_slot.cols);
         assert_eq!(app.visuals[&visual], VisualState::Ready { w: 380, h: 380, max_scale: 1.0 });
+    }
+
+    #[test]
+    fn leaving_focus_lays_the_diagram_out_at_its_feed_size_at_once() {
+        let mut app = booted(&fake());
+        let id = PostId::from("b");
+        let p = Post { parts: vec![Part::Mermaid { mermaid: "flowchart TD\n A-->B".into(), id: None }], ..post("b", "s1", 2, "") };
+        let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
+        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, &r));
+        let visual = (id, 2, 0);
+        app.visuals.insert(visual.clone(), VisualState::Ready { w: 360, h: 260, max_scale: 1.0 });
+        app.feed = None;
+        let post_index = app.posts.iter().position(|p| p.id == visual.0).unwrap();
+        app.cursor = app.feed().starts[post_index];
+        let feed_slot = app.feed().slots.iter().find(|(key, _)| key == &visual).unwrap().1;
+        app.update(key(KeyCode::Char('z')));
+        app.update(Msg::VisualReady { key: visual.clone(), w: 1150, h: 830, max_scale: 1.0 });
+        app.update(key(KeyCode::Char('z')));
+        let slot = app.feed().slots.iter().find(|(key, _)| key == &visual).unwrap().1;
+        assert_eq!((slot.cols, slot.rows), (feed_slot.cols, feed_slot.rows), "no frame at the zoomed size squeezed into the card");
     }
 
     #[test]
