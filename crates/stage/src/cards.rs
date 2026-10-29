@@ -780,14 +780,10 @@ fn boxed(content: Line<'static>, inner: usize) -> Line<'static> {
 }
 
 /// Every card, wrapped to `width`, with folds applied and comments below.
-/// `fit` sizes each visual card (by card index) for the inner width.
-pub fn layout(cards: &[Card], comments: &[Comment], width: u16, folds: &Folds, fit: &dyn Fn(usize) -> Fit) -> Laid {
-    layout_selected(cards, comments, width, folds, fit, None)
-}
-
-/// Lay out only the selected card at its original index when focused; hits and
-/// visual slots keep that index so actions still address the right post part.
-pub fn layout_selected(
+/// `fit` sizes each visual card (by card index) for the inner width. With
+/// `selected` (focus), only that card, still at its own index, so hits and
+/// visual slots address the right post part.
+pub fn layout(
     cards: &[Card], comments: &[Comment], width: u16, folds: &Folds,
     fit: &dyn Fn(usize) -> Fit, selected: Option<usize>,
 ) -> Laid {
@@ -916,7 +912,7 @@ mod tests {
     fn golden(part: Part, render: PartRender) -> String {
         let p = post(vec![part]);
         let r = PostRender { id: "p1".into(), version: 1, parts: vec![render] };
-        let laid = layout(&build_cards(&p, &r), &[], 40, &Folds::new(), &|_| Fit::Pending { rows: 1 });
+        let laid = layout(&build_cards(&p, &r), &[], 40, &Folds::new(), &|_| Fit::Pending { rows: 1 }, None);
         let height = laid.lines.len() as u16;
         let mut term = Terminal::new(TestBackend::new(40, height)).unwrap();
         term.draw(|f| f.render_widget(Paragraph::new(laid.lines.clone()), f.area())).unwrap();
@@ -960,7 +956,7 @@ mod tests {
             ]),
             &PostRender { id: "p1".into(), version: 1, parts: vec![PartRender::Native; 2] },
         );
-        let laid = layout_selected(&cards, &[], 70, &Folds::new(), &|_| Fit::Pending { rows: 1 }, Some(1));
+        let laid = layout(&cards, &[], 70, &Folds::new(), &|_| Fit::Pending { rows: 1 }, Some(1));
         assert!(laid.lines.iter().any(|line| line.to_string().contains("second")));
         assert!(!laid.lines.iter().any(|line| line.to_string().contains("first")));
         assert!(laid.hits.contains(&Hit::Card(1)));
@@ -1050,7 +1046,7 @@ mod tests {
                 }],
             }],
         };
-        let laid = layout(&build_cards(&post(vec![part]), &PostRender { id: "p1".into(), version: 1, parts: vec![render] }), &[], 40, &Folds::new(), &|_| Fit::Pending { rows: 1 });
+        let laid = layout(&build_cards(&post(vec![part]), &PostRender { id: "p1".into(), version: 1, parts: vec![render] }), &[], 40, &Folds::new(), &|_| Fit::Pending { rows: 1 }, None);
         let row = &laid.lines[3];
         let pad = &row.spans[row.spans.len() - 2];
         assert_eq!(pad.style.bg, Some(ui::ADDED_BG));
@@ -1100,7 +1096,7 @@ mod tests {
             &post(vec![Part::Mermaid { mermaid: "graph TD\nA-->B".into(), id: None }]),
             &PostRender { id: "p1".into(), version: 1, parts: vec![PartRender::Native] },
         );
-        let lay = |fit: Fit| layout(&cards, &[], 40, &Folds::new(), &move |_| fit.clone());
+        let lay = |fit: Fit| layout(&cards, &[], 40, &Folds::new(), &move |_| fit.clone(), None);
         let pending = lay(Fit::Pending { rows: 4 });
         assert!(pending.lines[1].to_string().contains("rendering…"));
         assert!(pending.slots.is_empty());

@@ -267,7 +267,7 @@ fn read_verbs_and_refs() {
     assert_eq!(doctor["notes"], 3);
     assert_eq!(doctor["protocol"], 1);
     let manifest = d.ok("manifest", Value::Null);
-    assert_eq!(manifest["verbs"].as_array().unwrap().len(), 21);
+    assert_eq!(manifest["verbs"].as_array().unwrap().len(), 23);
 
     // Protocol errors.
     let r = d.call_as(None, "no-such-verb", json!({}));
@@ -824,6 +824,34 @@ fn session_files_removed_or_added_outside_become_events() {
 }
 
 #[test]
+fn session_delete_trashes_and_restore_brings_it_back_idempotently() {
+    let d = Notesd::new();
+    let post = d.ok("post-new", json!({ "title": "P", "parts": [md("x")] }));
+    let (session, post_id) = (post["post"]["session"].clone(), post["post"]["id"].clone());
+    let since = d.ok("doctor", Value::Null)["seq"].clone();
+    let mut watch = d.watch(json!({ "since": since, "kinds": ["session"] }));
+
+    let r = d.ok("session-delete", json!({ "id": session }));
+    assert_eq!((&r["trashed"], &r["already"]), (&json!(true), &json!(false)), "{r}");
+    assert_eq!(next_event(&mut watch)["kind"], "session-deleted");
+    assert!(d.session_files().is_empty());
+    d.err("not_found", "post-show", json!({ "id": post_id }));
+    let r = d.ok("session-delete", json!({ "id": session }));
+    assert_eq!((&r["trashed"], &r["already"]), (&json!(true), &json!(true)), "{r}");
+
+    let r = d.ok("session-restore", json!({ "id": session }));
+    assert_eq!((&r["restored"], &r["already"]), (&json!(true), &json!(false)), "{r}");
+    assert_eq!(next_event(&mut watch)["kind"], "session-restored");
+    d.ok("post-show", json!({ "id": post_id }));
+    assert_eq!(d.ok("session-restore", json!({ "id": session }))["already"], true);
+
+    let r = d.ok("session-delete", json!({ "id": session, "purge": true }));
+    assert_eq!((&r["purged"], &r["trashed"]), (&json!(true), &json!(false)), "{r}");
+    d.err("not_found", "session-restore", json!({ "id": session }));
+    d.err("not_found", "session-delete", json!({ "id": session, "purge": true }));
+}
+
+#[test]
 fn session_search_finds_titles_then_content() {
     let d = Notesd::new();
     let named = d.ok("session-new", json!({ "agent": "claude", "title": "Redirect bug" }));
@@ -873,6 +901,8 @@ fn sideshow_verbs_report_their_documented_error_codes() {
         ("post-delete", json!({ "id": "nope" })),
         ("session-rename", json!({ "id": "nope", "title": "t" })),
         ("session-delete", json!({ "id": "nope" })),
+        ("session-delete", json!({ "id": "nope", "purge": true })),
+        ("session-restore", json!({ "id": "nope" })),
         ("comment-delete", json!({ "id": "nope" })),
         ("asset-get", json!({ "id": "nope" })),
         ("trace-list", json!({ "id": "nope" })),

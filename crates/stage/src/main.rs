@@ -124,10 +124,10 @@ fn main() -> ExitCode {
     let mut draw = |term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App, gallery: &mut Gallery| {
         let _ = term.backend_mut().write_all(b"\x1b[?2026h");
         let _ = term.draw(|f| ui::draw(f, app));
-        app.cancel_sidebar_if_visuals_left();
         // A resize makes ratatui clear the screen (inside `draw`), and Rex frees the
         // images with it: send them again after the clear, before placing them.
         let focused = app.focused_visual();
+        gallery.view(app.zoom_view);
         if app.size != drawn_size {
             gallery.replace_all(term.backend_mut(), app.target(), focused.as_ref());
             drawn_size = app.size;
@@ -236,8 +236,13 @@ fn main() -> ExitCode {
                     restore();
                     return ExitCode::SUCCESS;
                 }
-                Effect::NeedVisual { key, source, target } => {
-                    for m in gallery.need(term.backend_mut(), key, source, target) {
+                Effect::PrefetchZoom { key, target } => {
+                    if let Some(m) = gallery.prefetch_zoom(key, target) {
+                        later.extend(pump(&mut app, &mut client, m));
+                    }
+                }
+                Effect::NeedVisual { key, source } => {
+                    for m in gallery.need(term.backend_mut(), key, source) {
                         later.extend(pump(&mut app, &mut client, m));
                     }
                 }
@@ -272,6 +277,12 @@ fn main() -> ExitCode {
             draw(&mut term, &mut app, &mut gallery);
             if let Some(f) = loop_trace.as_mut() {
                 let _ = writeln!(f, "draw {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
+            }
+            // Pixels for the visuals this frame shows (then their neighbors).
+            let fx = app.after_draw();
+            pending = perform(&mut app, &mut client, fx);
+            if !pending.is_empty() {
+                continue;
             }
         }
         // While scrolling, live pages hold still; 150 ms after the last scroll

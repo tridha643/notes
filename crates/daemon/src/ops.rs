@@ -285,7 +285,8 @@ impl Tx<'_> {
             Verb::SessionList => value(p::session_list(db).map_err(Fail)?),
             Verb::SessionSearch(a) => value(p::session_search(db, a).map_err(Fail)?),
             Verb::SessionRename(a) => self.written_posts(p::session_rename(db, a)),
-            Verb::SessionDelete(a) => self.posts_events(p::session_delete(db, &a.id)),
+            Verb::SessionDelete(a) => self.written_posts(p::session_delete(db, a)),
+            Verb::SessionRestore(a) => self.written_posts(p::session_restore(db, &a.id)),
             Verb::PostNew(a) => {
                 let cwd = self.cwd.clone();
                 self.written_posts(p::post_new(db, a, agent, cwd.as_deref()))
@@ -641,6 +642,8 @@ pub fn manifest() -> Value {
             { "verb": "watch", "args": { "since": "u64? (exclusive; default now)", "kinds": "[string] exact or prefix before '-', e.g. note" }, "result": "event lines until the client disconnects" },
             { "verb": "batch", "args": { "ops": "[{verb, args}]", "atomic": "bool" }, "result": "[{ok:true, result} | {ok:false, error}]" },
             { "verb": "manifest", "result": "this object" },
+            { "verb": "session-delete", "args": { "id": "string", "purge": "bool" }, "result": "{id, trashed, purged, already}; trashed 30 days unless purge" },
+            { "verb": "session-restore", "args": { "id": "string" }, "result": "{id, restored, already}" },
             { "verb": "doctor", "result": "{protocol, daemon_version, socket, vault, database, notes}" }
         ]
     })

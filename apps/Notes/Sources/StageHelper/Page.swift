@@ -153,8 +153,10 @@ final class Page: NSObject, WKNavigationDelegate {
     private let web: WKWebView
 
     private var loaded = false, paused = false, snapping = false
-    /// Suppress snapshots while layout briefly uses a 1pt measurement viewport.
-    private var measuring = false, layoutVersion = 0
+    /// No snapshots while layout briefly uses a 1pt measurement viewport.
+    private var measuring = false
+    /// Bumped by each layout, so callbacks and snapshots from an older one are dropped.
+    private var layoutVersion = 0
     private var frame = 0
     private var inFlight: Int?
     /// A capture came due while a frame was unacked or a snapshot was running.
@@ -263,8 +265,7 @@ final class Page: NSObject, WKNavigationDelegate {
 
     private func capture() {
         guard loaded, !paused else { return }
-        if measuring { due = true; return }
-        if inFlight != nil || snapping {
+        if measuring || inFlight != nil || snapping {
             due = true
             return
         }
@@ -295,7 +296,7 @@ final class Page: NSObject, WKNavigationDelegate {
                     let shm = try writeShm(px)
                     self.frame += 1
                     self.inFlight = self.frame
-                    self.client.send(["id": self.id, "frame": self.frame, "shm": shm, "w": w, "h": h])
+                    self.client.send(.frame(id: self.id, frame: self.frame, shm: shm, w: w, h: h))
                     if self.frame == 1 { traceMark("html first frame", since: self.opened) }
                 } catch {
                     self.client.fail(self.id, "shm: \(error)")
@@ -378,7 +379,7 @@ final class Page: NSObject, WKNavigationDelegate {
             self.web.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
         }
         guard loaded else {
-            client.send(["id": id, "ok": true, "patched": false])
+            client.send(.patched(id: id, patched: false))
             return reload()
         }
         let t0 = DispatchTime.now().uptimeNanoseconds
@@ -386,7 +387,7 @@ final class Page: NSObject, WKNavigationDelegate {
             guard let self else { return }
             let outcome = (try? result.get()) as? String ?? "patch-failed"
             traceMark("html update \(outcome)", since: t0)
-            self.client.send(["id": self.id, "ok": true, "patched": outcome == "ok"])
+            self.client.send(.patched(id: self.id, patched: outcome == "ok"))
             if outcome == "ok" { self.layout() } else { reload() }
         }
     }

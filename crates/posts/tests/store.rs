@@ -52,6 +52,10 @@ fn new_post(conn: &Store, session: Option<&str>, parts: Vec<Part>) -> PostWriteR
         .0
 }
 
+fn delete(id: &str, purge: bool) -> SessionDeleteArgs {
+    SessionDeleteArgs { id: id.into(), purge }
+}
+
 fn code_of(result: Result<impl std::fmt::Debug>) -> ErrorCode {
     result.expect_err("expected an error").code
 }
@@ -145,11 +149,11 @@ fn sessions_crud_with_counts_and_events() {
         )),
         ErrorCode::NotFound
     );
-    let ev = session_delete(&conn, &s.id).unwrap();
+    let (_, ev) = session_delete(&conn, &delete(&s.id, false)).unwrap();
     assert_eq!(ev[0].kind, "session-deleted");
     assert_eq!(code_of(session_get(&conn, &s.id)), ErrorCode::NotFound);
     assert_eq!(post_list(&conn, &PostListArgs::default()).unwrap().len(), 0);
-    assert_eq!(code_of(session_delete(&conn, &s.id)), ErrorCode::NotFound);
+    assert_eq!(code_of(session_delete(&conn, &delete("nope", false))), ErrorCode::NotFound);
 }
 
 #[test]
@@ -965,7 +969,7 @@ fn session_delete_keeps_assets_other_sessions_reference() {
     };
     new_post(&conn, Some(&gone.id), vec![image(&private)]);
     new_post(&conn, Some(&kept.id), vec![image(&shared)]);
-    session_delete(&conn, &gone.id).unwrap();
+    session_delete(&conn, &delete(&gone.id, true)).unwrap();
     assert_eq!(code_of(asset_get(&conn, &private)), ErrorCode::NotFound);
     assert!(asset_get(&conn, &shared).is_ok());
 }
@@ -1268,4 +1272,96 @@ fn post_render_end_to_end() {
         )),
         ErrorCode::NotFound
     );
+}
+
+/// A session with one post (an image asset) and one comment.
+fn session_with_asset(conn: &Store, bytes: &[u8]) -> (SessionId, AssetId) {
+    let (s, _) = session_new(conn, &SessionNewArgs { agent: "a".into(), title: Some("T".into()), cwd: None }).unwrap();
+    let args = AssetPutArgs {
+        session: Some(s.id.clone()),
+        kind: AssetKind::Image,
+        content_type: "image/png".into(),
+        filename: None,
+        data_base64: STANDARD.encode(bytes),
+    };
+    let asset = asset_put(conn, &args).unwrap().id;
+    let image = Part::Image { asset_id: asset.clone(), alt: None, caption: None, id: None };
+    let post = new_post(conn, Some(&s.id), vec![image]).post;
+    let comment = CommentNewArgs { post: Some(post.id), session: None, text: "keep me".into(), anchor: None, author: None };
+    comment_new(conn, &comment, None).unwrap();
+    (s.id, asset)
+}
+
+#[test]
+fn session_trash_restore_round_trip_keeps_posts_comments_and_assets() {
+    let conn = db();
+    let (id, asset) = session_with_asset(&conn, b"pixels");
+    let (r, ev) = session_delete(&conn, &delete(&id, false)).unwrap();
+    assert_eq!((r.trashed, r.purged, r.already, ev[0].kind.as_str()), (true, false, false, "session-deleted"));
+    assert_eq!(code_of(session_get(&conn, &id)), ErrorCode::NotFound);
+    assert!(session_list(&conn).unwrap().is_empty());
+    assert!(asset_get(&conn, &asset).is_ok());
+    // A second delete changes nothing and says so.
+    let (r, ev) = session_delete(&conn, &delete(&id, false)).unwrap();
+    assert_eq!((r.trashed, r.already, ev.len()), (true, true, 0));
+
+    let (r, ev) = session_restore(&conn, &id).unwrap();
+    assert_eq!((r.restored, r.already, ev[0].kind.as_str()), (true, false, "session-restored"));
+    assert_eq!(session_get(&conn, &id).unwrap().post_count, 1);
+    assert_eq!(comment_list(&conn, &CommentListArgs { session: Some(id.clone()), ..Default::default() }).unwrap().len(), 1);
+    assert!(asset_get(&conn, &asset).is_ok());
+    // Restoring a live session changes nothing.
+    let (r, ev) = session_restore(&conn, &id).unwrap();
+    assert_eq!((r.already, ev.len()), (true, 0));
+    assert_eq!(code_of(session_restore(&conn, "nope")), ErrorCode::NotFound);
+}
+
+#[test]
+fn session_purge_deletes_live_and_trashed_sessions_with_their_assets() {
+    let conn = db();
+    let (live, live_asset) = session_with_asset(&conn, b"pixels");
+    let (r, ev) = session_delete(&conn, &delete(&live, true)).unwrap();
+    assert_eq!((r.purged, r.trashed, ev[0].kind.as_str()), (true, false, "session-deleted"));
+    assert_eq!(code_of(asset_get(&conn, &live_asset)), ErrorCode::NotFound);
+    assert_eq!(code_of(session_restore(&conn, &live)), ErrorCode::NotFound);
+    // Purging twice is not_found: no tombstone is kept.
+    assert_eq!(code_of(session_delete(&conn, &delete(&live, true))), ErrorCode::NotFound);
+
+    let (trashed, asset) = session_with_asset(&conn, b"other");
+    session_delete(&conn, &delete(&trashed, false)).unwrap();
+    let (r, ev) = session_delete(&conn, &delete(&trashed, true)).unwrap();
+    assert_eq!((r.purged, ev.len()), (true, 0));
+    assert_eq!(code_of(asset_get(&conn, &asset)), ErrorCode::NotFound);
+    assert_eq!(code_of(session_restore(&conn, &trashed)), ErrorCode::NotFound);
+}
+
+#[test]
+fn trash_purge_waits_30_days_then_deletes_unreferenced_assets() {
+    let conn = db();
+    let (id, asset) = session_with_asset(&conn, b"pixels");
+    session_delete(&conn, &delete(&id, false)).unwrap();
+    let day = 86_400;
+    let soon = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    trash_purge(&conn, soon + 29 * day).unwrap();
+    assert!(asset_get(&conn, &asset).is_ok());
+    assert!(session_restore(&conn, &id).is_ok());
+    session_delete(&conn, &delete(&id, false)).unwrap();
+    trash_purge(&conn, soon + 31 * day).unwrap();
+    assert_eq!(code_of(asset_get(&conn, &asset)), ErrorCode::NotFound);
+    assert_eq!(code_of(session_restore(&conn, &id)), ErrorCode::NotFound);
+}
+
+#[test]
+fn trashed_sessions_survive_a_reopen_and_keep_the_assets_others_share() {
+    let conn = db();
+    let (id, asset) = session_with_asset(&conn, b"pixels");
+    // Another live session references the same bytes; purging the owner keeps them.
+    let (other, _) = session_new(&conn, &SessionNewArgs { agent: "b".into(), title: None, cwd: None }).unwrap();
+    new_post(&conn, Some(&other.id), vec![Part::Image { asset_id: asset.clone(), alt: None, caption: None, id: None }]);
+    session_delete(&conn, &delete(&id, false)).unwrap();
+    session_delete(&conn, &delete(&other.id, true)).unwrap();
+    assert!(asset_get(&conn, &asset).is_ok(), "the trashed session still references it");
+    let reopened = Store::open(Connection::open_in_memory().unwrap(), conn.root().to_path_buf()).unwrap();
+    assert!(session_list(&reopened).unwrap().is_empty());
+    assert!(session_restore(&reopened, &id).is_ok());
 }

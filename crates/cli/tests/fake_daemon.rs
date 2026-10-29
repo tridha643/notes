@@ -545,7 +545,27 @@ fn sideshow_verbs_send_exact_requests_and_print_text() {
             "s1\tclaude\t2 posts\t1970-01-01 00:00Z\tFix\n".into(),
         ),
         (vec!["session", "rename", "s1", "New name"], "", r#""verb":"session-rename","args":{"id":"s1","title":"New name"}"#.into(), "null".into(), "".into()),
-        (vec!["session", "delete", "s1"], "", r#""verb":"session-delete","args":{"id":"s1"}"#.into(), "null".into(), "".into()),
+        (
+            vec!["session", "delete", "s1"],
+            "",
+            r#""verb":"session-delete","args":{"id":"s1","purge":false}"#.into(),
+            r#"{"id":"s1","trashed":true,"purged":false,"already":false}"#.into(),
+            "s1\ttrashed\n".into(),
+        ),
+        (
+            vec!["session", "delete", "s1", "--purge"],
+            "",
+            r#""verb":"session-delete","args":{"id":"s1","purge":true}"#.into(),
+            r#"{"id":"s1","trashed":false,"purged":true,"already":false}"#.into(),
+            "s1\tpurged\n".into(),
+        ),
+        (
+            vec!["session", "restore", "s1"],
+            "",
+            r#""verb":"session-restore","args":{"id":"s1"}"#.into(),
+            r#"{"id":"s1","restored":true,"already":true}"#.into(),
+            "s1\trestored (already)\n".into(),
+        ),
         (vec!["kits"], "", r#""verb":"kits""#.into(), r#"[{"id":"slides","label":"Slides","summary":"Deck","css":""}]"#.into(), "slides\tSlides: Deck\n".into()),
         (
             vec!["trace", "-", "--session", "s1"],

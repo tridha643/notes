@@ -80,13 +80,24 @@ private func page(_ html: String) throws -> String {
 @Suite(.serialized) struct StageHelperTests {
     @Test func mermaidResolvesThePalette() throws {
         let h = try Helper()
-        try h.send(["op": "mermaid", "id": 1, "source": "flowchart TD\n  A[agent] --> B{notesd}"])
+        try h.send(["op": "mermaid", "id": 1, "source": "flowchart TD\n  A[agent] --> B{notesd}", "max_width": 400, "font_size": 14])
         let r = try #require(h.next())
         #expect(r["ok"] as? Bool == true)
         let svg = try #require(r["svg"] as? String)
         #expect(svg.hasPrefix("<svg") && !svg.contains("var("))
         #expect(svg.contains("#89b4fa") && svg.contains("#cdd6f4"))
         #expect((r["width"] as? Double ?? 0) > 0 && (r["height"] as? Double ?? 0) > 0)
+    }
+
+    @Test func mermaidDoesNotWaitBehindWebKitStartup() throws {
+        // A fresh helper spends its first ~100 ms building a spare web view on the main
+        // thread; `warm` is answered there, so mermaid must not queue behind it.
+        let h = try Helper()
+        try h.send(["op": "mermaid", "id": 1, "source": "flowchart TD\n  A --> B", "max_width": 400, "font_size": 14])
+        try h.send(["op": "warm", "id": 2])
+        let first = try #require(h.next())
+        #expect(first["id"] as? Int == 1 && first["ok"] as? Bool == true, "\(first)")
+        #expect(try #require(h.next())["id"] as? Int == 2)
     }
 
     @Test func imageRoundTripsThroughShm() throws {
@@ -206,6 +217,12 @@ private func page(_ html: String) throws -> String {
         let r = try #require(h.next())
         #expect(r["ok"] as? Bool == false && r["id"] as? Int == 3)
         try h.send(["op": "html-ack", "id": 99, "frame": 1])
+        #expect(try #require(h.next())["ok"] as? Bool == false)
+        // Strict: a missing field or an unknown one is refused, under the request's id.
+        try h.send(["op": "mermaid", "id": 4, "source": "flowchart TD\n  A --> B"])
+        let missing = try #require(h.next())
+        #expect(missing["ok"] as? Bool == false && missing["id"] as? Int == 4, "\(missing)")
+        try h.send(["op": "warm", "id": 5, "extra": 1])
         #expect(try #require(h.next())["ok"] as? Bool == false)
     }
 }

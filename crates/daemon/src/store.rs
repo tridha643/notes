@@ -519,6 +519,7 @@ impl Tx<'_> {
 
     /// Opportunistic: runs at startup and after deletes, never on a timer.
     pub fn purge_trash(&mut self) -> R<()> {
+        notes_posts::trash_purge(self.store, self.now).map_err(Fail)?;
         let cutoff = self.now - TRASH_DAYS * 86_400;
         self.db.execute("DELETE FROM history WHERE note_id IN (SELECT note_id FROM trash WHERE deleted_at < ?1)", [cutoff])?;
         self.db.execute("DELETE FROM notes WHERE path IS NULL AND id IN (SELECT note_id FROM trash WHERE deleted_at < ?1)", [cutoff])?;

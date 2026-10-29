@@ -64,9 +64,10 @@ pub fn unplace(id: u32) -> Vec<u8> {
     format!("\x1b_Ga=d,d=i,i={id},p=1,q=2\x1b\\").into_bytes()
 }
 
-/// Delete an old image and its placement after a resized frame takes its place.
+/// Delete an image and all its placements, freeing its pixels (`I`: lowercase would
+/// only remove the placements and leave the pixels in the terminal's memory).
 pub fn delete(id: u32) -> Vec<u8> {
-    format!("\x1b_Ga=d,d=i,i={id},q=2\x1b\\").into_bytes()
+    format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\").into_bytes()
 }
 
 /// Every image and placement stage made (on quit).
@@ -75,6 +76,12 @@ pub const FREE_ALL: &[u8] = b"\x1b_Ga=d,d=A,q=2\x1b\\";
 /// Write RGBA pixels into a fresh shared-memory object and return its name.
 /// The terminal unlinks it after a `t=s` transmit; call [`unlink`] otherwise.
 pub fn shm_write(rgba: &[u8]) -> io::Result<String> {
+    shm_fill(rgba.len(), |buf| buf.copy_from_slice(rgba))
+}
+
+/// A fresh shared-memory object of `len` zeroed bytes, filled in place by `fill`
+/// (so a raster is drawn straight into what the terminal reads, never copied).
+pub fn shm_fill(len: usize, fill: impl FnOnce(&mut [u8])) -> io::Result<String> {
     use std::sync::atomic::{AtomicU32, Ordering};
     static N: AtomicU32 = AtomicU32::new(0);
     // macOS caps shm names at 31 bytes.
@@ -92,15 +99,15 @@ pub fn shm_write(rgba: &[u8]) -> io::Result<String> {
             libc::shm_unlink(c.as_ptr());
             Err(e)
         };
-        if libc::ftruncate(fd, rgba.len() as libc::off_t) != 0 {
+        if libc::ftruncate(fd, len as libc::off_t) != 0 {
             return fail(fd);
         }
-        let ptr = libc::mmap(std::ptr::null_mut(), rgba.len(), libc::PROT_WRITE, libc::MAP_SHARED, fd, 0);
+        let ptr = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0);
         if ptr == libc::MAP_FAILED {
             return fail(fd);
         }
-        std::ptr::copy_nonoverlapping(rgba.as_ptr(), ptr.cast::<u8>(), rgba.len());
-        libc::munmap(ptr, rgba.len());
+        fill(std::slice::from_raw_parts_mut(ptr.cast::<u8>(), len));
+        libc::munmap(ptr, len);
         libc::close(fd);
     }
     Ok(name)

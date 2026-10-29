@@ -25,6 +25,8 @@ use crate::{error, stage_index::StageIndex, Result};
 pub const SCHEMA: u32 = 1;
 const TMP_SUFFIX: &str = ".notesd-tmp";
 pub(crate) const ASSETS: &str = "assets";
+/// Deleted sessions wait here as `<deleted_at>--<file name>`; the loader skips dot names.
+const TRASH: &str = ".trash";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -404,6 +406,59 @@ impl Store {
         stage.delete(&self.root.join(file))?;
         stage.remove(id);
         Ok(())
+    }
+
+    /// Move a session's file into the trash, stamped with the deletion time `at`.
+    pub(crate) fn trash_session(&self, id: &SessionId, at: i64) -> Result<()> {
+        let mut stage = self.stage_mut();
+        let Some(e) = stage.sessions.get(id) else {
+            return Ok(());
+        };
+        let from = self.root.join(&e.file);
+        let to = self.root.join(TRASH).join(format!("{at}--{}", e.file));
+        let mut bytes = serde_json::to_vec_pretty(&e.data).expect("session serializes");
+        bytes.push(b'\n');
+        fs::create_dir_all(self.root.join(TRASH)).map_err(|e| io_error("create", &to, e))?;
+        stage.write(&to, &bytes)?;
+        stage.delete(&from)?;
+        stage.remove(id);
+        Ok(())
+    }
+
+    /// Every trashed session as (path, deleted_at, session); files that don't parse are skipped.
+    pub(crate) fn trashed(&self) -> Vec<(PathBuf, i64, SessionFile)> {
+        let Ok(entries) = fs::read_dir(self.root.join(TRASH)) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let at = name.split_once("--")?.0.parse().ok()?;
+                let (data, _) = Stage::read_file(&e.path()).ok()?;
+                Some((e.path(), at, data))
+            })
+            .collect()
+    }
+
+    /// Put a trashed session back under its original file name.
+    pub(crate) fn untrash_session(&self, trashed: &Path, data: SessionFile) -> Result<()> {
+        let name = trashed.file_name().expect("trash paths have a name").to_string_lossy();
+        let file = name.split_once("--").map_or(&*name, |(_, f)| f).to_owned();
+        let mut bytes = serde_json::to_vec_pretty(&data).expect("session serializes");
+        bytes.push(b'\n');
+        let path = self.root.join(&file);
+        let mut stage = self.stage_mut();
+        stage.write(&path, &bytes)?;
+        stage.delete(trashed)?;
+        let stamp = stamp(&path).map_err(|e| io_error("stat", &path, e))?;
+        stage.replace(file, stamp, data);
+        Ok(())
+    }
+
+    /// Remove a trashed session's file for good.
+    pub(crate) fn delete_trashed(&self, trashed: &Path) -> Result<()> {
+        self.stage_mut().delete(trashed)
     }
 
     pub(crate) fn asset_path(&self, id: &str) -> PathBuf {

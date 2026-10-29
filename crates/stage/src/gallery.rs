@@ -16,14 +16,14 @@ use std::{
     os::unix::{net::UnixStream, process::CommandExt},
     path::PathBuf,
     process::{Command, Stdio},
-    sync::{mpsc::Sender, Arc, OnceLock},
+    sync::{mpsc::Sender, Arc, Mutex, OnceLock},
     thread,
 };
 
-use serde_json::{json, Value};
+use notes_proto::helper::{Failed, Frame, HelperReply, HelperRequest, Image, Mermaid};
 
 use crate::{
-    app::{Msg, OnScreen, Target, VisualKey},
+    app::{Msg, OnScreen, Target, VisualKey, ZoomView},
     cards::VisualSource,
     client::StageClient,
     kitty::{self, Place},
@@ -35,12 +35,21 @@ pub enum Gfx {
     /// One JSON line from stage-helper.
     Helper(String),
     HelperExited,
-    /// A mermaid diagram rasterized into shared memory (or why it couldn't be).
-    Raster { key: VisualKey, epoch: u64, done: Result<(String, u32, u32), String> },
+    /// A mermaid diagram rasterized into shared memory for `made_for` (or why it couldn't be).
+    Raster { key: VisualKey, made_for: RasterTarget, done: Result<(String, u32, u32), String> },
 }
+
+/// What a Mermaid raster depends on: the width and height it must fit, the cell
+/// size (all px), and, when zoomed (focused), the window of the diagram shown.
+pub type RasterTarget = (u32, u32, (u16, u16), Option<ZoomView>);
 
 /// CSS px → device px for helper renders (Retina).
 const SCALE: f64 = 2.0;
+/// Limit very large diagrams without shrinking ordinary tall ones to the viewport.
+const MAX_MERMAID_HEIGHT_PX: u32 = 4096;
+/// Diagram pixels the terminal holds for stage. Past this, the diagrams shown least
+/// recently (and not on screen) are dropped; they rasterize again from their SVG if seen.
+const DIAGRAM_BUDGET_BYTES: u64 = 128 << 20;
 
 struct Img {
     id: u32,
@@ -55,6 +64,25 @@ struct Img {
     /// The image file these pixels came from (PNG sent as a file, or decoded by
     /// the helper), to send again after a clear.
     file: Option<PathBuf>,
+    /// The `place` call that last showed it, to drop the least recent first.
+    shown_at: u64,
+}
+
+/// The focused diagram's feed-size pixels while its zoomed raster is shown, so
+/// closing focus puts them back in the same frame instead of shrinking the zoomed one.
+struct Unzoomed {
+    key: VisualKey,
+    /// What the feed-size pixels were rasterized for.
+    made_for: Option<RasterTarget>,
+    img: Option<Img>,
+}
+
+/// A zoomed raster made ahead of `z` for the diagram under the cursor: its pixels wait
+/// in shared memory until focus opens on it (then they're shown in that first frame).
+struct Prefetch {
+    key: VisualKey,
+    made_for: RasterTarget,
+    done: Option<(String, u32, u32)>,
 }
 
 /// The connection to the shared helper (see `stage-helper --serve`).
@@ -80,8 +108,21 @@ pub struct Gallery {
     svgs: HashMap<VisualKey, String>,
     target: Target,
     focused: Option<VisualKey>,
-    /// Invalidates raster jobs started for an earlier focus or pane size.
-    raster_epoch: u64,
+    /// The focused diagram's zoom and pan.
+    view: ZoomView,
+    /// The focused diagram, parsed once, so zooming and panning only draw.
+    parsed: Arc<Mutex<Option<(VisualKey, Parsed)>>>,
+    /// The target each diagram's latest raster job was started for. Diagrams are
+    /// rasterized for the current target only when on screen (or focused).
+    rastered: HashMap<VisualKey, RasterTarget>,
+    zoom: Option<Unzoomed>,
+    prefetch: Option<Prefetch>,
+    /// Prefetched zoomed pixels to show at the next `place`, the first frame of focus.
+    ready_zoom: Option<(VisualKey, (String, u32, u32))>,
+    /// Images to delete at the next `place` (which has the terminal).
+    dead: Vec<u32>,
+    /// Counts `place` calls, for `Img::shown_at`.
+    frame: u64,
     cache: PathBuf,
     /// The session folder; assets are read straight from its `assets/` (notesd only writes it).
     stage: PathBuf,
@@ -110,22 +151,81 @@ fn fonts() -> Arc<resvg::usvg::fontdb::Database> {
     .clone()
 }
 
-/// SVG → RGBA at the size it will be shown: within `width_px` × `height_px`
-/// (never past 2× its CSS size), on a transparent background so glass shows through.
-pub fn rasterize(svg: &str, width_px: u32, height_px: u32) -> Result<(Vec<u8>, u32, u32), String> {
+/// SVG → RGBA at up to `max_scale`× its CSS size, within the supplied pixel budget,
+/// on a transparent background so glass shows through. The canvas is padded
+/// (diagram centered) to whole `cell` px, so kitty shows it 1:1 instead of
+/// stretching it to the cells it rounds up to.
+pub fn rasterize(svg: &str, width_px: u32, height_px: u32, cell: (u16, u16), max_scale: f32) -> Result<(Vec<u8>, u32, u32), String> {
+    let (tree, at, pw, ph) = fit_svg(svg, width_px, height_px, cell, max_scale)?;
+    let mut px = vec![0; (pw * ph * 4) as usize];
+    draw(&tree, at, &mut px, (pw, ph))?;
+    Ok((px, pw, ph))
+}
+
+/// A diagram parsed by usvg (which also lays out its text: the costly part).
+type Parsed = Arc<resvg::usvg::Tree>;
+
+fn parse(svg: &str) -> Result<Parsed, String> {
     let opt = resvg::usvg::Options { fontdb: fonts(), ..Default::default() };
-    let tree = resvg::usvg::Tree::from_str(svg, &opt).map_err(|e| format!("svg: {e}"))?;
+    resvg::usvg::Tree::from_str(svg, &opt).map(Arc::new).map_err(|e| format!("svg: {e}"))
+}
+
+/// A fitted diagram drawn straight into a new shared-memory object for the terminal,
+/// so no diagram-sized buffer is ever allocated (or kept by malloc) in stage itself.
+fn draw_shm((tree, at, pw, ph): (Parsed, resvg::tiny_skia::Transform, u32, u32)) -> Result<(String, u32, u32), String> {
+    let mut drawn = Ok(());
+    let shm = kitty::shm_fill((pw * ph * 4) as usize, |px| drawn = draw(&tree, at, px, (pw, ph))).map_err(|e| format!("shared memory: {e}"))?;
+    drawn.inspect_err(|_| kitty::unlink(&shm))?;
+    Ok((shm, pw, ph))
+}
+
+/// The parsed diagram, where it's drawn, and the canvas: whole cells, diagram centered.
+fn fit_svg(svg: &str, width_px: u32, height_px: u32, (cw, ch): (u16, u16), max_scale: f32) -> Result<(Parsed, resvg::tiny_skia::Transform, u32, u32), String> {
+    let tree = parse(svg)?;
     let size = tree.size();
-    let scale = (width_px as f32 / size.width()).min(height_px as f32 / size.height()).min(SCALE as f32);
-    let (w, h) = ((size.width() * scale).ceil() as u32, (size.height() * scale).ceil() as u32);
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(w.max(1), h.max(1)).ok_or("empty diagram")?;
-    resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+    let scale = (width_px as f32 / size.width()).min(height_px as f32 / size.height()).min(max_scale);
+    let (w, h) = (
+        ((size.width() * scale).ceil() as u32).clamp(1, width_px.max(1)),
+        ((size.height() * scale).ceil() as u32).clamp(1, height_px.max(1)),
+    );
+    let (cw, ch) = (cw.max(1) as u32, ch.max(1) as u32);
+    let (pw, ph) = (w.div_ceil(cw) * cw, h.div_ceil(ch) * ch);
+    let at = resvg::tiny_skia::Transform::from_scale(scale, scale).post_translate(((pw - w) / 2) as f32, ((ph - h) / 2) as f32);
+    Ok((tree, at, pw, ph))
+}
+
+/// A zoomed diagram: `view.level` 1.5x steps past fitting `width_px`x`height_px` (at most
+/// 8 px per CSS px unless fitting needs more), and of that only the window of the pane's
+/// size around (`cx`, `cy`), kept inside the diagram. Only the window is drawn, so any
+/// zoom costs about one pane of pixels.
+fn fit_view(tree: Parsed, width_px: u32, height_px: u32, (cw, ch): (u16, u16), view: ZoomView) -> Result<(Parsed, resvg::tiny_skia::Transform, u32, u32), String> {
+    let size = tree.size();
+    let fit = (width_px as f32 / size.width()).min(height_px as f32 / size.height());
+    let scale = (fit * 1.5f32.powi(view.level as i32)).min(fit.max(8.0));
+    let (dw, dh) = (size.width() * scale, size.height() * scale);
+    let (w, h) = ((dw.ceil() as u32).clamp(1, width_px.max(1)), (dh.ceil() as u32).clamp(1, height_px.max(1)));
+    let (cw, ch) = (cw.max(1) as u32, ch.max(1) as u32);
+    let (pw, ph) = (w.div_ceil(cw) * cw, h.div_ceil(ch) * ch);
+    let origin = |center: u16, whole: f32, shown: u32| (center as f32 / 1000.0 * whole - shown as f32 / 2.0).clamp(0.0, (whole - shown as f32).max(0.0));
+    let (ox, oy) = (origin(view.cx, dw, w), origin(view.cy, dh, h));
+    let at = resvg::tiny_skia::Transform::from_scale(scale, scale)
+        .post_translate(((pw - w) / 2) as f32 - ox, ((ph - h) / 2) as f32 - oy);
+    Ok((tree, at, pw, ph))
+}
+
+/// Draw onto `px` (zeroed: transparent, so glass shows through) as straight RGBA.
+fn draw(tree: &resvg::usvg::Tree, at: resvg::tiny_skia::Transform, px: &mut [u8], (w, h): (u32, u32)) -> Result<(), String> {
+    resvg::render(tree, at, &mut resvg::tiny_skia::PixmapMut::from_bytes(px, w, h).ok_or("empty diagram")?);
     // tiny-skia is premultiplied; kitty wants straight RGBA.
-    let rgba = pixmap.pixels().iter().flat_map(|p| {
-        let c = p.demultiply();
-        [c.red(), c.green(), c.blue(), c.alpha()]
-    });
-    Ok((rgba.collect(), w.max(1), h.max(1)))
+    for p in px.as_chunks_mut::<4>().0 {
+        let a = p[3] as u32;
+        if a != 0 && a != 255 {
+            for c in &mut p[..3] {
+                *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// One `STAGE_TRACE` line, when tracing.
@@ -168,7 +268,14 @@ impl Gallery {
             svgs: HashMap::new(),
             target,
             focused: None,
-            raster_epoch: 0,
+            view: ZoomView::default(),
+            parsed: Arc::default(),
+            rastered: HashMap::new(),
+            zoom: None,
+            prefetch: None,
+            ready_zoom: None,
+            dead: Vec::new(),
+            frame: 0,
             cache,
             stage,
             trace: std::env::var_os("STAGE_TRACE").and_then(|p| std::fs::File::create(p).ok()),
@@ -189,7 +296,7 @@ impl Gallery {
                 i.page
             }).collect();
             for page in pages {
-                let _ = self.send(json!({"op": "html-pause", "id": page}));
+                let _ = self.send(&HelperRequest::HtmlPause { id: page });
             }
         }
     }
@@ -198,15 +305,14 @@ impl Gallery {
     /// first visual doesn't pay for process launch, WebKit and font loading.
     pub fn warm(&mut self) {
         thread::spawn(fonts);
-        let _ = self.ask(json!({"op": "warm"}));
+        let _ = self.ask(|id| HelperRequest::Warm { id });
     }
 
     /// Connect to the shared helper, launching it (detached, so it outlives this
     /// stage and the next one starts warm) if nobody answers.
     fn connect(&self) -> Result<UnixStream, String> {
-        // A new socket keeps existing stages on their helper while this build
-        // starts one with the corrected HTML resize behavior.
-        let sock = self.cache.join("helper-v2.sock");
+        // Versioned so a stage never talks to a helper from an older protocol behavior.
+        let sock = self.cache.join("helper-v3.sock");
         if let Ok(stream) = UnixStream::connect(&sock) {
             return Ok(stream);
         }
@@ -232,7 +338,7 @@ impl Gallery {
     }
 
     /// Send one request to stage-helper, connecting first if needed.
-    fn ask(&mut self, mut req: Value) -> Result<u64, String> {
+    fn ask(&mut self, req: impl FnOnce(u64) -> HelperRequest) -> Result<u64, String> {
         if self.helper.is_none() {
             let stream = self.connect()?;
             let reader = stream.try_clone().map_err(|e| e.to_string())?;
@@ -249,8 +355,7 @@ impl Gallery {
         }
         let id = self.next_req;
         self.next_req += 1;
-        req["id"] = json!(id);
-        self.send(req).map(|()| id)
+        self.send(&req(id)).map(|()| id)
     }
 
     fn write_cache(&self, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
@@ -263,20 +368,20 @@ impl Gallery {
         (self.target.width_px as f64 / SCALE, self.target.max_height_px as f64 / SCALE)
     }
 
-    fn resize_pages(&mut self, focused: Option<&VisualKey>) {
+    fn resize_pages(&mut self) {
         let (width, max_height) = self.html_size();
         let pages: Vec<_> = self.pages.iter()
-            .filter(|(_, key)| focused.is_none_or(|selected| selected == *key))
+            .filter(|(_, key)| self.focused.as_ref().is_none_or(|selected| selected == *key))
             .map(|(id, _)| *id)
             .collect();
         for page in pages {
-            let _ = self.send(json!({"op": "html-resize", "id": page, "width": width, "max_height": max_height, "scale": SCALE}));
+            let _ = self.send(&HelperRequest::HtmlResize { id: page, width, max_height, scale: SCALE });
         }
     }
 
     /// Start making a visual's pixels. Failures come back as messages for the app.
-    pub fn need(&mut self, out: &mut impl Write, key: VisualKey, source: VisualSource, target: Target) -> Vec<Msg> {
-        self.target = target;
+    /// Asked right after a draw, so `self.target` is the current one.
+    pub fn need(&mut self, out: &mut impl Write, key: VisualKey, source: VisualSource) -> Vec<Msg> {
         let kind = match &source {
             VisualSource::Mermaid(_) => "mermaid",
             VisualSource::Asset(_) => "image",
@@ -284,11 +389,13 @@ impl Gallery {
         };
         self.asked.insert(key.clone(), (std::time::Instant::now(), kind));
         let result = match &source {
-            VisualSource::Mermaid(src) => self
-                .ask(json!({"op": "mermaid", "source": src, "max_width": target.width_px as f64 / SCALE, "font_size": 14}))
-                .map(|req| {
-                    self.pending.insert(req, Pending::Mermaid(key.clone()));
-                }),
+            VisualSource::Mermaid(src) => {
+                let max_width = self.target.width_px as f64 / SCALE;
+                self.ask(|id| HelperRequest::Mermaid { id, source: src.clone(), max_width, font_size: 14.0 })
+                    .map(|req| {
+                        self.pending.insert(req, Pending::Mermaid(key.clone()));
+                    })
+            }
             VisualSource::Asset(asset) => {
                 // The file in the session folder, else the bytes over the socket.
                 let local = self.stage.join("assets").join(asset.as_str());
@@ -323,7 +430,7 @@ impl Gallery {
                     return msgs;
                 }
                 let (width, max_height) = self.html_size();
-                self.ask(json!({"op": "html-open", "path": path, "width": width, "max_height": max_height, "scale": SCALE, "fps": 60}))
+                self.ask(|id| HelperRequest::HtmlOpen { id, path, width, max_height, scale: SCALE, fps: 60.0 })
                     .map(|req| {
                         self.pages.insert(req, key.clone());
                     })
@@ -339,7 +446,7 @@ impl Gallery {
     /// in place when it can be), keeping its pixels on screen. `None`: no such page.
     fn update_page(&mut self, key: &VisualKey, path: &std::path::Path) -> Option<Vec<Msg>> {
         let (page, old) = self.pages.iter().find(|(_, k)| k.0 == key.0 && k.2 == key.2).map(|(page, k)| (*page, k.clone()))?;
-        self.send(json!({"op": "html-update", "id": page, "path": path})).ok()?;
+        self.send(&HelperRequest::HtmlUpdate { id: page, path: path.to_owned() }).ok()?;
         self.pages.insert(page, key.clone());
         self.asked.remove(key);
         let Some(img) = self.images.remove(&old) else { return Some(vec![]) };
@@ -350,59 +457,139 @@ impl Gallery {
 
     /// Ask the helper to decode a non-PNG image file.
     fn decode(&mut self, key: VisualKey, path: PathBuf) -> Result<(), String> {
-        let req = self.ask(json!({"op": "image", "path": path}))?;
+        let req = self.ask(|id| HelperRequest::Image { id, path: path.clone() })?;
         self.pending.insert(req, Pending::Image(key, path));
         Ok(())
     }
 
-    /// Re-render only the focused Mermaid card when its full-width target changes.
-    /// Other cards retain their pixels until focus closes; then they render at
-    /// the normal target again. This avoids competing with the card the user sees.
+    /// The focused diagram's zoom and pan, from the app; `place` rasterizes it again on change.
+    pub fn view(&mut self, view: ZoomView) {
+        self.view = view;
+    }
+
+    /// A new target or focus: resize live pages. Diagrams follow in `place`, which
+    /// re-rasterizes only the ones on screen (just the focused one while focused).
     pub fn retarget(&mut self, target: Target, focused: Option<&VisualKey>) {
         if target == self.target && focused == self.focused.as_ref() {
             return;
         }
         self.target = target;
+        if focused != self.focused.as_ref() {
+            // Keep the zoom made ahead's parse for the card being focused; drop any other.
+            let mut parsed = self.parsed.lock().unwrap_or_else(|e| e.into_inner());
+            if parsed.as_ref().is_some_and(|(key, _)| Some(key) != focused) {
+                *parsed = None;
+            }
+        }
         self.focused = focused.cloned();
-        self.raster_epoch += 1;
-        self.raster_target();
-        self.resize_pages(focused);
+        if let Some(ahead) = self.prefetch.take_if(|ahead| focused == Some(&ahead.key)) {
+            if ahead.made_for == self.raster_target(&ahead.key) {
+                // Made for exactly this: no raster job; a pending one lands as the focused raster.
+                self.zoom = Some(Unzoomed { key: ahead.key.clone(), made_for: self.rastered.get(&ahead.key).copied(), img: None });
+                self.rastered.insert(ahead.key.clone(), ahead.made_for);
+                self.ready_zoom = ahead.done.map(|done| (ahead.key, done));
+            } else if let Some((shm, ..)) = ahead.done {
+                kitty::unlink(&shm);
+            }
+        }
+        if let Some(zoom) = self.zoom.take_if(|zoom| focused != Some(&zoom.key)) {
+            if let Some(zoomed) = zoom.img.and_then(|img| self.images.insert(zoom.key.clone(), img)) {
+                self.dead.extend([Some(zoomed.id), zoomed.previous].into_iter().flatten());
+            }
+            match zoom.made_for {
+                Some(made_for) => self.rastered.insert(zoom.key, made_for),
+                None => self.rastered.remove(&zoom.key),
+            };
+        }
+        self.resize_pages();
+    }
+
+    fn raster_target(&self, key: &VisualKey) -> RasterTarget {
+        match self.focused.as_ref() == Some(key) {
+            // The whole diagram in the pane: no scrolling a zoomed one.
+            true => (self.target.width_px, self.target.max_height_px, self.target.cell_px, Some(self.view)),
+            false => (self.target.width_px, MAX_MERMAID_HEIGHT_PX, self.target.cell_px, None),
+        }
     }
 
     /// A request about an existing page (its id is the page id, not a new one).
-    fn send(&mut self, req: Value) -> Result<(), String> {
+    fn send(&mut self, req: &HelperRequest) -> Result<(), String> {
         let helper = self.helper.as_mut().ok_or("stage-helper isn't running")?;
-        if let Err(e) = helper.stream.write_all(format!("{req}\n").as_bytes()) {
+        let line = serde_json::to_string(req).map_err(|e| e.to_string())?;
+        if let Err(e) = helper.stream.write_all(format!("{line}\n").as_bytes()) {
             self.helper = None;
             return Err(format!("stage-helper stopped ({e})"));
         }
         Ok(())
     }
 
-    fn raster_target(&self) {
-        if let Some(key) = &self.focused {
-            if let Some(svg) = self.svgs.get(key) {
-                self.raster(key.clone(), svg.clone());
-            }
-        } else {
-            for (key, svg) in &self.svgs {
-                self.raster(key.clone(), svg.clone());
-            }
+    /// Rasterize `key` for the current target, unless a job for it already exists.
+    fn raster(&mut self, key: &VisualKey) {
+        let made_for = self.raster_target(key);
+        if self.rastered.get(key) == Some(&made_for) {
+            return;
         }
+        let Some(svg) = self.svgs.get(key).cloned() else { return };
+        if made_for.3.is_some() && self.zoom.as_ref().is_none_or(|zoom| &zoom.key != key) {
+            self.zoom = Some(Unzoomed { key: key.clone(), made_for: self.rastered.get(key).copied(), img: None });
+        }
+        self.rastered.insert(key.clone(), made_for);
+        self.spawn_raster(key.clone(), svg, made_for);
     }
 
-    fn raster(&self, key: VisualKey, svg: String) {
-        let (tx, width, height, epoch) = (self.tx.clone(), self.target.width_px, self.target.max_height_px, self.raster_epoch);
+    /// Set the card's feed image aside while it's zoomed. Pixels it still holds back for
+    /// a resize are deleted now: hidden under the zoom, they'd stay on screen.
+    fn park(&mut self, key: &VisualKey) {
+        if !self.zoom.as_ref().is_some_and(|zoom| &zoom.key == key && zoom.img.is_none()) {
+            return;
+        }
+        let Some(mut img) = self.images.remove(key) else { return };
+        if let Some(previous) = img.previous.take() {
+            self.dead.push(previous);
+            img.placed = None;
+        }
+        self.zoom.as_mut().expect("checked").img = Some(img);
+    }
+
+    /// Make the zoomed raster for `key` at `target` ahead of `z` (one at a time). Asked
+    /// again for one already made, it says so again: the app may have forgotten its size.
+    pub fn prefetch_zoom(&mut self, key: VisualKey, target: Target) -> Option<Msg> {
+        let made_for = (target.width_px, target.max_height_px, target.cell_px, Some(ZoomView::default()));
+        if let Some(ahead) = self.prefetch.as_ref().filter(|ahead| ahead.key == key && ahead.made_for == made_for) {
+            return ahead.done.as_ref().map(|(_, w, h)| Msg::ZoomReady { key, w: *w, h: *h });
+        }
+        if self.focused.is_some() {
+            return None;
+        }
+        let svg = self.svgs.get(&key).cloned()?;
+        if let Some((shm, ..)) = self.prefetch.take().and_then(|ahead| ahead.done) {
+            kitty::unlink(&shm);
+        }
+        self.prefetch = Some(Prefetch { key: key.clone(), made_for, done: None });
+        self.spawn_raster(key, svg, made_for);
+        None
+    }
+
+    fn spawn_raster(&self, key: VisualKey, svg: String, made_for: RasterTarget) {
+        let (tx, parsed, (width, height, cell, zoom)) = (self.tx.clone(), self.parsed.clone(), made_for);
         thread::spawn(move || {
             let t0 = std::time::Instant::now();
-            let raster = rasterize(&svg, width, height);
+            let done = match zoom {
+                Some(view) => {
+                    let mut cached = parsed.lock().unwrap_or_else(|e| e.into_inner());
+                    let tree = match cached.as_ref().filter(|(k, _)| *k == key) {
+                        Some((_, tree)) => Ok(tree.clone()),
+                        None => parse(&svg).inspect(|tree| *cached = Some((key.clone(), tree.clone()))),
+                    };
+                    drop(cached);
+                    tree.and_then(|tree| fit_view(tree, width, height, cell, view)).and_then(draw_shm)
+                }
+                None => fit_svg(&svg, width, height, cell, SCALE as f32).and_then(draw_shm),
+            };
             if std::env::var_os("STAGE_HELPER_TRACE").is_some() {
                 eprintln!("resvg {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0);
             }
-            let done = raster.and_then(|(px, w, h)| {
-                kitty::shm_write(&px).map(|shm| (shm, w, h)).map_err(|e| format!("shared memory: {e}"))
-            });
-            let _ = tx.send(Msg::Gfx(Gfx::Raster { key, epoch, done }));
+            let _ = tx.send(Msg::Gfx(Gfx::Raster { key, made_for, done }));
         });
     }
 
@@ -419,7 +606,7 @@ impl Gallery {
         let img = self.images.entry(key.clone()).or_insert_with(|| {
             let id = *next_id;
             *next_id += 1;
-            Img { id, w, h, placed: None, previous: None, page: None, paused: false, file: None }
+            Img { id, w, h, placed: None, previous: None, page: None, paused: false, file: None, shown_at: 0 }
         });
         img.file = Some(path.to_owned());
         let _ = out.write_all(&kitty::transmit_png(img.id, path));
@@ -438,7 +625,7 @@ impl Gallery {
         let img = self.images.entry(key.clone()).or_insert_with(|| {
             let id = *next_id;
             *next_id += 1;
-            Img { id, w, h, placed: None, previous: None, page, paused: false, file: None }
+            Img { id, w, h, placed: None, previous: None, page, paused: false, file: None, shown_at: 0 }
         });
         if file.is_some() {
             img.file = file;
@@ -485,61 +672,86 @@ impl Gallery {
                 msgs.extend(self.pages.drain().map(|(_, key)| Msg::VisualFailed { key, reason: "stage-helper stopped".into() }));
                 msgs
             }
-            Gfx::Raster { epoch, done, .. } if epoch != self.raster_epoch => {
+            Gfx::Raster { key, made_for, done }
+                if self.focused.as_ref() != Some(&key)
+                    && self.prefetch.as_ref().is_some_and(|ahead| ahead.key == key && ahead.made_for == made_for && ahead.done.is_none()) =>
+            {
+                match done {
+                    Ok((shm, w, h)) => {
+                        self.prefetch.as_mut().expect("checked").done = Some((shm, w, h));
+                        vec![Msg::ZoomReady { key, w, h }]
+                    }
+                    Err(_) => {
+                        self.prefetch = None;
+                        vec![]
+                    }
+                }
+            }
+            Gfx::Raster { key, made_for, done } if made_for != self.raster_target(&key) => {
+                // Made for an earlier width: drop it, and let `place` ask again if it's on screen.
                 if let Ok((shm, ..)) = done { kitty::unlink(&shm); }
+                if self.rastered.get(&key) == Some(&made_for) {
+                    self.rastered.remove(&key);
+                }
+                // Nor do the feed pixels set aside while zoomed come from it.
+                if let Some(zoom) = self.zoom.as_mut().filter(|zoom| zoom.key == key && zoom.made_for == Some(made_for)) {
+                    zoom.made_for = None;
+                }
                 vec![]
             }
-            Gfx::Raster { key, done, .. } => match done {
+            Gfx::Raster { key, made_for, done } => match done {
                 Ok((shm, w, h)) => {
-                    // Even if the dimensions match, the focused preview is now
-                    // crisp and must return to its natural pixel scale.
-                    let ready = self.show(out, key.clone(), &shm, (w, h), None, None)
-                        .unwrap_or(Msg::VisualReady { key, w, h, max_scale: 1.0 });
-                    vec![ready]
-                },
+                    // A zoomed raster gets its own image; the feed-size one waits for focus to close.
+                    if made_for.3.is_some() {
+                        self.park(&key);
+                    }
+                    let shown = self.show(out, key, &shm, (w, h), None, None);
+                    // Zoomed pixels only count while the app still focuses this card: a `z`
+                    // back in the same loop turn must not leave the feed laid out zoomed.
+                    match shown {
+                        Some(Msg::VisualReady { key, w, h, .. }) if made_for.3.is_some() => vec![Msg::ZoomShown { key, w, h }],
+                        other => other.into_iter().collect(),
+                    }
+                }
                 Err(reason) => vec![Msg::VisualFailed { key, reason }],
             },
             Gfx::Helper(line) => {
-                let Ok(v) = serde_json::from_str::<Value>(&line) else { return vec![] };
-                let id = v["id"].as_u64().unwrap_or(0);
-                let dims = || Some((v["w"].as_u64()? as u32, v["h"].as_u64()? as u32));
-                if let Some(frame) = v["frame"].as_u64() {
-                    let (Some(key), Some(shm), Some(size)) = (self.pages.get(&id).cloned(), v["shm"].as_str(), dims()) else {
-                        return vec![];
-                    };
-                    // A frame captured before a focus/resize can arrive after the
-                    // target changes. Never show it at an intermediate width.
-                    if size.0 != self.target.width_px {
-                        kitty::unlink(shm);
-                        let _ = self.send(json!({"op": "html-ack", "id": id, "frame": frame}));
-                        return vec![];
+                let Ok(reply) = serde_json::from_str::<HelperReply>(&line) else { return vec![] };
+                match reply {
+                    HelperReply::Frame(Frame { id, frame, shm, w, h }) => {
+                        let Some(key) = self.pages.get(&id).cloned() else { return vec![] };
+                        // A frame captured before a focus/resize can arrive after the
+                        // target changes. Never show it at an intermediate width.
+                        if w != self.target.width_px {
+                            kitty::unlink(&shm);
+                            let _ = self.send(&HelperRequest::HtmlAck { id, frame });
+                            return vec![];
+                        }
+                        let msg = self.show(out, key, &shm, (w, h), Some(id), None);
+                        let _ = self.send(&HelperRequest::HtmlAck { id, frame });
+                        msg.into_iter().collect()
                     }
-                    let msg = self.show(out, key, shm, size, Some(id), None);
-                    let _ = self.send(json!({"op": "html-ack", "id": id, "frame": frame}));
-                    return msg.into_iter().collect();
-                }
-                if v["ok"] == json!(false) {
-                    let reason = v["error"].as_str().unwrap_or("stage-helper failed").to_owned();
-                    let key = match self.pending.remove(&id) {
-                        Some(Pending::Mermaid(k) | Pending::Image(k, _)) => Some(k),
-                        None => self.pages.remove(&id),
-                    };
-                    return key.map(|key| Msg::VisualFailed { key, reason }).into_iter().collect();
-                }
-                match self.pending.remove(&id) {
-                    Some(Pending::Mermaid(key)) => {
-                        let svg = v["svg"].as_str().unwrap_or_default().to_owned();
-                        self.svgs.insert(key.clone(), svg.clone());
+                    HelperReply::Failed(Failed { id, error: reason, .. }) => {
+                        let id = id.unwrap_or(0);
+                        let key = match self.pending.remove(&id) {
+                            Some(Pending::Mermaid(k) | Pending::Image(k, _)) => Some(k),
+                            None => self.pages.remove(&id),
+                        };
+                        key.map(|key| Msg::VisualFailed { key, reason }).into_iter().collect()
+                    }
+                    HelperReply::Mermaid(Mermaid { id, svg, .. }) => {
+                        let Some(Pending::Mermaid(key)) = self.pending.remove(&id) else { return vec![] };
+                        self.svgs.insert(key.clone(), svg);
                         if self.focused.as_ref().is_none_or(|focused| focused == &key) {
-                            self.raster(key, svg);
+                            self.raster(&key);
                         }
                         vec![]
                     }
-                    Some(Pending::Image(key, path)) => match (v["shm"].as_str(), dims()) {
-                        (Some(shm), Some(size)) => self.show(out, key, shm, size, None, Some(path)).into_iter().collect(),
-                        _ => vec![Msg::VisualFailed { key, reason: "stage-helper sent no pixels".into() }],
+                    HelperReply::Image(Image { id, shm, w, h, .. }) => match self.pending.remove(&id) {
+                        Some(Pending::Image(key, path)) => self.show(out, key, &shm, (w, h), None, Some(path)).into_iter().collect(),
+                        _ => vec![],
                     },
-                    None => vec![],
+                    HelperReply::Patched(_) | HelperReply::Done(_) => vec![],
                 }
             }
         }
@@ -548,20 +760,37 @@ impl Gallery {
     /// Match kitty placements to what's on screen this frame. Call between a
     /// frame's synchronized-output brackets, after ratatui drew it.
     pub fn place(&mut self, out: &mut impl Write, on_screen: &[OnScreen]) {
+        if let Some((key, (shm, w, h))) = self.ready_zoom.take() {
+            if on_screen.iter().any(|o| o.key == key && o.px == (w, h)) {
+                // The app laid the card out at this size (`Msg::ZoomReady`): show it in this frame.
+                self.park(&key);
+                let _ = self.show(out, key, &shm, (w, h), None, None);
+            } else {
+                // The app doesn't know its size yet: hand it over like a raster just made.
+                let made_for = self.raster_target(&key);
+                let _ = self.tx.send(Msg::Gfx(Gfx::Raster { key, made_for, done: Ok((shm, w, h)) }));
+            }
+        }
+        // Diagrams on screen (only the focused one while focused) at the current target.
+        for o in on_screen {
+            if self.focused.as_ref().is_none_or(|focused| focused == &o.key) {
+                self.raster(&o.key);
+            }
+        }
         let mut pause = Vec::new();
         let mut resume = Vec::new();
         for (key, img) in self.images.iter_mut() {
-            let wanted = on_screen.iter().find(|o| &o.key == key).map(|o| {
+            let shown = on_screen.iter().find(|o| &o.key == key);
+            if shown.is_some() {
+                img.shown_at = self.frame;
+            }
+            let wanted = shown.map(|o| {
                 crop(&Place { col: o.col, row: o.row, cols: o.cols, rows: o.rows, src: (0, o.top as u32, 0, o.total as u32) }, (img.w, img.h))
             });
-            // While the sidebar still has its old geometry, leave its old pixels
-            // alone. The new image is transmitted but not placed until the redraw
-            // moves the card to its new cell rectangle.
-            if let (Some(new), Some(old), Some(_)) = (wanted, img.placed, img.previous) {
-                if (new.col, new.row, new.cols) == (old.col, old.row, old.cols)
-                    && old.src.2 != img.w {
-                    continue;
-                }
+            // Resized pixels wait (the old image stays) until the layout is sized for
+            // them: the app holds old sizes while a sidebar change waits for every HTML card.
+            if img.previous.is_some() && img.placed.is_some() && shown.is_some_and(|o| o.px != (img.w, img.h)) {
+                continue;
             }
             if let Some(old) = img.previous.take() {
                 let _ = out.write_all(&kitty::delete(old));
@@ -595,11 +824,49 @@ impl Gallery {
                 }
             }
         }
+        // The zoomed image just took the card's place: hide (not delete) the feed-size one.
+        if let Some(img) = self.zoom.as_mut().and_then(|zoom| zoom.img.as_mut()) {
+            if img.placed.take().is_some() {
+                let _ = out.write_all(&kitty::unplace(img.id));
+            }
+        }
+        for id in self.dead.drain(..) {
+            let _ = out.write_all(&kitty::delete(id));
+        }
+        self.keep_diagrams_within_budget(out);
+        self.frame += 1;
         for page in pause {
-            let _ = self.send(json!({"op": "html-pause", "id": page}));
+            let _ = self.send(&HelperRequest::HtmlPause { id: page });
         }
         for page in resume {
-            let _ = self.send(json!({"op": "html-resume", "id": page}));
+            let _ = self.send(&HelperRequest::HtmlResume { id: page });
+        }
+    }
+
+    /// Drop the least recently shown diagrams that aren't on screen while the terminal
+    /// holds more diagram pixels than `DIAGRAM_BUDGET_BYTES`. No allocation unless over.
+    fn keep_diagrams_within_budget(&mut self, out: &mut impl Write) {
+        let bytes = |img: &Img| img.w as u64 * img.h as u64 * 4;
+        let mut held: u64 = self.images.iter().filter(|(key, _)| self.svgs.contains_key(*key)).map(|(_, img)| bytes(img)).sum();
+        if held <= DIAGRAM_BUDGET_BYTES {
+            return;
+        }
+        let mut idle: Vec<(u64, VisualKey)> = self.images.iter()
+            .filter(|(key, img)| self.svgs.contains_key(*key) && img.placed.is_none())
+            .map(|(key, img)| (img.shown_at, key.clone()))
+            .collect();
+        idle.sort_unstable();
+        for (_, key) in idle {
+            if held <= DIAGRAM_BUDGET_BYTES {
+                break;
+            }
+            let img = self.images.remove(&key).expect("listed above");
+            held -= bytes(&img);
+            for id in [Some(img.id), img.previous].into_iter().flatten() {
+                let _ = out.write_all(&kitty::delete(id));
+            }
+            self.rastered.remove(&key);
+            note(&mut self.trace, format_args!("evict {} ({} KB)", img.id, bytes(&img) / 1024));
         }
     }
 
@@ -608,12 +875,25 @@ impl Gallery {
     pub fn replace_all(&mut self, out: &mut impl Write, target: Target, focused: Option<&VisualKey>) {
         self.target = target;
         self.focused = focused.cloned();
-        self.raster_epoch += 1;
+        // The terminal dropped every image: diagrams rasterize again as they come on screen.
+        self.rastered.clear();
+        let ahead = self.prefetch.take().and_then(|ahead| ahead.done);
+        for (shm, ..) in ahead.into_iter().chain(self.ready_zoom.take().map(|(_, done)| done)) {
+            kitty::unlink(&shm);
+        }
+        if let Some(zoom) = self.zoom.as_mut() {
+            zoom.made_for = None;
+            if let Some(img) = zoom.img.as_mut() {
+                img.placed = None;
+            }
+        }
         note(&mut self.trace, format_args!("clear: sending {} images again", self.images.len()));
         let mut decode = Vec::new();
         for (key, img) in self.images.iter_mut() {
             img.placed = None;
-            img.previous = None;
+            if let Some(old) = img.previous.take() {
+                let _ = out.write_all(&kitty::delete(old));
+            }
             match img.file.as_ref().map(|f| (kitty::png_size(&read_head(f)).is_some(), f)) {
                 Some((true, file)) => {
                     let _ = out.write_all(&kitty::transmit_png(img.id, file));
@@ -625,9 +905,8 @@ impl Gallery {
         for (key, file) in decode {
             let _ = self.decode(key, file);
         }
-        self.raster_target();
         // Only the focused page needs the new size while it fills the pane.
-        self.resize_pages(focused);
+        self.resize_pages();
     }
 
     /// Remove every image (on quit).
@@ -673,7 +952,7 @@ mod tests {
     #[test]
     fn html_frame_from_before_a_resize_is_never_transmitted() {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 800, max_height_px: 400 });
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 800, max_height_px: 400, cell_px: (1, 1) });
         let key: VisualKey = ("page".into(), 1, 0);
         gallery.pages.insert(9, key.clone());
         let mut out = Vec::new();
@@ -688,13 +967,13 @@ mod tests {
     #[test]
     fn live_frames_reuse_the_placed_pixel_rect() {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut g = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 660, max_height_px: 360 });
+        let mut g = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 660, max_height_px: 360, cell_px: (10, 20) });
         let key: VisualKey = ("p".into(), 1, 0);
         g.pages.insert(9, key.clone());
         let frame = |n: u64| Gfx::Helper(format!(r#"{{"id":9,"frame":{n},"shm":"/stg-test-{n}","w":660,"h":360}}"#));
         let mut out = Vec::new();
         g.handle(&mut out, frame(1));
-        g.place(&mut Vec::new(), &[OnScreen { key: key.clone(), col: 3, row: 4, cols: 40, top: 0, rows: 10, total: 10 }]);
+        g.place(&mut Vec::new(), &[OnScreen { key: key.clone(), col: 3, row: 4, cols: 40, top: 0, rows: 10, total: 10, px: (660, 360) }]);
         out.clear();
         g.handle(&mut out, frame(2));
         let s = String::from_utf8_lossy(&out);
@@ -704,12 +983,12 @@ mod tests {
     #[test]
     fn resized_html_keeps_old_pixels_until_the_card_moves_to_its_new_width() {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 600, max_height_px: 400 });
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 600, max_height_px: 400, cell_px: (1, 1) });
         let key: VisualKey = ("page".into(), 1, 0);
         gallery.pages.insert(9, key.clone());
         let frame = |number, width| Gfx::Helper(format!(r#"{{"id":9,"frame":{number},"shm":"/stg-test-{number}","w":{width},"h":200}}"#));
         gallery.handle(&mut Vec::new(), frame(1, 600));
-        let old = OnScreen { key: key.clone(), col: 25, row: 4, cols: 70, top: 0, rows: 10, total: 10 };
+        let old = OnScreen { key: key.clone(), col: 25, row: 4, cols: 70, top: 0, rows: 10, total: 10, px: (600, 200) };
         gallery.place(&mut Vec::new(), std::slice::from_ref(&old));
         let old_id = gallery.images[&key].id;
 
@@ -718,53 +997,294 @@ mod tests {
         gallery.handle(&mut transmitted, frame(2, 800));
         let new_id = gallery.images[&key].id;
         assert_ne!(new_id, old_id);
-        assert!(!String::from_utf8_lossy(&transmitted).contains(&format!("a=d,d=i,i={old_id}")));
+        assert!(!String::from_utf8_lossy(&transmitted).contains(&format!("a=d,d=I,i={old_id}")));
         let mut still_old = Vec::new();
         gallery.place(&mut still_old, std::slice::from_ref(&old));
         assert!(still_old.is_empty(), "the old sidebar layout keeps the old pixels");
 
         let mut switched = Vec::new();
-        gallery.place(&mut switched, &[OnScreen { col: 0, cols: 95, ..old }]);
+        gallery.place(&mut switched, &[OnScreen { col: 0, cols: 95, px: (800, 200), ..old }]);
         let output = String::from_utf8_lossy(&switched);
-        assert!(output.contains(&format!("a=d,d=i,i={old_id}")));
+        assert!(output.contains(&format!("a=d,d=I,i={old_id}")));
         assert!(output.contains(&format!("a=p,i={new_id}")));
     }
 
     #[test]
-    fn focusing_rasterizes_only_the_selected_mermaid_and_ignores_old_pixels() {
+    fn leaving_focus_places_the_narrow_raster_once_the_layout_uses_it() {
+        // z→z with the sidebar shown: the full-width raster is still on screen in the
+        // normal column (same cell rect) when the normal-width one lands.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 950, max_height_px: 400, cell_px: (10, 20) });
+        let key: VisualKey = ("diagram".into(), 1, 0);
+        let shms: Vec<String> = [(950, 400), (690, 300)].iter().map(|(w, h)| kitty::shm_write(&vec![0; w * h * 4]).unwrap()).collect();
+        let raster = |shm: &str, w, h| Gfx::Raster { key: key.clone(), made_for: (950, MAX_MERMAID_HEIGHT_PX, (10, 20), None), done: Ok((shm.to_owned(), w, h)) };
+        gallery.handle(&mut Vec::new(), raster(&shms[0], 950, 400));
+        let at = OnScreen { key: key.clone(), col: 29, row: 7, cols: 69, top: 0, rows: 20, total: 20, px: (950, 400) };
+        gallery.place(&mut Vec::new(), std::slice::from_ref(&at));
+        let wide_id = gallery.images[&key].id;
+        gallery.handle(&mut Vec::new(), raster(&shms[1], 690, 300));
+        let narrow_id = gallery.images[&key].id;
+        let mut out = Vec::new();
+        gallery.place(&mut out, std::slice::from_ref(&at));
+        assert!(out.is_empty(), "the layout still sizes the card for the wide pixels");
+        gallery.place(&mut out, &[OnScreen { rows: 15, total: 15, px: (690, 300), ..at }]);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains(&format!("a=d,d=I,i={wide_id}")) && s.contains(&format!("a=p,i={narrow_id},p=1,x=0,y=0,w=690,h=300,c=69,r=15")), "{s}");
+        shms.iter().for_each(|shm| kitty::unlink(shm)); // no terminal here to consume them
+    }
+
+    /// `place` with these cards on screen, as the app would after a draw.
+    fn shown(keys: &[&VisualKey]) -> Vec<OnScreen> {
+        keys.iter().map(|k| OnScreen { key: (*k).clone(), col: 0, row: 0, cols: 10, top: 0, rows: 5, total: 5, px: (0, 0) }).collect()
+    }
+
+    fn next_raster(rx: &std::sync::mpsc::Receiver<Msg>) -> (VisualKey, RasterTarget, Result<(String, u32, u32), String>) {
+        let Msg::Gfx(Gfx::Raster { key, made_for, done }) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap() else { panic!("no raster") };
+        (key, made_for, done)
+    }
+
+    #[test]
+    fn only_diagrams_on_screen_rasterize_and_only_the_focused_one_while_focused() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let normal = Target { width_px: 100, max_height_px: 100 };
-        let focused_target = Target { width_px: 200, max_height_px: 200 };
+        let normal = Target { width_px: 100, max_height_px: 100, cell_px: (1, 1) };
         let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), normal);
-        let first: VisualKey = ("first".into(), 1, 0);
-        let second: VisualKey = ("second".into(), 1, 0);
+        let (first, second, off): (VisualKey, VisualKey, VisualKey) = (("first".into(), 1, 0), ("second".into(), 1, 0), ("off".into(), 1, 0));
         let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="#89b4fa"/></svg>"##;
-        gallery.svgs.insert(first.clone(), svg.into());
-        gallery.svgs.insert(second.clone(), svg.into());
-        gallery.retarget(focused_target, Some(&second));
-        let Msg::Gfx(Gfx::Raster { key, epoch, done }) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap() else { panic!("no raster") };
-        assert_eq!(key, second);
-        assert!(rx.try_recv().is_err(), "offscreen Mermaid cards must not render during focus");
-        let (shm, ..) = done.unwrap();
-        assert!(gallery.handle(&mut Vec::new(), Gfx::Raster { key, epoch: epoch - 1, done: Ok((shm.clone(), 200, 100)) }).is_empty());
-        assert!(!gallery.images.contains_key(&second));
-        // The stale completion owns its shm and must unlink it.
-        assert!(kitty::shm_read(&shm, 1).is_err());
-        gallery.retarget(normal, None);
-        let mut keys = [rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(), rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap()]
-            .into_iter().map(|msg| match msg { Msg::Gfx(Gfx::Raster { key, done: Ok((shm, ..)), .. }) => { kitty::unlink(&shm); key }, _ => panic!("no raster") }).collect::<Vec<_>>();
+        for k in [&first, &second, &off] {
+            gallery.svgs.insert(k.clone(), svg.into());
+        }
+        let unlink = |done: Result<(String, u32, u32), String>| kitty::unlink(&done.unwrap().0);
+        gallery.place(&mut Vec::new(), &shown(&[&first, &second]));
+        let mut keys = [next_raster(&rx), next_raster(&rx)].map(|(key, _, done)| { unlink(done); key });
         keys.sort();
-        assert_eq!(keys, [first, second]);
+        assert_eq!(keys, [first.clone(), second.clone()]);
+        // Drawn again at the same target: nothing new.
+        gallery.place(&mut Vec::new(), &shown(&[&first, &second]));
+        assert!(rx.try_recv().is_err());
+
+        gallery.retarget(Target { width_px: 200, ..normal }, Some(&second));
+        gallery.place(&mut Vec::new(), &shown(&[&second]));
+        let (key, made_for, done) = next_raster(&rx);
+        assert_eq!((key, made_for), (second.clone(), (200, 100, (1, 1), Some(ZoomView::default()))));
+        unlink(done);
+        assert!(rx.try_recv().is_err(), "nothing but the focused card renders during focus");
+
+        // Back to the normal width: both already have feed-size pixels, so nothing renders.
+        gallery.retarget(normal, None);
+        gallery.place(&mut Vec::new(), &shown(&[&first, &second]));
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "an off-screen or already-current diagram never rasterizes");
     }
 
     #[test]
     fn rasterizes_svg_at_the_card_width() {
         let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="#89b4fa"/></svg>"##;
-        let (px, w, h) = rasterize(svg, 150, 1000).unwrap();
+        let (px, w, h) = rasterize(svg, 150, 1000, (1, 1), 2.0).unwrap();
         assert_eq!((w, h), (150, 75));
         assert_eq!(&px[..4], &[0x89, 0xb4, 0xfa, 0xff]);
-        // Never past 2× the SVG's own size, and no taller than it will be shown.
-        assert_eq!(rasterize(svg, 1000, 1000).unwrap().1, 200);
-        assert_eq!(rasterize(svg, 1000, 40).unwrap().2, 40);
+        // Never past 2× the SVG's own size or the explicit height budget.
+        assert_eq!(rasterize(svg, 1000, 1000, (1, 1), 2.0).unwrap().1, 200);
+        assert_eq!(rasterize(svg, 1000, 40, (1, 1), 2.0).unwrap().2, 40);
+    }
+
+    #[test]
+    fn a_focused_diagram_fills_the_pane_at_full_resolution() {
+        // Vector: zooming re-rasterizes as large as the pane allows (width and height, so
+        // nothing to scroll) instead of stopping at 2x the diagram's own size.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let target = Target { width_px: 1000, max_height_px: 400, cell_px: (1, 1) };
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), target);
+        let key: VisualKey = ("small".into(), 1, 0);
+        gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
+        gallery.place(&mut Vec::new(), &shown(&[&key]));
+        let (_, _, done) = next_raster(&rx);
+        let (shm, w, h) = done.unwrap();
+        kitty::unlink(&shm);
+        assert_eq!((w, h), (200, 100), "in the feed: native size (2x CSS px)");
+        gallery.retarget(target, Some(&key));
+        gallery.place(&mut Vec::new(), &shown(&[&key]));
+        let (_, _, done) = next_raster(&rx);
+        let (shm, w, h) = done.unwrap();
+        kitty::unlink(&shm);
+        assert_eq!((w, h), (800, 400), "focused: as large as fits the 1000x400 pane");
+    }
+
+    #[test]
+    fn closing_focus_puts_the_feed_pixels_back_without_a_new_raster() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let target = Target { width_px: 1000, max_height_px: 400, cell_px: (1, 1) };
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), target);
+        let key: VisualKey = ("small".into(), 1, 0);
+        gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
+        let at = |px| OnScreen { key: key.clone(), col: 0, row: 0, cols: 10, top: 0, rows: 5, total: 5, px };
+        gallery.place(&mut Vec::new(), &[at((0, 0))]);
+        let (key_, made_for, done) = next_raster(&rx);
+        gallery.handle(&mut Vec::new(), Gfx::Raster { key: key_, made_for, done });
+        gallery.place(&mut Vec::new(), &[at((200, 100))]);
+        let feed_id = gallery.images[&key].id;
+        gallery.retarget(target, Some(&key));
+        gallery.place(&mut Vec::new(), &[at((200, 100))]);
+        let (key_, made_for, done) = next_raster(&rx);
+        gallery.handle(&mut Vec::new(), Gfx::Raster { key: key_, made_for, done });
+        let zoomed_id = gallery.images[&key].id;
+        let mut out = Vec::new();
+        gallery.place(&mut out, &[at((800, 400))]);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains(&format!("a=p,i={zoomed_id},")) && s.contains(&format!("a=d,d=i,i={feed_id},p=1")), "zoomed shown, feed pixels hidden but kept: {s}");
+        assert!(!s.contains(&format!("a=d,d=I,i={feed_id},q=2")));
+        gallery.retarget(target, None);
+        let mut out = Vec::new();
+        gallery.place(&mut out, &[at((200, 100))]);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains(&format!("a=p,i={feed_id},")) && s.contains(&format!("a=d,d=I,i={zoomed_id},q=2")), "{s}");
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "the feed pixels are still right: no raster");
+    }
+
+    #[test]
+    fn a_zoom_made_ahead_shows_in_the_first_focused_frame() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let feed = Target { width_px: 800, max_height_px: 400, cell_px: (1, 1) };
+        let focus = Target { width_px: 1000, ..feed };
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), feed);
+        let key: VisualKey = ("chart".into(), 1, 0);
+        gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
+        assert!(gallery.prefetch_zoom(key.clone(), focus).is_none());
+        let (key_, made_for, done) = next_raster(&rx);
+        assert_eq!(made_for, (1000, 400, (1, 1), Some(ZoomView::default())));
+        assert!(matches!(gallery.handle(&mut Vec::new(), Gfx::Raster { key: key_, made_for, done }).as_slice(), [Msg::ZoomReady { w: 800, h: 400, .. }]));
+        gallery.retarget(focus, Some(&key));
+        let mut out = Vec::new();
+        gallery.place(&mut out, &[OnScreen { key: key.clone(), col: 0, row: 0, cols: 800, top: 0, rows: 400, total: 400, px: (800, 400) }]);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("s=800,v=400") && s.contains("a=p,") && s.contains("w=800,h=400"), "{s}");
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "focus starts no raster: it was made ahead");
+    }
+
+    #[test]
+    fn diagrams_past_the_budget_are_dropped_least_recent_first_and_come_back() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let target = Target { width_px: 4096, max_height_px: 400, cell_px: (1, 1) };
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), target);
+        // 16 MB each: nine of them are past the 128 MB budget.
+        let keys: Vec<VisualKey> = (0..9).map(|i| (format!("d{i}").into(), 1, 0)).collect();
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="2048" height="512"/>"#;
+        let mut out = Vec::new();
+        for key in &keys {
+            gallery.svgs.insert(key.clone(), svg.into());
+            gallery.place(&mut out, &shown(&[key]));
+            let (key_, made_for, done) = next_raster(&rx);
+            gallery.handle(&mut Vec::new(), Gfx::Raster { key: key_, made_for, done });
+            gallery.place(&mut out, &shown(&[key]));
+        }
+        let first = String::from_utf8_lossy(&out);
+        assert!(!gallery.images.contains_key(&keys[0]) && gallery.images.contains_key(&keys[1]), "only the least recent one goes");
+        assert!(first.contains("a=d,d=I,"), "and its pixels are freed in the terminal: {first}");
+        gallery.place(&mut Vec::new(), &shown(&[&keys[0]]));
+        let (key, _, done) = next_raster(&rx);
+        assert_eq!(key, keys[0], "seen again, it rasterizes again");
+        kitty::unlink(&done.unwrap().0);
+    }
+
+    #[test]
+    fn asking_again_for_a_zoom_already_made_says_its_size_again() {
+        // Found by the stage-pixels model: z, z before a draw, then z again showed
+        // zoomed pixels squeezed into the feed layout, because the app forgot the size.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let feed = Target { width_px: 800, max_height_px: 400, cell_px: (1, 1) };
+        let focus = Target { width_px: 1000, ..feed };
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), feed);
+        let key: VisualKey = ("chart".into(), 1, 0);
+        gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
+        assert!(gallery.prefetch_zoom(key.clone(), focus).is_none());
+        let (key_, made_for, done) = next_raster(&rx);
+        gallery.handle(&mut Vec::new(), Gfx::Raster { key: key_, made_for, done });
+        assert!(matches!(gallery.prefetch_zoom(key.clone(), focus), Some(Msg::ZoomReady { w: 800, h: 400, .. })));
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "and doesn't rasterize it again");
+        if let Some(Prefetch { done: Some((shm, ..)), .. }) = gallery.prefetch.take() { kitty::unlink(&shm); }
+    }
+
+    #[test]
+    fn a_zoomed_view_draws_only_its_window_at_full_resolution() {
+        // Left half red, right half blue; a 400x400 pane at level 2 (2.25x past fitting).
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><rect width="50" height="100" fill="#ff0000"/><rect x="50" width="50" height="100" fill="#0000ff"/></svg>"##;
+        let window = |view| {
+            let (tree, at, w, h) = fit_view(parse(svg).unwrap(), 400, 400, (1, 1), view).unwrap();
+            let mut px = vec![0; (w * h * 4) as usize];
+            draw(&tree, at, &mut px, (w, h)).unwrap();
+            (w, h, px)
+        };
+        let (w, h, fit) = window(ZoomView::default());
+        assert_eq!((w, h), (400, 400), "level 0 fits the pane");
+        assert_eq!((&fit[..4], &fit[fit.len() - 4..]), (&[255, 0, 0, 255][..], &[0, 0, 255, 255][..]));
+        let (w, h, left) = window(ZoomView { level: 2, cx: 0, cy: 500 });
+        assert_eq!((w, h), (400, 400), "zoomed in: still one pane of pixels");
+        assert!(left.chunks(4).all(|p| p == [255, 0, 0, 255]), "panned left: only the red half");
+        let (_, _, right) = window(ZoomView { level: 2, cx: 1000, cy: 500 });
+        assert!(right.chunks(4).all(|p| p == [0, 0, 255, 255]), "panned right: only the blue half");
+    }
+
+    #[test]
+    fn resize_cannot_replace_crisp_pixels_with_an_older_raster() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let at = |width_px| Target { width_px, max_height_px: 100, cell_px: (1, 1) };
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), at(120));
+        let key: VisualKey = ("diagram".into(), 1, 0);
+        gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
+        gallery.place(&mut Vec::new(), &shown(&[&key]));
+        let old = next_raster(&rx);
+        gallery.retarget(at(180), None);
+        gallery.place(&mut Vec::new(), &shown(&[&key]));
+        let latest = next_raster(&rx);
+        let (shm, w, h) = latest.2.unwrap();
+        assert_eq!((w, h), (180, 90));
+        assert_eq!(gallery.handle(&mut Vec::new(), Gfx::Raster { key: key.clone(), made_for: latest.1, done: Ok((shm.clone(), w, h)) }).len(), 1);
+        kitty::unlink(&shm); // the test has no terminal to consume the transmitted pixels
+        let (stale_shm, stale_w, stale_h) = old.2.unwrap();
+        assert!(gallery.handle(&mut Vec::new(), Gfx::Raster { key: key.clone(), made_for: old.1, done: Ok((stale_shm.clone(), stale_w, stale_h)) }).is_empty());
+        assert!(kitty::shm_read(&stale_shm, 1).is_err(), "a dropped raster's shm is unlinked");
+        assert_eq!((gallery.images[&key].w, gallery.images[&key].h), (180, 90));
+    }
+
+    #[test]
+    fn a_dropped_raster_is_asked_for_again_when_its_width_comes_back() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let at = |width_px| Target { width_px, max_height_px: 100, cell_px: (1, 1) };
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), at(100));
+        let key: VisualKey = ("diagram".into(), 1, 0);
+        gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
+        gallery.place(&mut Vec::new(), &shown(&[&key]));
+        let first = next_raster(&rx);
+        // It lands while the width is briefly different (a focus round trip), so it's dropped…
+        gallery.retarget(at(200), None);
+        gallery.handle(&mut Vec::new(), Gfx::Raster { key: key.clone(), made_for: first.1, done: first.2 });
+        gallery.retarget(at(100), None);
+        // …and the next draw asks again instead of waiting forever for pixels already thrown away.
+        gallery.place(&mut Vec::new(), &shown(&[&key]));
+        let again = next_raster(&rx);
+        assert_eq!(again.1, (100, MAX_MERMAID_HEIGHT_PX, (1, 1), None));
+        kitty::unlink(&again.2.unwrap().0);
+    }
+
+    #[test]
+    fn tall_mermaid_retains_card_width_instead_of_shrinking_to_viewport() {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="650" height="816"><rect width="650" height="816"/></svg>"#;
+        let (_, w, h) = rasterize(svg, 700, MAX_MERMAID_HEIGHT_PX, (1, 1), 2.0).unwrap();
+        assert_eq!((w, h), (700, 879));
+    }
+
+    #[test]
+    fn mermaid_fills_whole_cells_so_kitty_never_resamples() {
+        // 420×415.5 CSS px at 2× is 840×831; with 10×20 px cells that rounded up
+        // to 84×42 cells (840×840 px) and kitty stretched it ~1% vertically.
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="420" height="415.5"><rect width="420" height="415.5" fill="red"/></svg>"#;
+        let cell = (10, 20);
+        let (px, w, h) = rasterize(svg, 840, MAX_MERMAID_HEIGHT_PX, cell, 2.0).unwrap();
+        assert_eq!((w, h), (840, 840));
+        // The padding is transparent: the last row was not drawn on.
+        assert!(px[((h - 1) * w * 4) as usize..].chunks(4).all(|p| p[3] == 0));
+        let crate::cards::Fit::Ready { cols, rows } = crate::app::fit_cells((w, h), 1.0, 84, u16::MAX, cell) else { panic!("fits") };
+        assert_eq!((cols as u32 * 10, rows as u32 * 20), (w, h), "one image px per screen px");
+        // A 25-row crop scrolled 3 rows in: exactly 25 cells of source pixels.
+        let p = crop(&Place { col: 0, row: 0, cols, rows: 25, src: (0, 3, 0, rows as u32) }, (w, h));
+        assert_eq!(p.src, (0, 60, 840, 500));
     }
 }
