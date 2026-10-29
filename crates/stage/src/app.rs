@@ -49,7 +49,8 @@ pub enum VisualState {
     Failed(String),
 }
 
-/// Pixel budget for a visual: the card's inner width and half the visible height.
+/// Pixel budget for a visual: card width and the live HTML viewport height.
+/// Mermaid can extend beyond that height so the feed scrolls through it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Target {
     pub width_px: u32,
@@ -508,7 +509,14 @@ impl App {
         if view.laid.as_ref().is_none_or(|(k, _)| *k != key) {
             let inner = width.saturating_sub(4).max(1);
             let fit = |c: usize| match visuals.get(&(id.clone(), version, c)) {
-                Some(VisualState::Ready { w, h, max_scale }) => fit_cells((*w, *h), *max_scale, inner, page / 2, cell),
+                Some(VisualState::Ready { w, h, max_scale }) => {
+                    // Scroll through tall Mermaid diagrams instead of shrinking their labels.
+                    let rows = match &cards[c].body {
+                        CardBody::Visual { source: VisualSource::Mermaid(_), .. } => u16::MAX,
+                        _ => page / 2,
+                    };
+                    fit_cells((*w, *h), *max_scale, inner, rows, cell)
+                },
                 Some(VisualState::Failed(why)) => Fit::Failed(why.clone()),
                 // Hold about the room a diagram or page usually takes.
                 Some(VisualState::Pending) | None => Fit::Pending { rows: (page / 3).clamp(3, 12) },
@@ -1293,6 +1301,26 @@ mod tests {
         let start = app.start();
         serve(&mut app, start, db);
         app
+    }
+
+    #[test]
+    fn tall_mermaid_scrolls_at_readable_size_while_html_stays_within_viewport() {
+        let mut app = booted(&fake());
+        app.cell_px = (10, 20);
+        let mut post = post("b", "s1", 2, "");
+        post.parts = vec![
+            Part::Mermaid { mermaid: "flowchart TD\n A --> B".into(), id: None },
+            Part::Html { html: "<p>page</p>".into(), kits: vec![], id: None },
+        ];
+        let render = PostRender { id: "b".into(), version: 2, parts: vec![notes_proto::posts::PartRender::Native; 2] };
+        app.loaded.get_mut(&("b".into(), 2)).unwrap().cards = Some(cards::build_cards(&post, &render));
+        for card in 0..2 {
+            app.update(Msg::VisualReady { key: ("b".into(), 2, card), w: 700, h: 879, max_scale: 1.0 });
+        }
+        let page = app.page() as u16;
+        let slots = &app.feed().slots;
+        assert!(slots[0].1.rows > page, "the Mermaid card must scroll instead of shrinking to half a screen");
+        assert!(slots[1].1.rows <= page / 2, "live HTML still fits within half a screen");
     }
 
     #[test]

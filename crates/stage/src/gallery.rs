@@ -36,11 +36,13 @@ pub enum Gfx {
     Helper(String),
     HelperExited,
     /// A mermaid diagram rasterized into shared memory (or why it couldn't be).
-    Raster { key: VisualKey, done: Result<(String, u32, u32), String> },
+    Raster { key: VisualKey, epoch: u64, done: Result<(String, u32, u32), String> },
 }
 
 /// CSS px → device px for helper renders (Retina).
 const SCALE: f64 = 2.0;
+/// Limit very large diagrams without shrinking ordinary tall ones to the viewport.
+const MAX_MERMAID_HEIGHT_PX: u32 = 4096;
 
 struct Img {
     id: u32,
@@ -77,6 +79,7 @@ pub struct Gallery {
     /// Mermaid SVG by visual, kept so a resize can rasterize it again crisply.
     svgs: HashMap<VisualKey, String>,
     target: Target,
+    raster_epoch: u64,
     cache: PathBuf,
     /// The session folder; assets are read straight from its `assets/` (notesd only writes it).
     stage: PathBuf,
@@ -105,14 +108,17 @@ fn fonts() -> Arc<resvg::usvg::fontdb::Database> {
     .clone()
 }
 
-/// SVG → RGBA at the size it will be shown: within `width_px` × `height_px`
-/// (never past 2× its CSS size), on a transparent background so glass shows through.
+/// SVG → RGBA at up to 2× its CSS size, within the supplied pixel budget,
+/// on a transparent background so glass shows through.
 pub fn rasterize(svg: &str, width_px: u32, height_px: u32) -> Result<(Vec<u8>, u32, u32), String> {
     let opt = resvg::usvg::Options { fontdb: fonts(), ..Default::default() };
     let tree = resvg::usvg::Tree::from_str(svg, &opt).map_err(|e| format!("svg: {e}"))?;
     let size = tree.size();
     let scale = (width_px as f32 / size.width()).min(height_px as f32 / size.height()).min(SCALE as f32);
-    let (w, h) = ((size.width() * scale).ceil() as u32, (size.height() * scale).ceil() as u32);
+    let (w, h) = (
+        ((size.width() * scale).ceil() as u32).min(width_px),
+        ((size.height() * scale).ceil() as u32).min(height_px),
+    );
     let mut pixmap = resvg::tiny_skia::Pixmap::new(w.max(1), h.max(1)).ok_or("empty diagram")?;
     resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
     // tiny-skia is premultiplied; kitty wants straight RGBA.
@@ -162,6 +168,7 @@ impl Gallery {
             images: HashMap::new(),
             svgs: HashMap::new(),
             target,
+            raster_epoch: 0,
             cache,
             stage,
             trace: std::env::var_os("STAGE_TRACE").and_then(|p| std::fs::File::create(p).ok()),
@@ -335,14 +342,18 @@ impl Gallery {
         Ok(())
     }
 
-    /// The card width or pane height changed: re-render what depends on it.
+    /// Re-render diagrams when the card width changes, and resize live pages.
     pub fn retarget(&mut self, target: Target) {
         if target == self.target {
             return;
         }
+        let width_changed = target.width_px != self.target.width_px;
         self.target = target;
-        for (key, svg) in self.svgs.clone() {
-            self.raster(key, svg);
+        if width_changed {
+            self.raster_epoch += 1;
+            for (key, svg) in self.svgs.clone() {
+                self.raster(key, svg);
+            }
         }
         let (width, max_height) = self.html_size();
         for page in self.pages.keys().copied().collect::<Vec<_>>() {
@@ -361,17 +372,17 @@ impl Gallery {
     }
 
     fn raster(&self, key: VisualKey, svg: String) {
-        let (tx, width, height) = (self.tx.clone(), self.target.width_px, self.target.max_height_px);
+        let (tx, width, epoch) = (self.tx.clone(), self.target.width_px, self.raster_epoch);
         thread::spawn(move || {
             let t0 = std::time::Instant::now();
-            let raster = rasterize(&svg, width, height);
+            let raster = rasterize(&svg, width, MAX_MERMAID_HEIGHT_PX);
             if std::env::var_os("STAGE_HELPER_TRACE").is_some() {
                 eprintln!("resvg {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0);
             }
             let done = raster.and_then(|(px, w, h)| {
                 kitty::shm_write(&px).map(|shm| (shm, w, h)).map_err(|e| format!("shared memory: {e}"))
             });
-            let _ = tx.send(Msg::Gfx(Gfx::Raster { key, done }));
+            let _ = tx.send(Msg::Gfx(Gfx::Raster { key, epoch, done }));
         });
     }
 
@@ -443,7 +454,11 @@ impl Gallery {
                 msgs.extend(self.pages.drain().map(|(_, key)| Msg::VisualFailed { key, reason: "stage-helper stopped".into() }));
                 msgs
             }
-            Gfx::Raster { key, done } => match done {
+            Gfx::Raster { epoch, done, .. } if epoch != self.raster_epoch => {
+                if let Ok((shm, ..)) = done { kitty::unlink(&shm); }
+                vec![]
+            }
+            Gfx::Raster { key, done, .. } => match done {
                 Ok((shm, w, h)) => self.show(out, key, &shm, (w, h), None, None).into_iter().collect(),
                 Err(reason) => vec![Msg::VisualFailed { key, reason }],
             },
@@ -533,6 +548,7 @@ impl Gallery {
     /// images too, so send every one again (at `target`); the next `place` shows them.
     pub fn replace_all(&mut self, out: &mut impl Write, target: Target) {
         self.target = target;
+        self.raster_epoch += 1;
         note(&mut self.trace, format_args!("clear: sending {} images again", self.images.len()));
         let mut decode = Vec::new();
         for (key, img) in self.images.iter_mut() {
@@ -620,8 +636,41 @@ mod tests {
         let (px, w, h) = rasterize(svg, 150, 1000).unwrap();
         assert_eq!((w, h), (150, 75));
         assert_eq!(&px[..4], &[0x89, 0xb4, 0xfa, 0xff]);
-        // Never past 2× the SVG's own size, and no taller than it will be shown.
+        // Never past 2× the SVG's own size or the explicit height budget.
         assert_eq!(rasterize(svg, 1000, 1000).unwrap().1, 200);
         assert_eq!(rasterize(svg, 1000, 40).unwrap().2, 40);
+    }
+
+    #[test]
+    fn resize_cannot_replace_crisp_pixels_with_an_older_raster() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 100, max_height_px: 100 });
+        let key: VisualKey = ("diagram".into(), 1, 0);
+        gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
+        gallery.retarget(Target { width_px: 120, max_height_px: 100 });
+        gallery.retarget(Target { width_px: 180, max_height_px: 100 });
+        let jobs = [rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(), rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap()];
+        let mut old = None;
+        let mut latest = None;
+        for msg in jobs {
+            let Msg::Gfx(Gfx::Raster { key: job_key, epoch, done }) = msg else { panic!("expected raster") };
+            assert_eq!(job_key, key);
+            if epoch == gallery.raster_epoch { latest = Some(done.unwrap()); } else { old = Some(done.unwrap()); }
+        }
+        let (shm, w, h) = latest.unwrap();
+        assert_eq!((w, h), (180, 90));
+        assert_eq!(gallery.handle(&mut Vec::new(), Gfx::Raster { key: key.clone(), epoch: gallery.raster_epoch, done: Ok((shm.clone(), w, h)) }).len(), 1);
+        kitty::unlink(&shm); // the test has no terminal to consume the transmitted pixels
+        let (stale_shm, stale_w, stale_h) = old.unwrap();
+        assert!(gallery.handle(&mut Vec::new(), Gfx::Raster { key: key.clone(), epoch: gallery.raster_epoch - 1, done: Ok((stale_shm.clone(), stale_w, stale_h)) }).is_empty());
+        assert!(kitty::shm_read(&stale_shm, 1).is_err());
+        assert_eq!((gallery.images[&key].w, gallery.images[&key].h), (180, 90));
+    }
+
+    #[test]
+    fn tall_mermaid_retains_card_width_instead_of_shrinking_to_viewport() {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="650" height="816"><rect width="650" height="816"/></svg>"#;
+        let (_, w, h) = rasterize(svg, 700, MAX_MERMAID_HEIGHT_PX).unwrap();
+        assert_eq!((w, h), (700, 879));
     }
 }
