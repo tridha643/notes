@@ -11,7 +11,7 @@ use std::{
 use notes_proto::{
     posts::{
         AssetId, Comment, CommentListArgs, CommentNewArgs, IdArgs, PartOp, Post, PostListArgs, PostPartArgs, PostRender, PostShowArgs,
-        PostSummary, Session, SessionHit, SessionId, SessionSearchArgs,
+        PostSummary, Session, SessionDeleteArgs, SessionHit, SessionId, SessionSearchArgs,
     },
     to_line, ErrorBody, ErrorCode, Event, Request, Response, Verb, WatchArgs, PROTOCOL_VERSION,
 };
@@ -136,7 +136,7 @@ impl StageClient {
             StageRequest::CommentNew(a) => self.comment_new(a).map_or_else(failed, Reply::Commented),
             StageRequest::CommentList(s) => self.comment_list(s.clone()).map_or_else(failed, |c| Reply::Comments(s, c)),
             StageRequest::SessionRename(a) => self.saved(Verb::SessionRename(a), req),
-            StageRequest::SessionDelete(id) => self.saved(Verb::SessionDelete(IdArgs { id }), req),
+            StageRequest::SessionDelete(id) => self.saved(Verb::SessionDelete(SessionDeleteArgs { id, purge: false }), req),
             StageRequest::PostDelete(id) => self.saved(Verb::PostDelete(IdArgs { id }), req),
             StageRequest::PartDelete(id, i) => {
                 let rm = PostPartArgs { id, op: PartOp::Rm, target: Some(i.to_string()), part: None };

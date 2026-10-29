@@ -322,7 +322,9 @@ def answer(verb, a):
         for pid in [p for p, v in posts.items() if v["session"] == a["id"]]:
             del posts[pid]
         event("session-deleted", id=a["id"], session=a["id"])
-        return None
+        return {"id": a["id"], "trashed": not a.get("purge"), "purged": bool(a.get("purge")), "already": False}
+    if verb == "session-restore":
+        return {"id": a["id"], "restored": True, "already": a["id"] in sessions}
     if verb == "post-new":
         sid = a.get("session") or "s1"
         return write_post(sid, a.get("title") or "Untitled", a["parts"])

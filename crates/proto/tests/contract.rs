@@ -43,6 +43,7 @@ fn name(verb: &Verb) -> &'static str {
         Verb::SessionSearch(_) => "session-search",
         Verb::SessionRename(_) => "session-rename",
         Verb::SessionDelete(_) => "session-delete",
+        Verb::SessionRestore(_) => "session-restore",
         Verb::PostNew(_) => "post-new",
         Verb::PostUpdate(_) => "post-update",
         Verb::PostPart(_) => "post-part",
@@ -64,7 +65,7 @@ fn name(verb: &Verb) -> &'static str {
     }
 }
 
-const VERB_COUNT: usize = 44;
+const VERB_COUNT: usize = 45;
 
 fn md(text: &str) -> Part {
     Part::Markdown { markdown: text.into(), id: Some("p0".into()) }
@@ -98,7 +99,8 @@ fn samples() -> Vec<Verb> {
         Verb::SessionList,
         Verb::SessionSearch(SessionSearchArgs { query: "redirect".into(), limit: Some(20) }),
         Verb::SessionRename(SessionRenameArgs { id: "s1".into(), title: "Renamed".into() }),
-        Verb::SessionDelete(IdArgs { id: "s1".into() }),
+        Verb::SessionDelete(SessionDeleteArgs { id: "s1".into(), purge: false }),
+        Verb::SessionRestore(IdArgs { id: "s1".into() }),
         Verb::PostNew(PostNewArgs { session: Some("s1".into()), title: Some("Plan".into()), parts: vec![md("# Plan")], ..Default::default() }),
         Verb::PostUpdate(PostUpdateArgs { id: "p1".into(), title: None, parts: Some(vec![md("v2")]) }),
         Verb::PostPart(PostPartArgs { id: "p1".into(), op: PartOp::Set, target: Some("0".into()), part: Some(md("set")) }),
@@ -168,6 +170,8 @@ fn responses() -> Vec<(&'static str, Value)> {
         ("session-new", v(session())),
         ("session-list", v(vec![session()])),
         ("session-search", v(vec![SessionHit { session: session(), post: Some("p1".into()), text: Some("the redirect loops".into()) }])),
+        ("session-delete", v(SessionDeleteResult { id: "s1".into(), trashed: true, purged: false, already: false })),
+        ("session-restore", v(SessionRestoreResult { id: "s1".into(), restored: true, already: false })),
         ("post-new", v(PostWriteResult { post: summary(), feedback: vec![comment()] })),
         ("post-list", v(vec![summary()])),
         ("post-show", v(Post { id: "p1".into(), session: "s1".into(), title: "Plan".into(), parts: vec![md("# Plan")], version: 2, created_at: 1_761_400_000, updated_at: 1_761_400_100 })),

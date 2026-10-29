@@ -109,6 +109,7 @@ func roundTrip<T: Codable & Equatable>(_ type: T.Type, _ json: String) throws ->
     #expect(try line("post-update", PostUpdateArgs(id: "p1", parts: [.markdown(markdown: "x")])) == object(#"{"v":1,"id":1,"verb":"post-update","args":{"id":"p1","parts":[{"kind":"markdown","markdown":"x"}]}}"#))
     #expect(try line("session-new", SessionNewArgs(agent: "claude", title: "Fix")) == object(#"{"v":1,"id":1,"verb":"session-new","args":{"agent":"claude","title":"Fix"}}"#))
     #expect(try line("session-rename", SessionRenameArgs(id: "s1", title: "New")) == object(#"{"v":1,"id":1,"verb":"session-rename","args":{"id":"s1","title":"New"}}"#))
+    #expect(try line("session-delete", SessionDeleteArgs(id: "s1", purge: true)) == object(#"{"v":1,"id":1,"verb":"session-delete","args":{"id":"s1","purge":true}}"#))
     #expect(try line("trace-set", TraceSetArgs(session: "s1", steps: [TraceStep(label: "read"), TraceStep(label: "edit", kind: "tool")]))
         == object(#"{"v":1,"id":1,"verb":"trace-set","args":{"session":"s1","steps":[{"label":"read"},{"label":"edit","kind":"tool"}]}}"#))
     #expect(try line("setting-set", SettingSetArgs(key: "theme", value: "github")) == object(#"{"v":1,"id":1,"verb":"setting-set","args":{"key":"theme","value":"github"}}"#))

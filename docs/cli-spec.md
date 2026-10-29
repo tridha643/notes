@@ -127,8 +127,12 @@ Sideshow's verbs live under `post` so they don't collide with note verbs.
 | `notes comment <post> TEXT` | Reply on a post |
 | `notes sessions` | List agent sessions |
 | `notes session search <query> [--limit N]` | Sessions whose title, agent or cwd match, then those whose posts or comments contain the query |
+| `notes session delete <id> [--purge]` | Move a session to the trash (kept 30 days, assets kept), or delete it and its unreferenced assets for good. Result `{id, trashed, purged, already}`; deleting a trashed session succeeds with `already: true` |
+| `notes session restore <id>` | Bring a session back from the trash with posts, comments and assets. Result `{id, restored, already}`; restoring a live session succeeds with `already: true` |
 
-Session data lives in `~/Desktop/Stage/`: one JSON file per session (`<date>-<slug>-<id>.json`, `"schema": 1`) plus `assets/`. notesd is the only writer; deleting a file in Finder deletes the session.
+An id that is neither live nor trashed is `not_found` for both verbs, so `--purge` on something already purged (or never there) is `not_found`: no tombstone is kept. Delete emits `session-deleted` (stage drops it from the sidebar), restore emits `session-restored`; repeats emit nothing.
+
+Session data lives in `~/Desktop/Stage/`: one JSON file per session (`<date>-<slug>-<id>.json`, `"schema": 1`) plus `assets/`. notesd is the only writer; deleting a file in Finder deletes the session. Trashed sessions sit in `.trash/` as `<deleted_at>--<file>`, which the folder loader skips; notesd purges those older than 30 days (and their unreferenced assets) at startup and after each note delete, like the notes trash.
 
 ### Events
 

@@ -19,5 +19,7 @@ notes guide         # how posts should look
 Then post with `notes post <kind> <file|-> --title "..."` (add
 `--session-title "The task"` on the first one), revise with
 `notes post update <id> ...`, and treat `feedback:` lines on stderr as messages
-from the user. If `notes` isn't on PATH, stage isn't installed: say so instead
-of looking for another way to post.
+from the user. `notes session delete <id>` trashes a session for 30 days,
+`notes session restore <id>` brings it back, and `--purge` deletes it for good.
+If `notes` isn't on PATH, stage isn't installed: say so instead of looking for
+another way to post.

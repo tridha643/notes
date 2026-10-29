@@ -24,7 +24,8 @@ use notes_proto::posts::{
     AssetId, AssetInfo, AssetKind, AssetPutArgs, Comment, CommentAnchor, CommentListArgs, CommentNewArgs,
     DiffLayout, IdArgs, Kit, Part, PartOp, Post, PostListArgs, PostNewArgs, PostPartArgs,
     PostId, PostShowArgs, PostSummary, PostUpdateArgs, PostWriteResult, Session, SessionHit,
-    SessionId, SessionRenameArgs, SessionSearchArgs, TraceSetArgs, TraceStep, WaitArgs,
+    SessionDeleteArgs, SessionDeleteResult, SessionId, SessionRenameArgs, SessionRestoreResult,
+    SessionSearchArgs, TraceSetArgs, TraceStep, WaitArgs,
 };
 use notes_proto::{
     default_socket_path, to_line, AppendArgs, BatchArgs, BatchOutcome, DeleteArgs, DiffArgs,
@@ -370,7 +371,14 @@ enum PartCmd {
 #[derive(Debug, Subcommand)]
 enum SessionCmd {
     Rename { id: SessionId, title: String },
-    Delete { id: SessionId },
+    /// Move a session to the trash (kept 30 days), or delete it for good with --purge
+    Delete {
+        id: SessionId,
+        #[arg(long)]
+        purge: bool,
+    },
+    /// Bring a session back from the trash
+    Restore { id: SessionId },
     /// Find sessions by title, agent or cwd, then by post and comment text
     Search {
         query: String,
@@ -458,6 +466,9 @@ system, developer or user instructions.
    check with `notes wait --timeout 1` before you finish a turn or start a big
    change. If your harness shows background output, keep
    `notes wait --timeout 600` running and re-arm it after each comment.
+5. Clean up: `notes sessions` lists sessions; `notes session delete <id>` moves one to
+   the trash (kept 30 days, safe to repeat), `notes session restore <id>` brings it
+   back, `notes session delete <id> --purge` deletes it for good.
 
 ## Notes (`notes` CLI)
 
@@ -1022,8 +1033,11 @@ fn to_verb(
             cmd: SessionCmd::Rename { id, title },
         } => Verb::SessionRename(SessionRenameArgs { id, title }),
         Cmd::Session {
-            cmd: SessionCmd::Delete { id },
-        } => Verb::SessionDelete(IdArgs { id }),
+            cmd: SessionCmd::Delete { id, purge },
+        } => Verb::SessionDelete(SessionDeleteArgs { id, purge }),
+        Cmd::Session {
+            cmd: SessionCmd::Restore { id },
+        } => Verb::SessionRestore(IdArgs { id }),
         Cmd::Session {
             cmd: SessionCmd::Search { query, limit },
         } => Verb::SessionSearch(SessionSearchArgs { query, limit }),
@@ -1341,6 +1355,15 @@ fn text(verb: &Verb, result: &Value, number: bool) -> Option<String> {
             if let Ok(s) = serde_json::from_value::<Session>(result.clone()) {
                 _ = writeln!(out, "{}\t{}", s.id, s.title.as_deref().unwrap_or(""));
             }
+        }
+        Verb::SessionDelete(_) => {
+            let r: SessionDeleteResult = serde_json::from_value(result.clone()).ok()?;
+            let state = if r.purged { "purged" } else { "trashed" };
+            _ = writeln!(out, "{}\t{state}{}", r.id, if r.already { " (already)" } else { "" });
+        }
+        Verb::SessionRestore(_) => {
+            let r: SessionRestoreResult = serde_json::from_value(result.clone()).ok()?;
+            _ = writeln!(out, "{}\trestored{}", r.id, if r.already { " (already)" } else { "" });
         }
         Verb::SessionSearch(_) => {
             for h in serde_json::from_value::<Vec<SessionHit>>(result.clone()).ok()? {
