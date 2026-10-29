@@ -141,6 +141,33 @@ private func page(_ html: String) throws -> String {
         try h.send(["op": "html-close", "id": 8])
     }
 
+    @Test func animatedPageResizeNeverEmitsTheMeasurementViewport() throws {
+        let path = try page("""
+        <style>body{margin:0}.b{height:100px;background:#89b4fa;animation:p .2s linear infinite alternate}
+        @keyframes p{to{opacity:.5}}</style><div class=b></div>
+        """)
+        let h = try Helper()
+        try h.send(["op": "html-open", "id": 11, "path": path, "width": 400, "max_height": 200, "scale": 1, "fps": 60])
+        let first = try #require(h.next())
+        shm_unlink(try #require(first["shm"] as? String))
+        try h.send(["op": "html-ack", "id": 11, "frame": try #require(first["frame"] as? Int)])
+        for n in 0..<12 {
+            let width = n.isMultiple(of: 2) ? 600 : 400
+            try h.send(["op": "html-resize", "id": 11, "width": width, "max_height": 200, "scale": 1])
+            var gotResizedFrame = false
+            let deadline = Date(timeIntervalSinceNow: 2)
+            while Date() < deadline, let frame = h.next(0.5) {
+                guard let shm = frame["shm"] as? String, let number = frame["frame"] as? Int else { continue }
+                shm_unlink(shm)
+                #expect((frame["h"] as? Int ?? 0) >= 100, "measurement viewport escaped: \(frame)")
+                try h.send(["op": "html-ack", "id": 11, "frame": number])
+                if frame["w"] as? Int == width { gotResizedFrame = true; break }
+            }
+            #expect(gotResizedFrame, "resize to \(width) never produced a frame")
+        }
+        try h.send(["op": "html-close", "id": 11])
+    }
+
     @Test func widePagesAreZoomedOutToFitTheCard() throws {
         let path = try page("<body style='margin:0'><div style='width:1000px;height:500px;background:#89b4fa'></div></body>")
         let h = try Helper()

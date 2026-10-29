@@ -11,7 +11,7 @@ stage --session <id>  # open one
 ## Keys
 
 `j/k` next/previous post · `J/K` session · `↑↓` line · `⏎` fold, or open the selected session ·
-`space/b` page · `g/G` top/bottom · `/` search sessions · `c` comment (anchored to the selected
+`space/b` page · `g/G` top/bottom · `z` focus the card under the cursor (full-width, `z`/`Esc` to return) · `s` or the `≡` header control toggles the sidebar · `/` search sessions · `c` comment (anchored to the selected
 lines on code and diff) · `r` rename the selected session · `d` delete the card under the
 cursor, else the shown post · `D` delete the selected session (deletes wait for `y`) · `v`
 older version · `o` open html in the browser · `:` commands (`open copy versions rerender

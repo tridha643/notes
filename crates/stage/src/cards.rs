@@ -782,6 +782,15 @@ fn boxed(content: Line<'static>, inner: usize) -> Line<'static> {
 /// Every card, wrapped to `width`, with folds applied and comments below.
 /// `fit` sizes each visual card (by card index) for the inner width.
 pub fn layout(cards: &[Card], comments: &[Comment], width: u16, folds: &Folds, fit: &dyn Fn(usize) -> Fit) -> Laid {
+    layout_selected(cards, comments, width, folds, fit, None)
+}
+
+/// Lay out only the selected card at its original index when focused; hits and
+/// visual slots keep that index so actions still address the right post part.
+pub fn layout_selected(
+    cards: &[Card], comments: &[Comment], width: u16, folds: &Folds,
+    fit: &dyn Fn(usize) -> Fit, selected: Option<usize>,
+) -> Laid {
     let width = (width as usize).max(8);
     let inner = width - 4;
     let mut laid = Laid::default();
@@ -789,7 +798,7 @@ pub fn layout(cards: &[Card], comments: &[Comment], width: u16, folds: &Folds, f
         laid.lines.push(line);
         laid.hits.push(hit);
     };
-    for (c, card) in cards.iter().enumerate() {
+    for (c, card) in cards.iter().enumerate().filter(|(c, _)| selected.is_none_or(|s| s == *c)) {
         push(&mut laid, bordered(&card.label, width), Hit::Card(c));
         let rows: Vec<(Line<'static>, Hit)> = match &card.body {
             CardBody::Lines(lines) => lines.iter().map(|l| (l.clone(), Hit::Card(c))).collect(),
@@ -940,6 +949,22 @@ mod tests {
 │ └───┴────┘                           │
 ╰──────────────────────────────────────╯"
         );
+    }
+
+    #[test]
+    fn selected_layout_keeps_the_original_part_index() {
+        let cards = build_cards(
+            &post(vec![
+                Part::Markdown { markdown: "first".into(), id: None },
+                Part::Markdown { markdown: "second".into(), id: None },
+            ]),
+            &PostRender { id: "p1".into(), version: 1, parts: vec![PartRender::Native; 2] },
+        );
+        let laid = layout_selected(&cards, &[], 70, &Folds::new(), &|_| Fit::Pending { rows: 1 }, Some(1));
+        assert!(laid.lines.iter().any(|line| line.to_string().contains("second")));
+        assert!(!laid.lines.iter().any(|line| line.to_string().contains("first")));
+        assert!(laid.hits.contains(&Hit::Card(1)));
+        assert!(!laid.hits.contains(&Hit::Card(0)));
     }
 
     #[test]

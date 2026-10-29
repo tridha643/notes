@@ -70,7 +70,7 @@ fn versions(app: &mut App) -> Vec<Effect> {
 fn help(app: &mut App) -> Vec<Effect> {
     let cmds: Vec<String> = COMMANDS.iter().map(|c| format!(":{} {}", c.name, c.help)).collect();
     app.toast = Some(format!(
-        "j/k post · J/K session · ↑↓ line · ⏎ fold/open · space/b page · g/G · / search · c comment · r rename session · d delete card/post · D delete session · v version · o open · q quit · {}",
+        "j/k post · J/K session · ↑↓ line · ⏎ fold/open · space/b page · g/G · z focus card · s sidebar · / search · c comment · r rename session · d delete card/post · D delete session · v version · o open · q quit · {}",
         cmds.join(" · ")
     ));
     vec![]

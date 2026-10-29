@@ -36,7 +36,7 @@ pub enum Gfx {
     Helper(String),
     HelperExited,
     /// A mermaid diagram rasterized into shared memory (or why it couldn't be).
-    Raster { key: VisualKey, done: Result<(String, u32, u32), String> },
+    Raster { key: VisualKey, epoch: u64, done: Result<(String, u32, u32), String> },
 }
 
 /// CSS px → device px for helper renders (Retina).
@@ -47,6 +47,8 @@ struct Img {
     w: u32,
     h: u32,
     placed: Option<Place>,
+    /// The old image stays at its original size until the resized one is placed.
+    previous: Option<u32>,
     /// The html page streaming into this image, if live.
     page: Option<u64>,
     paused: bool,
@@ -77,6 +79,9 @@ pub struct Gallery {
     /// Mermaid SVG by visual, kept so a resize can rasterize it again crisply.
     svgs: HashMap<VisualKey, String>,
     target: Target,
+    focused: Option<VisualKey>,
+    /// Invalidates raster jobs started for an earlier focus or pane size.
+    raster_epoch: u64,
     cache: PathBuf,
     /// The session folder; assets are read straight from its `assets/` (notesd only writes it).
     stage: PathBuf,
@@ -162,6 +167,8 @@ impl Gallery {
             images: HashMap::new(),
             svgs: HashMap::new(),
             target,
+            focused: None,
+            raster_epoch: 0,
             cache,
             stage,
             trace: std::env::var_os("STAGE_TRACE").and_then(|p| std::fs::File::create(p).ok()),
@@ -197,7 +204,9 @@ impl Gallery {
     /// Connect to the shared helper, launching it (detached, so it outlives this
     /// stage and the next one starts warm) if nobody answers.
     fn connect(&self) -> Result<UnixStream, String> {
-        let sock = self.cache.join("helper.sock");
+        // A new socket keeps existing stages on their helper while this build
+        // starts one with the corrected HTML resize behavior.
+        let sock = self.cache.join("helper-v2.sock");
         if let Ok(stream) = UnixStream::connect(&sock) {
             return Ok(stream);
         }
@@ -252,6 +261,17 @@ impl Gallery {
 
     fn html_size(&self) -> (f64, f64) {
         (self.target.width_px as f64 / SCALE, self.target.max_height_px as f64 / SCALE)
+    }
+
+    fn resize_pages(&mut self, focused: Option<&VisualKey>) {
+        let (width, max_height) = self.html_size();
+        let pages: Vec<_> = self.pages.iter()
+            .filter(|(_, key)| focused.is_none_or(|selected| selected == *key))
+            .map(|(id, _)| *id)
+            .collect();
+        for page in pages {
+            let _ = self.send(json!({"op": "html-resize", "id": page, "width": width, "max_height": max_height, "scale": SCALE}));
+        }
     }
 
     /// Start making a visual's pixels. Failures come back as messages for the app.
@@ -335,19 +355,18 @@ impl Gallery {
         Ok(())
     }
 
-    /// The card width or pane height changed: re-render what depends on it.
-    pub fn retarget(&mut self, target: Target) {
-        if target == self.target {
+    /// Re-render only the focused Mermaid card when its full-width target changes.
+    /// Other cards retain their pixels until focus closes; then they render at
+    /// the normal target again. This avoids competing with the card the user sees.
+    pub fn retarget(&mut self, target: Target, focused: Option<&VisualKey>) {
+        if target == self.target && focused == self.focused.as_ref() {
             return;
         }
         self.target = target;
-        for (key, svg) in self.svgs.clone() {
-            self.raster(key, svg);
-        }
-        let (width, max_height) = self.html_size();
-        for page in self.pages.keys().copied().collect::<Vec<_>>() {
-            let _ = self.send(json!({"op": "html-resize", "id": page, "width": width, "max_height": max_height, "scale": SCALE}));
-        }
+        self.focused = focused.cloned();
+        self.raster_epoch += 1;
+        self.raster_target();
+        self.resize_pages(focused);
     }
 
     /// A request about an existing page (its id is the page id, not a new one).
@@ -360,8 +379,20 @@ impl Gallery {
         Ok(())
     }
 
+    fn raster_target(&self) {
+        if let Some(key) = &self.focused {
+            if let Some(svg) = self.svgs.get(key) {
+                self.raster(key.clone(), svg.clone());
+            }
+        } else {
+            for (key, svg) in &self.svgs {
+                self.raster(key.clone(), svg.clone());
+            }
+        }
+    }
+
     fn raster(&self, key: VisualKey, svg: String) {
-        let (tx, width, height) = (self.tx.clone(), self.target.width_px, self.target.max_height_px);
+        let (tx, width, height, epoch) = (self.tx.clone(), self.target.width_px, self.target.max_height_px, self.raster_epoch);
         thread::spawn(move || {
             let t0 = std::time::Instant::now();
             let raster = rasterize(&svg, width, height);
@@ -371,7 +402,7 @@ impl Gallery {
             let done = raster.and_then(|(px, w, h)| {
                 kitty::shm_write(&px).map(|shm| (shm, w, h)).map_err(|e| format!("shared memory: {e}"))
             });
-            let _ = tx.send(Msg::Gfx(Gfx::Raster { key, done }));
+            let _ = tx.send(Msg::Gfx(Gfx::Raster { key, epoch, done }));
         });
     }
 
@@ -388,7 +419,7 @@ impl Gallery {
         let img = self.images.entry(key.clone()).or_insert_with(|| {
             let id = *next_id;
             *next_id += 1;
-            Img { id, w, h, placed: None, page: None, paused: false, file: None }
+            Img { id, w, h, placed: None, previous: None, page: None, paused: false, file: None }
         });
         img.file = Some(path.to_owned());
         let _ = out.write_all(&kitty::transmit_png(img.id, path));
@@ -407,22 +438,33 @@ impl Gallery {
         let img = self.images.entry(key.clone()).or_insert_with(|| {
             let id = *next_id;
             *next_id += 1;
-            Img { id, w, h, placed: None, page, paused: false, file: None }
+            Img { id, w, h, placed: None, previous: None, page, paused: false, file: None }
         });
         if file.is_some() {
             img.file = file;
         }
         let resized = (img.w, img.h) != (w, h);
+        if resized && (img.placed.is_some() || img.previous.is_some()) {
+            // Reusing the id would replace the pixels in the old placement before
+            // the layout switches widths, visibly stretching the HTML card.
+            if img.previous.is_some() {
+                let _ = out.write_all(&kitty::delete(img.id));
+            } else {
+                img.previous = Some(img.id);
+            }
+            img.id = *next_id;
+            *next_id += 1;
+        }
         (img.w, img.h) = (w, h);
         // Same size and on screen: replace the frame in place. Otherwise just
         // transmit; the next `place` positions it.
         // `placed` already holds the pixel rect (see `place`); don't crop it twice.
-        let place = img.placed.filter(|_| !resized);
+        let place = img.placed.filter(|_| !resized && img.previous.is_none());
         let _ = out.write_all(b"\x1b[?2026h");
         let _ = out.write_all(&kitty::transmit(img.id, shm, (w, h), place.as_ref()));
         let _ = out.write_all(b"\x1b[?2026l");
         let _ = out.flush();
-        if place.is_none() {
+        if place.is_none() && img.previous.is_none() {
             img.placed = None;
         }
         (fresh || resized).then_some(Msg::VisualReady { key, w, h, max_scale: 1.0 })
@@ -443,8 +485,18 @@ impl Gallery {
                 msgs.extend(self.pages.drain().map(|(_, key)| Msg::VisualFailed { key, reason: "stage-helper stopped".into() }));
                 msgs
             }
-            Gfx::Raster { key, done } => match done {
-                Ok((shm, w, h)) => self.show(out, key, &shm, (w, h), None, None).into_iter().collect(),
+            Gfx::Raster { epoch, done, .. } if epoch != self.raster_epoch => {
+                if let Ok((shm, ..)) = done { kitty::unlink(&shm); }
+                vec![]
+            }
+            Gfx::Raster { key, done, .. } => match done {
+                Ok((shm, w, h)) => {
+                    // Even if the dimensions match, the focused preview is now
+                    // crisp and must return to its natural pixel scale.
+                    let ready = self.show(out, key.clone(), &shm, (w, h), None, None)
+                        .unwrap_or(Msg::VisualReady { key, w, h, max_scale: 1.0 });
+                    vec![ready]
+                },
                 Err(reason) => vec![Msg::VisualFailed { key, reason }],
             },
             Gfx::Helper(line) => {
@@ -455,6 +507,13 @@ impl Gallery {
                     let (Some(key), Some(shm), Some(size)) = (self.pages.get(&id).cloned(), v["shm"].as_str(), dims()) else {
                         return vec![];
                     };
+                    // A frame captured before a focus/resize can arrive after the
+                    // target changes. Never show it at an intermediate width.
+                    if size.0 != self.target.width_px {
+                        kitty::unlink(shm);
+                        let _ = self.send(json!({"op": "html-ack", "id": id, "frame": frame}));
+                        return vec![];
+                    }
                     let msg = self.show(out, key, shm, size, Some(id), None);
                     let _ = self.send(json!({"op": "html-ack", "id": id, "frame": frame}));
                     return msg.into_iter().collect();
@@ -471,7 +530,9 @@ impl Gallery {
                     Some(Pending::Mermaid(key)) => {
                         let svg = v["svg"].as_str().unwrap_or_default().to_owned();
                         self.svgs.insert(key.clone(), svg.clone());
-                        self.raster(key, svg);
+                        if self.focused.as_ref().is_none_or(|focused| focused == &key) {
+                            self.raster(key, svg);
+                        }
                         vec![]
                     }
                     Some(Pending::Image(key, path)) => match (v["shm"].as_str(), dims()) {
@@ -493,6 +554,19 @@ impl Gallery {
             let wanted = on_screen.iter().find(|o| &o.key == key).map(|o| {
                 crop(&Place { col: o.col, row: o.row, cols: o.cols, rows: o.rows, src: (0, o.top as u32, 0, o.total as u32) }, (img.w, img.h))
             });
+            // While the sidebar still has its old geometry, leave its old pixels
+            // alone. The new image is transmitted but not placed until the redraw
+            // moves the card to its new cell rectangle.
+            if let (Some(new), Some(old), Some(_)) = (wanted, img.placed, img.previous) {
+                if (new.col, new.row, new.cols) == (old.col, old.row, old.cols)
+                    && old.src.2 != img.w {
+                    continue;
+                }
+            }
+            if let Some(old) = img.previous.take() {
+                let _ = out.write_all(&kitty::delete(old));
+                img.placed = None;
+            }
             match (wanted, img.placed) {
                 (Some(p), Some(q)) if p == q => {}
                 (Some(p), _) => {
@@ -531,12 +605,15 @@ impl Gallery {
 
     /// The screen was cleared (a resize). Placements are gone, and Rex drops the
     /// images too, so send every one again (at `target`); the next `place` shows them.
-    pub fn replace_all(&mut self, out: &mut impl Write, target: Target) {
+    pub fn replace_all(&mut self, out: &mut impl Write, target: Target, focused: Option<&VisualKey>) {
         self.target = target;
+        self.focused = focused.cloned();
+        self.raster_epoch += 1;
         note(&mut self.trace, format_args!("clear: sending {} images again", self.images.len()));
         let mut decode = Vec::new();
         for (key, img) in self.images.iter_mut() {
             img.placed = None;
+            img.previous = None;
             match img.file.as_ref().map(|f| (kitty::png_size(&read_head(f)).is_some(), f)) {
                 Some((true, file)) => {
                     let _ = out.write_all(&kitty::transmit_png(img.id, file));
@@ -548,14 +625,9 @@ impl Gallery {
         for (key, file) in decode {
             let _ = self.decode(key, file);
         }
-        for (key, svg) in self.svgs.clone() {
-            self.raster(key, svg);
-        }
-        // A resize makes each page measure again and send a fresh frame.
-        let (width, max_height) = self.html_size();
-        for page in self.pages.keys().copied().collect::<Vec<_>>() {
-            let _ = self.send(json!({"op": "html-resize", "id": page, "width": width, "max_height": max_height, "scale": SCALE}));
-        }
+        self.raster_target();
+        // Only the focused page needs the new size while it fills the pane.
+        self.resize_pages(focused);
     }
 
     /// Remove every image (on quit).
@@ -599,6 +671,21 @@ mod tests {
     }
 
     #[test]
+    fn html_frame_from_before_a_resize_is_never_transmitted() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 800, max_height_px: 400 });
+        let key: VisualKey = ("page".into(), 1, 0);
+        gallery.pages.insert(9, key.clone());
+        let mut out = Vec::new();
+        let old = Gfx::Helper(r#"{"id":9,"frame":3,"shm":"/stg-old","w":600,"h":200}"#.into());
+        assert!(gallery.handle(&mut out, old).is_empty());
+        assert!(out.is_empty());
+        assert!(!gallery.images.contains_key(&key));
+        let resized = Gfx::Helper(r#"{"id":9,"frame":4,"shm":"/stg-new","w":800,"h":200}"#.into());
+        assert!(matches!(gallery.handle(&mut out, resized).as_slice(), [Msg::VisualReady { w: 800, .. }]));
+    }
+
+    #[test]
     fn live_frames_reuse_the_placed_pixel_rect() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut g = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 660, max_height_px: 360 });
@@ -612,6 +699,62 @@ mod tests {
         g.handle(&mut out, frame(2));
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("a=T") && s.contains("x=0,y=0,w=660,h=360,c=40,r=10"), "{s}");
+    }
+
+    #[test]
+    fn resized_html_keeps_old_pixels_until_the_card_moves_to_its_new_width() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 600, max_height_px: 400 });
+        let key: VisualKey = ("page".into(), 1, 0);
+        gallery.pages.insert(9, key.clone());
+        let frame = |number, width| Gfx::Helper(format!(r#"{{"id":9,"frame":{number},"shm":"/stg-test-{number}","w":{width},"h":200}}"#));
+        gallery.handle(&mut Vec::new(), frame(1, 600));
+        let old = OnScreen { key: key.clone(), col: 25, row: 4, cols: 70, top: 0, rows: 10, total: 10 };
+        gallery.place(&mut Vec::new(), std::slice::from_ref(&old));
+        let old_id = gallery.images[&key].id;
+
+        gallery.target.width_px = 800;
+        let mut transmitted = Vec::new();
+        gallery.handle(&mut transmitted, frame(2, 800));
+        let new_id = gallery.images[&key].id;
+        assert_ne!(new_id, old_id);
+        assert!(!String::from_utf8_lossy(&transmitted).contains(&format!("a=d,d=i,i={old_id}")));
+        let mut still_old = Vec::new();
+        gallery.place(&mut still_old, std::slice::from_ref(&old));
+        assert!(still_old.is_empty(), "the old sidebar layout keeps the old pixels");
+
+        let mut switched = Vec::new();
+        gallery.place(&mut switched, &[OnScreen { col: 0, cols: 95, ..old }]);
+        let output = String::from_utf8_lossy(&switched);
+        assert!(output.contains(&format!("a=d,d=i,i={old_id}")));
+        assert!(output.contains(&format!("a=p,i={new_id}")));
+    }
+
+    #[test]
+    fn focusing_rasterizes_only_the_selected_mermaid_and_ignores_old_pixels() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let normal = Target { width_px: 100, max_height_px: 100 };
+        let focused_target = Target { width_px: 200, max_height_px: 200 };
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), normal);
+        let first: VisualKey = ("first".into(), 1, 0);
+        let second: VisualKey = ("second".into(), 1, 0);
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="#89b4fa"/></svg>"##;
+        gallery.svgs.insert(first.clone(), svg.into());
+        gallery.svgs.insert(second.clone(), svg.into());
+        gallery.retarget(focused_target, Some(&second));
+        let Msg::Gfx(Gfx::Raster { key, epoch, done }) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap() else { panic!("no raster") };
+        assert_eq!(key, second);
+        assert!(rx.try_recv().is_err(), "offscreen Mermaid cards must not render during focus");
+        let (shm, ..) = done.unwrap();
+        assert!(gallery.handle(&mut Vec::new(), Gfx::Raster { key, epoch: epoch - 1, done: Ok((shm.clone(), 200, 100)) }).is_empty());
+        assert!(!gallery.images.contains_key(&second));
+        // The stale completion owns its shm and must unlink it.
+        assert!(kitty::shm_read(&shm, 1).is_err());
+        gallery.retarget(normal, None);
+        let mut keys = [rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(), rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap()]
+            .into_iter().map(|msg| match msg { Msg::Gfx(Gfx::Raster { key, done: Ok((shm, ..)), .. }) => { kitty::unlink(&shm); key }, _ => panic!("no raster") }).collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(keys, [first, second]);
     }
 
     #[test]

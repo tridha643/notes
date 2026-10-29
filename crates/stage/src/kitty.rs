@@ -64,6 +64,11 @@ pub fn unplace(id: u32) -> Vec<u8> {
     format!("\x1b_Ga=d,d=i,i={id},p=1,q=2\x1b\\").into_bytes()
 }
 
+/// Delete an old image and its placement after a resized frame takes its place.
+pub fn delete(id: u32) -> Vec<u8> {
+    format!("\x1b_Ga=d,d=i,i={id},q=2\x1b\\").into_bytes()
+}
+
 /// Every image and placement stage made (on quit).
 pub const FREE_ALL: &[u8] = b"\x1b_Ga=d,d=A,q=2\x1b\\";
 
