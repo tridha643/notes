@@ -127,6 +127,7 @@ fn main() -> ExitCode {
         // A resize makes ratatui clear the screen (inside `draw`), and Rex frees the
         // images with it: send them again after the clear, before placing them.
         let focused = app.focused_visual();
+        gallery.view(app.zoom_view);
         if app.size != drawn_size {
             gallery.replace_all(term.backend_mut(), app.target(), focused.as_ref());
             drawn_size = app.size;

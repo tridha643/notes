@@ -44,6 +44,8 @@ moves between states.
 - Events: `z`, `s` (no HTML card waiting), draws (only when one is due), and raster
   completions in any order. Bounds: 7 image ids, 2 jobs in flight per size
   (`model/StagePixels.cfg`). 79,042 distinct states at the sync commit.
+- Zoom levels and panning (`ZoomView`) aren't modeled: every zoomed raster is `Z`. A
+  change of view is a new zoom target, like the width changes the model does cover.
 - Left out: HTML cards and the sidebar's wait for their frames, PNG/decoded images,
   terminal resizes (`replace_all`), the 128 MB eviction, several cards competing, the helper
   (SVG arrives once, at the start), cell-rect geometry within a frame.

@@ -58,6 +58,23 @@ pub struct Target {
     pub cell_px: (u16, u16),
 }
 
+/// Where a focused diagram is zoomed: `level` 1.5x steps past fitting the pane, centered
+/// on (`cx`, `cy`), per mille of the diagram's width and height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZoomView {
+    pub level: u8,
+    pub cx: u16,
+    pub cy: u16,
+}
+
+impl Default for ZoomView {
+    fn default() -> Self {
+        ZoomView { level: 0, cx: 500, cy: 500 }
+    }
+}
+
+const MAX_ZOOM_LEVEL: u8 = 6;
+
 /// A visual on screen this frame: top-left cell, size in cells, and how many
 /// of its rows are cut off above (`top`) and shown (`rows` of `total`).
 #[derive(Debug, Clone, PartialEq)]
@@ -246,6 +263,8 @@ pub struct App {
     /// What a card showed when focus closed, until the next draw: `z` again before the
     /// gallery has seen focus close finds it still showing those pixels.
     left_focus: Option<(VisualKey, VisualState)>,
+    /// The focused diagram's zoom and pan (`+`/`-`/`0`, arrows or hjkl).
+    pub zoom_view: ZoomView,
     feed: Option<(FeedKey, Feed)>,
     /// A post to bring to the top on the next layout (a sidebar pick, a follow).
     jump: Option<PostId>,
@@ -307,6 +326,7 @@ impl App {
             unzoomed: None,
             zoom_ahead: None,
             left_focus: None,
+            zoom_view: ZoomView::default(),
             feed: None,
             jump: None,
             remembered: HashMap::new(),
@@ -986,8 +1006,34 @@ impl App {
         if html_ready { vec![] } else { self.enter_card_focus() }
     }
 
+    /// Zoom (`+`/`-`/`0`) and pan (arrows, hjkl) a focused diagram; `None` for any other
+    /// card or key. Panning moves a quarter of what's in view, never past the edges.
+    fn zoom_key(&mut self, code: KeyCode) -> Option<Vec<Effect>> {
+        let key = self.focused_visual()?;
+        if !matches!(self.visual_source(&key), Some(VisualSource::Mermaid(_))) {
+            return None;
+        }
+        let v = &mut self.zoom_view;
+        let half = |level: u8| (500.0 / 1.5f32.powi(level as i32)) as u16;
+        let step = half(v.level) / 2;
+        match code {
+            KeyCode::Char('+' | '=') => v.level = (v.level + 1).min(MAX_ZOOM_LEVEL),
+            KeyCode::Char('-') => v.level = v.level.saturating_sub(1),
+            KeyCode::Char('0') => *v = ZoomView::default(),
+            KeyCode::Left | KeyCode::Char('h') => v.cx = v.cx.saturating_sub(step),
+            KeyCode::Right | KeyCode::Char('l') => v.cx += step,
+            KeyCode::Up | KeyCode::Char('k') => v.cy = v.cy.saturating_sub(step),
+            KeyCode::Down | KeyCode::Char('j') => v.cy += step,
+            _ => return None,
+        }
+        let h = half(v.level);
+        (v.cx, v.cy) = (v.cx.clamp(h, 1000 - h), v.cy.clamp(h, 1000 - h));
+        Some(vec![])
+    }
+
     /// Back to the feed where it was, following again if it was.
     fn leave_focus(&mut self) {
+        self.zoom_view = ZoomView::default();
         self.focused_card = None;
         self.feed = None;
         if let Some((key, state)) = self.unzoomed.take() {
@@ -1065,6 +1111,9 @@ impl App {
 
     fn nav_key(&mut self, k: KeyEvent) -> Vec<Effect> {
         let page = self.page() as isize;
+        if let Some(fx) = self.zoom_key(k.code) {
+            return fx;
+        }
         match k.code {
             KeyCode::Char('q') => vec![Effect::Quit],
             KeyCode::Char('z') => self.toggle_card_focus(),
@@ -2085,6 +2134,37 @@ mod tests {
         app.update(key(KeyCode::Char('z')));
         let slot = app.feed().slots.iter().find(|(key, _)| key == &visual).unwrap().1;
         assert_eq!(slot.cols as u32 * app.cell_px.0 as u32, wide, "the first focused layout is already the zoomed size");
+    }
+
+    #[test]
+    fn a_focused_diagram_zooms_and_pans_within_its_edges() {
+        let mut app = booted(&fake());
+        let id = PostId::from("b");
+        let p = Post { parts: vec![Part::Mermaid { mermaid: "flowchart TD\n A-->B".into(), id: None }], ..post("b", "s1", 2, "") };
+        let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
+        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, &r));
+        app.visuals.insert((id.clone(), 2, 0), VisualState::Ready { w: 360, h: 260, max_scale: 1.0 });
+        app.feed = None;
+        let post_index = app.posts.iter().position(|p| p.id == id).unwrap();
+        app.cursor = app.feed().starts[post_index];
+        app.update(key(KeyCode::Char('+')));
+        assert_eq!(app.zoom_view, ZoomView::default(), "outside focus + does nothing");
+        app.update(key(KeyCode::Char('z')));
+        app.update(key(KeyCode::Char('l')));
+        assert_eq!(app.zoom_view, ZoomView::default(), "fitted: nothing to pan");
+        app.update(key(KeyCode::Char('+')));
+        app.update(key(KeyCode::Char('+')));
+        assert_eq!(app.zoom_view.level, 2);
+        for _ in 0..20 {
+            app.update(key(KeyCode::Right));
+        }
+        let edge = 1000 - (500.0 / 1.5f32.powi(2)) as u16;
+        assert_eq!(app.zoom_view.cx, edge, "panning stops at the diagram's edge");
+        app.update(key(KeyCode::Char('0')));
+        assert_eq!(app.zoom_view, ZoomView::default());
+        app.update(key(KeyCode::Char('+')));
+        app.update(key(KeyCode::Char('z')));
+        assert_eq!(app.zoom_view, ZoomView::default(), "leaving focus resets the zoom");
     }
 
     #[test]

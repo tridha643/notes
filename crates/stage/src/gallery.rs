@@ -16,14 +16,14 @@ use std::{
     os::unix::{net::UnixStream, process::CommandExt},
     path::PathBuf,
     process::{Command, Stdio},
-    sync::{mpsc::Sender, Arc, OnceLock},
+    sync::{mpsc::Sender, Arc, Mutex, OnceLock},
     thread,
 };
 
 use serde_json::{json, Value};
 
 use crate::{
-    app::{Msg, OnScreen, Target, VisualKey},
+    app::{Msg, OnScreen, Target, VisualKey, ZoomView},
     cards::VisualSource,
     client::StageClient,
     kitty::{self, Place},
@@ -40,9 +40,8 @@ pub enum Gfx {
 }
 
 /// What a Mermaid raster depends on: the width and height it must fit, the cell
-/// size (all px), and whether it's zoomed (focused: as large as fits the pane,
-/// instead of stopping at 2x the diagram's own size).
-pub type RasterTarget = (u32, u32, (u16, u16), bool);
+/// size (all px), and, when zoomed (focused), the window of the diagram shown.
+pub type RasterTarget = (u32, u32, (u16, u16), Option<ZoomView>);
 
 /// CSS px → device px for helper renders (Retina).
 const SCALE: f64 = 2.0;
@@ -109,6 +108,10 @@ pub struct Gallery {
     svgs: HashMap<VisualKey, String>,
     target: Target,
     focused: Option<VisualKey>,
+    /// The focused diagram's zoom and pan.
+    view: ZoomView,
+    /// The focused diagram, parsed once, so zooming and panning only draw.
+    parsed: Arc<Mutex<Option<(VisualKey, Parsed)>>>,
     /// The target each diagram's latest raster job was started for. Diagrams are
     /// rasterized for the current target only when on screen (or focused).
     rastered: HashMap<VisualKey, RasterTarget>,
@@ -159,10 +162,17 @@ pub fn rasterize(svg: &str, width_px: u32, height_px: u32, cell: (u16, u16), max
     Ok((px, pw, ph))
 }
 
-/// `rasterize` straight into a new shared-memory object for the terminal, so no
-/// diagram-sized buffer is ever allocated (or kept by malloc) in stage itself.
-fn rasterize_shm(svg: &str, width_px: u32, height_px: u32, cell: (u16, u16), max_scale: f32) -> Result<(String, u32, u32), String> {
-    let (tree, at, pw, ph) = fit_svg(svg, width_px, height_px, cell, max_scale)?;
+/// A diagram parsed by usvg (which also lays out its text: the costly part).
+type Parsed = Arc<resvg::usvg::Tree>;
+
+fn parse(svg: &str) -> Result<Parsed, String> {
+    let opt = resvg::usvg::Options { fontdb: fonts(), ..Default::default() };
+    resvg::usvg::Tree::from_str(svg, &opt).map(Arc::new).map_err(|e| format!("svg: {e}"))
+}
+
+/// A fitted diagram drawn straight into a new shared-memory object for the terminal,
+/// so no diagram-sized buffer is ever allocated (or kept by malloc) in stage itself.
+fn draw_shm((tree, at, pw, ph): (Parsed, resvg::tiny_skia::Transform, u32, u32)) -> Result<(String, u32, u32), String> {
     let mut drawn = Ok(());
     let shm = kitty::shm_fill((pw * ph * 4) as usize, |px| drawn = draw(&tree, at, px, (pw, ph))).map_err(|e| format!("shared memory: {e}"))?;
     drawn.inspect_err(|_| kitty::unlink(&shm))?;
@@ -170,9 +180,8 @@ fn rasterize_shm(svg: &str, width_px: u32, height_px: u32, cell: (u16, u16), max
 }
 
 /// The parsed diagram, where it's drawn, and the canvas: whole cells, diagram centered.
-fn fit_svg(svg: &str, width_px: u32, height_px: u32, (cw, ch): (u16, u16), max_scale: f32) -> Result<(resvg::usvg::Tree, resvg::tiny_skia::Transform, u32, u32), String> {
-    let opt = resvg::usvg::Options { fontdb: fonts(), ..Default::default() };
-    let tree = resvg::usvg::Tree::from_str(svg, &opt).map_err(|e| format!("svg: {e}"))?;
+fn fit_svg(svg: &str, width_px: u32, height_px: u32, (cw, ch): (u16, u16), max_scale: f32) -> Result<(Parsed, resvg::tiny_skia::Transform, u32, u32), String> {
+    let tree = parse(svg)?;
     let size = tree.size();
     let scale = (width_px as f32 / size.width()).min(height_px as f32 / size.height()).min(max_scale);
     let (w, h) = (
@@ -182,6 +191,25 @@ fn fit_svg(svg: &str, width_px: u32, height_px: u32, (cw, ch): (u16, u16), max_s
     let (cw, ch) = (cw.max(1) as u32, ch.max(1) as u32);
     let (pw, ph) = (w.div_ceil(cw) * cw, h.div_ceil(ch) * ch);
     let at = resvg::tiny_skia::Transform::from_scale(scale, scale).post_translate(((pw - w) / 2) as f32, ((ph - h) / 2) as f32);
+    Ok((tree, at, pw, ph))
+}
+
+/// A zoomed diagram: `view.level` 1.5x steps past fitting `width_px`x`height_px` (at most
+/// 8 px per CSS px unless fitting needs more), and of that only the window of the pane's
+/// size around (`cx`, `cy`), kept inside the diagram. Only the window is drawn, so any
+/// zoom costs about one pane of pixels.
+fn fit_view(tree: Parsed, width_px: u32, height_px: u32, (cw, ch): (u16, u16), view: ZoomView) -> Result<(Parsed, resvg::tiny_skia::Transform, u32, u32), String> {
+    let size = tree.size();
+    let fit = (width_px as f32 / size.width()).min(height_px as f32 / size.height());
+    let scale = (fit * 1.5f32.powi(view.level as i32)).min(fit.max(8.0));
+    let (dw, dh) = (size.width() * scale, size.height() * scale);
+    let (w, h) = ((dw.ceil() as u32).clamp(1, width_px.max(1)), (dh.ceil() as u32).clamp(1, height_px.max(1)));
+    let (cw, ch) = (cw.max(1) as u32, ch.max(1) as u32);
+    let (pw, ph) = (w.div_ceil(cw) * cw, h.div_ceil(ch) * ch);
+    let origin = |center: u16, whole: f32, shown: u32| (center as f32 / 1000.0 * whole - shown as f32 / 2.0).clamp(0.0, (whole - shown as f32).max(0.0));
+    let (ox, oy) = (origin(view.cx, dw, w), origin(view.cy, dh, h));
+    let at = resvg::tiny_skia::Transform::from_scale(scale, scale)
+        .post_translate(((pw - w) / 2) as f32 - ox, ((ph - h) / 2) as f32 - oy);
     Ok((tree, at, pw, ph))
 }
 
@@ -240,6 +268,8 @@ impl Gallery {
             svgs: HashMap::new(),
             target,
             focused: None,
+            view: ZoomView::default(),
+            parsed: Arc::default(),
             rastered: HashMap::new(),
             zoom: None,
             prefetch: None,
@@ -431,6 +461,11 @@ impl Gallery {
         Ok(())
     }
 
+    /// The focused diagram's zoom and pan, from the app; `place` rasterizes it again on change.
+    pub fn view(&mut self, view: ZoomView) {
+        self.view = view;
+    }
+
     /// A new target or focus: resize live pages. Diagrams follow in `place`, which
     /// re-rasterizes only the ones on screen (just the focused one while focused).
     pub fn retarget(&mut self, target: Target, focused: Option<&VisualKey>) {
@@ -438,6 +473,13 @@ impl Gallery {
             return;
         }
         self.target = target;
+        if focused != self.focused.as_ref() {
+            // Keep the zoom made ahead's parse for the card being focused; drop any other.
+            let mut parsed = self.parsed.lock().unwrap_or_else(|e| e.into_inner());
+            if parsed.as_ref().is_some_and(|(key, _)| Some(key) != focused) {
+                *parsed = None;
+            }
+        }
         self.focused = focused.cloned();
         if let Some(ahead) = self.prefetch.take_if(|ahead| focused == Some(&ahead.key)) {
             if ahead.made_for == self.raster_target(&ahead.key) {
@@ -464,8 +506,8 @@ impl Gallery {
     fn raster_target(&self, key: &VisualKey) -> RasterTarget {
         match self.focused.as_ref() == Some(key) {
             // The whole diagram in the pane: no scrolling a zoomed one.
-            true => (self.target.width_px, self.target.max_height_px, self.target.cell_px, true),
-            false => (self.target.width_px, MAX_MERMAID_HEIGHT_PX, self.target.cell_px, false),
+            true => (self.target.width_px, self.target.max_height_px, self.target.cell_px, Some(self.view)),
+            false => (self.target.width_px, MAX_MERMAID_HEIGHT_PX, self.target.cell_px, None),
         }
     }
 
@@ -486,7 +528,7 @@ impl Gallery {
             return;
         }
         let Some(svg) = self.svgs.get(key).cloned() else { return };
-        if made_for.3 && self.zoom.as_ref().is_none_or(|zoom| &zoom.key != key) {
+        if made_for.3.is_some() && self.zoom.as_ref().is_none_or(|zoom| &zoom.key != key) {
             self.zoom = Some(Unzoomed { key: key.clone(), made_for: self.rastered.get(key).copied(), img: None });
         }
         self.rastered.insert(key.clone(), made_for);
@@ -510,7 +552,7 @@ impl Gallery {
     /// Make the zoomed raster for `key` at `target` ahead of `z` (one at a time). Asked
     /// again for one already made, it says so again: the app may have forgotten its size.
     pub fn prefetch_zoom(&mut self, key: VisualKey, target: Target) -> Option<Msg> {
-        let made_for = (target.width_px, target.max_height_px, target.cell_px, true);
+        let made_for = (target.width_px, target.max_height_px, target.cell_px, Some(ZoomView::default()));
         if let Some(ahead) = self.prefetch.as_ref().filter(|ahead| ahead.key == key && ahead.made_for == made_for) {
             return ahead.done.as_ref().map(|(_, w, h)| Msg::ZoomReady { key, w: *w, h: *h });
         }
@@ -527,10 +569,21 @@ impl Gallery {
     }
 
     fn spawn_raster(&self, key: VisualKey, svg: String, made_for: RasterTarget) {
-        let (tx, (width, height, cell, zoom)) = (self.tx.clone(), made_for);
+        let (tx, parsed, (width, height, cell, zoom)) = (self.tx.clone(), self.parsed.clone(), made_for);
         thread::spawn(move || {
             let t0 = std::time::Instant::now();
-            let done = rasterize_shm(&svg, width, height, cell, if zoom { f32::INFINITY } else { SCALE as f32 });
+            let done = match zoom {
+                Some(view) => {
+                    let mut cached = parsed.lock().unwrap_or_else(|e| e.into_inner());
+                    let tree = match cached.as_ref().filter(|(k, _)| *k == key) {
+                        Some((_, tree)) => Ok(tree.clone()),
+                        None => parse(&svg).inspect(|tree| *cached = Some((key.clone(), tree.clone()))),
+                    };
+                    drop(cached);
+                    tree.and_then(|tree| fit_view(tree, width, height, cell, view)).and_then(draw_shm)
+                }
+                None => fit_svg(&svg, width, height, cell, SCALE as f32).and_then(draw_shm),
+            };
             if std::env::var_os("STAGE_HELPER_TRACE").is_some() {
                 eprintln!("resvg {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0);
             }
@@ -647,14 +700,14 @@ impl Gallery {
             Gfx::Raster { key, made_for, done } => match done {
                 Ok((shm, w, h)) => {
                     // A zoomed raster gets its own image; the feed-size one waits for focus to close.
-                    if made_for.3 {
+                    if made_for.3.is_some() {
                         self.park(&key);
                     }
                     let shown = self.show(out, key, &shm, (w, h), None, None);
                     // Zoomed pixels only count while the app still focuses this card: a `z`
                     // back in the same loop turn must not leave the feed laid out zoomed.
                     match shown {
-                        Some(Msg::VisualReady { key, w, h, .. }) if made_for.3 => vec![Msg::ZoomShown { key, w, h }],
+                        Some(Msg::VisualReady { key, w, h, .. }) if made_for.3.is_some() => vec![Msg::ZoomShown { key, w, h }],
                         other => other.into_iter().collect(),
                     }
                 }
@@ -966,7 +1019,7 @@ mod tests {
         let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 950, max_height_px: 400, cell_px: (10, 20) });
         let key: VisualKey = ("diagram".into(), 1, 0);
         let shms: Vec<String> = [(950, 400), (690, 300)].iter().map(|(w, h)| kitty::shm_write(&vec![0; w * h * 4]).unwrap()).collect();
-        let raster = |shm: &str, w, h| Gfx::Raster { key: key.clone(), made_for: (950, MAX_MERMAID_HEIGHT_PX, (10, 20), false), done: Ok((shm.to_owned(), w, h)) };
+        let raster = |shm: &str, w, h| Gfx::Raster { key: key.clone(), made_for: (950, MAX_MERMAID_HEIGHT_PX, (10, 20), None), done: Ok((shm.to_owned(), w, h)) };
         gallery.handle(&mut Vec::new(), raster(&shms[0], 950, 400));
         let at = OnScreen { key: key.clone(), col: 29, row: 7, cols: 69, top: 0, rows: 20, total: 20, px: (950, 400) };
         gallery.place(&mut Vec::new(), std::slice::from_ref(&at));
@@ -1014,7 +1067,7 @@ mod tests {
         gallery.retarget(Target { width_px: 200, ..normal }, Some(&second));
         gallery.place(&mut Vec::new(), &shown(&[&second]));
         let (key, made_for, done) = next_raster(&rx);
-        assert_eq!((key, made_for), (second.clone(), (200, 100, (1, 1), true)));
+        assert_eq!((key, made_for), (second.clone(), (200, 100, (1, 1), Some(ZoomView::default()))));
         unlink(done);
         assert!(rx.try_recv().is_err(), "nothing but the focused card renders during focus");
 
@@ -1098,7 +1151,7 @@ mod tests {
         gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
         assert!(gallery.prefetch_zoom(key.clone(), focus).is_none());
         let (key_, made_for, done) = next_raster(&rx);
-        assert_eq!(made_for, (1000, 400, (1, 1), true));
+        assert_eq!(made_for, (1000, 400, (1, 1), Some(ZoomView::default())));
         assert!(matches!(gallery.handle(&mut Vec::new(), Gfx::Raster { key: key_, made_for, done }).as_slice(), [Msg::ZoomReady { w: 800, h: 400, .. }]));
         gallery.retarget(focus, Some(&key));
         let mut out = Vec::new();
@@ -1152,6 +1205,26 @@ mod tests {
     }
 
     #[test]
+    fn a_zoomed_view_draws_only_its_window_at_full_resolution() {
+        // Left half red, right half blue; a 400x400 pane at level 2 (2.25x past fitting).
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><rect width="50" height="100" fill="#ff0000"/><rect x="50" width="50" height="100" fill="#0000ff"/></svg>"##;
+        let window = |view| {
+            let (tree, at, w, h) = fit_view(parse(svg).unwrap(), 400, 400, (1, 1), view).unwrap();
+            let mut px = vec![0; (w * h * 4) as usize];
+            draw(&tree, at, &mut px, (w, h)).unwrap();
+            (w, h, px)
+        };
+        let (w, h, fit) = window(ZoomView::default());
+        assert_eq!((w, h), (400, 400), "level 0 fits the pane");
+        assert_eq!((&fit[..4], &fit[fit.len() - 4..]), (&[255, 0, 0, 255][..], &[0, 0, 255, 255][..]));
+        let (w, h, left) = window(ZoomView { level: 2, cx: 0, cy: 500 });
+        assert_eq!((w, h), (400, 400), "zoomed in: still one pane of pixels");
+        assert!(left.chunks(4).all(|p| p == [255, 0, 0, 255]), "panned left: only the red half");
+        let (_, _, right) = window(ZoomView { level: 2, cx: 1000, cy: 500 });
+        assert!(right.chunks(4).all(|p| p == [0, 0, 255, 255]), "panned right: only the blue half");
+    }
+
+    #[test]
     fn resize_cannot_replace_crisp_pixels_with_an_older_raster() {
         let (tx, rx) = std::sync::mpsc::channel();
         let at = |width_px| Target { width_px, max_height_px: 100, cell_px: (1, 1) };
@@ -1189,7 +1262,7 @@ mod tests {
         // …and the next draw asks again instead of waiting forever for pixels already thrown away.
         gallery.place(&mut Vec::new(), &shown(&[&key]));
         let again = next_raster(&rx);
-        assert_eq!(again.1, (100, MAX_MERMAID_HEIGHT_PX, (1, 1), false));
+        assert_eq!(again.1, (100, MAX_MERMAID_HEIGHT_PX, (1, 1), None));
         kitty::unlink(&again.2.unwrap().0);
     }
 
