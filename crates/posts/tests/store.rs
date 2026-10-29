@@ -6,7 +6,7 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use notes_posts::*;
-use notes_proto::{posts::*, ErrorCode};
+use notes_proto::{kits::{kits, KIT_IDS}, posts::*, ErrorCode};
 use rusqlite::Connection;
 
 /// A store over an in-memory database and a fresh temp session folder.

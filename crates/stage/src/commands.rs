@@ -41,8 +41,8 @@ fn open(app: &mut App) -> Vec<Effect> {
         .filter(|p| matches!(p, Part::Html { .. }))
         .or_else(|| app.shown_post()?.parts.iter().find(|p| matches!(p, Part::Html { .. })).cloned());
     match (html, app.shown.clone(), app.shown_version()) {
-        (Some(Part::Html { html, .. }), Some(id), Some(v)) => {
-            vec![Effect::OpenFile { name: format!("{id}-v{v}.html"), contents: html }]
+        (Some(Part::Html { html, kits, .. }), Some(id), Some(v)) => {
+            vec![Effect::OpenFile { name: format!("{id}-v{v}.html"), contents: crate::page::document(&html, &kits) }]
         }
         _ => {
             app.toast = Some("no html part to open".into());

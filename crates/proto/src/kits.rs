@@ -3,7 +3,7 @@
 //! any kit is used; `Kit` has no slot for it, so each kit's `css` starts with it
 //! (identical rules, so loading two kits just repeats them harmlessly).
 
-use notes_proto::posts::Kit;
+use crate::posts::Kit;
 
 pub const KIT_IDS: &[&str] = &["issues", "slides"];
 

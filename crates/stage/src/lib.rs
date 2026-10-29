@@ -9,6 +9,7 @@ pub mod commands;
 pub mod gallery;
 pub mod kitty;
 pub mod latency;
+pub mod page;
 pub mod probe;
 pub mod sanitize;
 pub mod ui;

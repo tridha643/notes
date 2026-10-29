@@ -197,10 +197,10 @@ fn card(part: &Part, render: Option<&PartRender>) -> Card {
                 fallback: vec![Line::styled(alt.as_deref().map_or("image".into(), |a| sanitize(a).into_owned()), ui::dim())],
             },
         },
-        (Part::Html { html, .. }, _) => Card {
+        (Part::Html { html, kits, .. }, _) => Card {
             label: "html".into(),
             body: CardBody::Visual {
-                source: VisualSource::Html(html.clone()),
+                source: VisualSource::Html(crate::page::document(html, kits)),
                 fallback: vec![Line::styled("o opens it in the browser", ui::dim())],
             },
         },
