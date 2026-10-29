@@ -603,7 +603,6 @@ impl App {
         };
         let Some(&line) = feed.starts.get(target) else { return };
         let max = feed.lines.len().saturating_sub(page);
-        self.follow = target + 1 == self.posts.len();
         (self.cursor, self.scroll) = (line, line.min(max));
         self.follow_cursor();
     }
@@ -684,7 +683,12 @@ impl App {
         if view.laid.as_ref().is_none_or(|(k, _)| *k != key) {
             let inner = width.saturating_sub(4).max(1);
             let rows = if selected.is_some() { page.saturating_sub(3) } else { page / 2 };
-            let fit = |c: usize| match visuals.get(&(id.clone(), version, c)) {
+            // A new version holds the size its card's last pixels had while it renders,
+            // so a patch never collapses the card to a placeholder and shifts the feed.
+            let last_ready = |c: usize| {
+                (1..version).rev().find_map(|v| visuals.get(&(id.clone(), v, c)).filter(|s| matches!(s, VisualState::Ready { .. })))
+            };
+            let fit = |c: usize| match visuals.get(&(id.clone(), version, c)).filter(|s| **s != VisualState::Pending).or_else(|| last_ready(c)) {
                 Some(VisualState::Ready { w, h, max_scale }) => {
                     // Scroll through tall Mermaid diagrams instead of shrinking their labels;
                     // a focused one shows its pixels 1:1 until the full-width raster lands.
@@ -786,11 +790,13 @@ impl App {
         ui::geometry_for(self).main.height.saturating_sub(1).max(1) as usize
     }
 
-    /// The shown post follows the cursor through the feed.
+    /// The shown post follows the cursor through the feed, and new posts are
+    /// followed only while the cursor is in the last one.
     fn follow_cursor(&mut self) {
         let cursor = self.cursor;
-        let post = self.feed().hits.get(cursor).map(|(p, _)| *p);
-        if let Some(id) = post.and_then(|p| self.posts.get(p)).map(|p| p.id.clone()) {
+        let Some(post) = self.feed().hits.get(cursor).map(|(p, _)| *p) else { return };
+        if let Some(id) = self.posts.get(post).map(|p| p.id.clone()) {
+            self.follow = post + 1 == self.posts.len();
             self.unseen.remove(&id);
             self.shown = Some(id);
         }
@@ -1484,6 +1490,7 @@ impl App {
                     return vec![];
                 }
                 posts.reverse();
+                let before: Vec<PostId> = self.posts.iter().map(|p| p.id.clone()).collect();
                 for p in &posts {
                     if self.seen_rows.insert((p.id.clone(), p.version)) {
                         self.fresh.push((p.id.clone(), p.version));
@@ -1499,15 +1506,25 @@ impl App {
                 if self.focused_card.as_ref().is_some_and(|(id, _)| !self.posts.iter().any(|p| &p.id == id)) {
                     self.leave_focus();
                 }
-                let target = match &self.shown {
-                    Some(id) if !self.follow && self.posts.iter().any(|p| &p.id == id) => Some(id.clone()),
-                    Some(id) if !self.follow => {
-                        // The shown post was deleted: select its neighbour.
-                        self.toast = Some(format!("post {id} was deleted"));
-                        self.posts.last().map(|p| p.id.clone())
-                    }
-                    _ if self.focused_card.is_some() => self.focused_card.as_ref().map(|(id, _)| id.clone()),
-                    _ => self.posts.last().map(|p| p.id.clone()),
+                // Posts never move: a patch or a deleted card keeps the view where it
+                // is, and only a post appended while following brings the feed along.
+                let last = self.posts.last().map(|p| p.id.clone());
+                let appended = last.as_ref().is_some_and(|id| !before.contains(id));
+                let gone = self.shown.as_ref().filter(|id| !self.posts.iter().any(|p| &p.id == *id)).cloned();
+                let target = if let Some(id) = gone {
+                    // The shown post was deleted: the one that took its place, else the one before.
+                    self.toast = Some(format!("post {id} was deleted"));
+                    let at = before.iter().position(|b| *b == id).unwrap_or(usize::MAX);
+                    let next = self.posts.get(at).or(self.posts.last()).map(|p| p.id.clone());
+                    self.jump = next.clone();
+                    next
+                } else if let Some((id, _)) = &self.focused_card {
+                    Some(id.clone())
+                } else if self.follow && (appended || self.shown.is_none()) {
+                    self.jump = last.clone();
+                    last
+                } else {
+                    self.shown.clone().or(last)
                 };
                 // The feed shows every post, so load them all.
                 for p in self.posts.clone() {
@@ -1516,9 +1533,6 @@ impl App {
                     }
                 }
                 if let Some(id) = target {
-                    if self.follow {
-                        self.jump = Some(id.clone());
-                    }
                     fx.extend(self.show(id));
                 } else {
                     self.shown = None;
@@ -2237,6 +2251,112 @@ mod tests {
         serve(&mut app, fx, &db);
         assert!(app.unread.contains("s2"));
         assert_eq!(app.builds, builds + 1);
+    }
+
+    fn post_event(kind: &str, id: &str, version: u64) -> Msg {
+        Msg::Event(Event { seq: 20, kind: kind.into(), path: None, version: Some(version), id: Some(id.into()), session: Some("s1".into()) })
+    }
+
+    /// Session s1 with posts a, b, c, d (made in that order), each taller than the page.
+    fn tall() -> Fake {
+        let mut db = fake();
+        db.posts = ["a", "b", "c", "d"].iter().map(|id| summary(id, "s1", 1)).collect();
+        db.md = "line\n\n".repeat(30);
+        db
+    }
+
+    fn send(app: &mut App, msg: Msg, db: &Fake) {
+        let fx = app.update(msg);
+        serve(app, fx, db);
+    }
+
+    fn order(app: &App) -> Vec<&str> {
+        app.posts.iter().map(|p| p.id.as_str()).collect()
+    }
+
+    #[test]
+    fn a_patch_never_moves_a_post_or_the_view() {
+        let mut db = tall();
+        let mut app = booted(&db);
+        for k in [KeyCode::Char('g'), KeyCode::Char('j')] {
+            send(&mut app, key(k), &db);
+        }
+        assert_eq!(app.shown.as_deref(), Some("b"));
+        let place = (app.scroll, app.cursor);
+        for id in ["d", "b", "a"] {
+            let p = db.posts.iter_mut().find(|p| p.id == id).unwrap();
+            p.version += 1;
+            let v = p.version;
+            send(&mut app, post_event("post-updated", id, v), &db);
+            app.feed();
+            assert_eq!(order(&app), ["a", "b", "c", "d"]);
+            assert_eq!((app.shown.as_deref(), app.scroll, app.cursor), (Some("b"), place.0, place.1), "after patching {id}");
+        }
+        // Reading partway down the last post: a patch above doesn't pull it back to its title.
+        send(&mut app, key(KeyCode::Char('G')), &db);
+        send(&mut app, key(KeyCode::Up), &db);
+        let place = (app.scroll, app.cursor);
+        db.posts[0].version += 1;
+        send(&mut app, post_event("post-updated", "a", db.posts[0].version), &db);
+        app.feed();
+        assert_eq!((app.shown.as_deref(), app.scroll, app.cursor), (Some("d"), place.0, place.1));
+    }
+
+    #[test]
+    fn a_new_post_pulls_the_feed_only_while_reading_the_last_one() {
+        let mut db = tall();
+        let mut app = booted(&db);
+        assert_eq!(app.shown.as_deref(), Some("d"));
+        // Scrolling up into c by line, not by post, stops following.
+        for _ in 0..3 {
+            send(&mut app, key(KeyCode::Up), &db);
+        }
+        assert_eq!(app.shown.as_deref(), Some("c"));
+        let place = (app.scroll, app.cursor);
+        db.posts.push(summary("e", "s1", 1));
+        send(&mut app, post_event("post-created", "e", 1), &db);
+        app.feed();
+        assert_eq!((app.shown.as_deref(), app.scroll, app.cursor), (Some("c"), place.0, place.1));
+        // Back on the last post, the next one is followed to its title.
+        send(&mut app, key(KeyCode::Char('G')), &db);
+        db.posts.push(summary("f", "s1", 1));
+        send(&mut app, post_event("post-created", "f", 1), &db);
+        let start = app.feed().starts[5];
+        assert_eq!((app.shown.as_deref(), app.cursor), (Some("f"), start));
+    }
+
+    #[test]
+    fn deleting_the_shown_post_lands_on_its_neighbour() {
+        let mut db = tall();
+        let mut app = booted(&db);
+        for k in [KeyCode::Char('g'), KeyCode::Char('j')] {
+            send(&mut app, key(k), &db);
+        }
+        db.posts.retain(|p| p.id != "b");
+        send(&mut app, post_event("post-deleted", "b", 1), &db);
+        let start = app.feed().starts[1];
+        assert_eq!((order(&app), app.shown.as_deref(), app.cursor), (vec!["a", "c", "d"], Some("c"), start));
+        // The last post has no next one, so the one before it takes over.
+        send(&mut app, key(KeyCode::Char('G')), &db);
+        db.posts.retain(|p| p.id != "d");
+        send(&mut app, post_event("post-deleted", "d", 1), &db);
+        assert_eq!(app.shown.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn a_patched_diagram_keeps_its_height_until_its_new_pixels_land() {
+        let mut app = booted(&fake());
+        let diagram = |v| Post { parts: vec![Part::Mermaid { mermaid: "graph TD\nA-->B".into(), id: None }], ..post("b", "s1", v, "") };
+        let render = |v| PostRender { id: "b".into(), version: v, parts: vec![notes_proto::posts::PartRender::Native] };
+        app.loaded.get_mut(&("b".into(), 2)).unwrap().cards = Some(cards::build_cards(&diagram(2), &render(2)));
+        app.visuals.insert(("b".into(), 2, 0), VisualState::Ready { w: 400, h: 1200, max_scale: 1.0 });
+        app.visual_gen += 1;
+        let shown = app.feed().lines.len();
+        app.posts.iter_mut().find(|p| p.id == "b").unwrap().version = 3;
+        let cards = Some(cards::build_cards(&diagram(3), &render(3)));
+        app.loaded.insert(("b".into(), 3), Loaded { post: Some(diagram(3)), render: Some(render(3)), cards });
+        app.visuals.insert(("b".into(), 3, 0), VisualState::Pending);
+        assert_eq!(app.feed().lines.len(), shown);
     }
 
     #[test]
