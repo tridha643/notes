@@ -182,6 +182,8 @@ pub struct App {
     /// The sidebar's selected session (index into `sessions`).
     pub sel: usize,
     pub mode: Mode,
+    /// Whether the session sidebar is hidden outside card focus.
+    pub sidebar_hidden: bool,
     pub size: (u16, u16),
     /// The card width last sent to notesd, so a resize only writes on change.
     card_cols: u16,
@@ -210,6 +212,8 @@ pub struct App {
     pub cursor: usize,
     /// The post and card isolated in the full-width focus view.
     pub focused_card: Option<(PostId, usize)>,
+    /// Keep the feed visible until a resized HTML frame is ready for focus.
+    pending_html_focus: Option<VisualKey>,
     /// Feed position to restore when the focus view closes.
     before_focus: Option<(usize, usize)>,
     feed: Option<(FeedKey, Feed)>,
@@ -247,6 +251,7 @@ impl App {
             shown: None,
             sel: 0,
             mode: Mode::Nav,
+            sidebar_hidden: false,
             size: (80, 24),
             card_cols: 0,
             cell_px: (8, 16),
@@ -265,6 +270,7 @@ impl App {
             scroll: 0,
             cursor: 0,
             focused_card: None,
+            pending_html_focus: None,
             before_focus: None,
             feed: None,
             jump: None,
@@ -286,14 +292,16 @@ impl App {
 
     /// The visual key selected for full-width card focus, if any.
     pub fn focused_visual(&self) -> Option<VisualKey> {
+        if let Some(key) = &self.pending_html_focus { return Some(key.clone()); }
         let (id, card) = self.focused_card.as_ref()?;
         Some((id.clone(), self.version_of(id)?, *card))
     }
 
     /// Pixel budget for visual cards at the current pane size.
     pub fn target(&self) -> Target {
-        let inner = ui::geometry_for(self).main.width.saturating_sub(5).max(1) as u32;
-        let rows = if self.focused_card.is_some() { self.page().saturating_sub(3) } else { self.page() / 2 };
+        let width = if self.pending_html_focus.is_some() { self.size.0 } else { ui::geometry_for(self).main.width };
+        let inner = width.saturating_sub(5).max(1) as u32;
+        let rows = if self.focused_card.is_some() || self.pending_html_focus.is_some() { self.page().saturating_sub(3) } else { self.page() / 2 };
         Target {
             width_px: inner * self.cell_px.0 as u32,
             max_height_px: rows.max(1) as u32 * self.cell_px.1 as u32,
@@ -373,14 +381,20 @@ impl App {
                 vec![Effect::Redraw]
             }
             Msg::VisualReady { key, w, h, max_scale } => {
+                let resized_html = self.pending_html_focus.as_ref() == Some(&key) && w == self.target().width_px;
                 self.visuals.insert(key, VisualState::Ready { w, h, max_scale, rendered_at: self.target() });
                 self.visual_gen += 1;
-                vec![Effect::Redraw]
+                let mut fx = if resized_html { self.enter_card_focus() } else { vec![] };
+                fx.push(Effect::Redraw);
+                fx
             }
             Msg::VisualFailed { key, reason } => {
+                let failed_html = self.pending_html_focus.as_ref() == Some(&key);
                 self.visuals.insert(key, VisualState::Failed(reason));
                 self.visual_gen += 1;
-                vec![Effect::Redraw]
+                let mut fx = if failed_html { self.enter_card_focus() } else { vec![] };
+                fx.push(Effect::Redraw);
+                fx
             }
             Msg::Gfx(_) => vec![],
         }
@@ -405,6 +419,7 @@ impl App {
             self.remembered.insert(old, r);
         }
         self.focused_card = None;
+        self.pending_html_focus = None;
         self.before_focus = None;
         self.open = Some(id.clone());
         self.feed = None;
@@ -709,36 +724,55 @@ impl App {
 
     // ---- Input ------------------------------------------------------------------
 
+    /// Enter card focus, preserving the feed position for when it closes.
+    fn enter_card_focus(&mut self) -> Vec<Effect> {
+        let Some((id, _, card)) = self.pending_html_focus.take() else { return vec![] };
+        self.before_focus = Some((self.scroll, self.cursor));
+        self.focused_card = Some((id, card));
+        self.feed = None;
+        self.scroll = 0;
+        self.cursor = 0;
+        self.follow_cursor();
+        self.report_card_width()
+    }
+
+    fn toggle_sidebar(&mut self) -> Vec<Effect> {
+        self.sidebar_hidden = !self.sidebar_hidden;
+        self.report_card_width()
+    }
+
+    fn report_card_width(&mut self) -> Vec<Effect> {
+        let cols = ui::geometry_for(self).main.width.saturating_sub(5);
+        if cols == self.card_cols { return vec![]; }
+        self.card_cols = cols;
+        vec![Effect::Request(StageRequest::CardCols(cols))]
+    }
+
     /// `z` focuses the card at the cursor; `z` or Escape restores the feed.
     fn toggle_card_focus(&mut self) -> Vec<Effect> {
+        if self.pending_html_focus.take().is_some() { return vec![]; }
         if self.focused_card.is_some() {
             self.focused_card = None;
             self.feed = None;
             if let Some((scroll, cursor)) = self.before_focus.take() {
                 (self.scroll, self.cursor) = (scroll, cursor);
             }
-        } else {
-            let (post, hit) = self.hit_at_cursor();
-            let Some(id) = post.and_then(|i| self.posts.get(i)).map(|p| p.id.clone()) else { return vec![] };
-            let card = match hit { Hit::Card(c) | Hit::Node(c, _) => c, Hit::None => 0 };
-            let Some(version) = self.version_of(&id) else { return vec![] };
-            let Some(cards) = self.loaded.get(&(id.clone(), version)).and_then(|loaded| loaded.cards.as_ref()) else { return vec![] };
-            if card >= cards.len() { return vec![]; }
-            self.before_focus = Some((self.scroll, self.cursor));
-            self.focused_card = Some((id, card));
-            self.follow = false;
-            self.feed = None;
-            self.scroll = 0;
-            self.cursor = 0;
-            self.follow_cursor();
+            return self.report_card_width();
         }
-        let cols = ui::geometry_for(self).main.width.saturating_sub(5);
-        if cols != self.card_cols {
-            self.card_cols = cols;
-            vec![Effect::Request(StageRequest::CardCols(cols))]
-        } else {
-            vec![]
-        }
+        let (post, hit) = self.hit_at_cursor();
+        let Some(id) = post.and_then(|i| self.posts.get(i)).map(|p| p.id.clone()) else { return vec![] };
+        let card = match hit { Hit::Card(c) | Hit::Node(c, _) => c, Hit::None => 0 };
+        let Some(version) = self.version_of(&id) else { return vec![] };
+        let Some(cards) = self.loaded.get(&(id.clone(), version)).and_then(|loaded| loaded.cards.as_ref()) else { return vec![] };
+        let Some(selected) = cards.get(card) else { return vec![] };
+        let key = (id.clone(), version, card);
+        let html_ready = matches!(selected.body, CardBody::Visual { source: VisualSource::Html(_), .. })
+            && matches!(self.visuals.get(&key), Some(VisualState::Ready { .. }))
+            && self.on_screen.iter().any(|shown| shown.key == key)
+            && ui::geometry_for(self).main.width != self.size.0;
+        self.follow = false;
+        self.pending_html_focus = Some(key);
+        if html_ready { vec![] } else { self.enter_card_focus() }
     }
 
     fn key(&mut self, k: KeyEvent) -> Vec<Effect> {
@@ -808,7 +842,8 @@ impl App {
         match k.code {
             KeyCode::Char('q') => vec![Effect::Quit],
             KeyCode::Char('z') => self.toggle_card_focus(),
-            KeyCode::Esc if self.focused_card.is_some() => self.toggle_card_focus(),
+            KeyCode::Char('s') => self.toggle_sidebar(),
+            KeyCode::Esc if self.focused_card.is_some() || self.pending_html_focus.is_some() => self.toggle_card_focus(),
             KeyCode::Char('j') if self.focused_card.is_none() => {
                 self.step_post(true);
                 vec![]
@@ -992,6 +1027,9 @@ impl App {
             m.column >= r.x && m.column < r.x + r.width && m.row >= r.y && m.row < r.y + r.height
         };
         let fx = match m.kind {
+            MouseEventKind::Down(MouseButton::Left) if m.row == g.header.y && m.column < 3 && matches!(self.mode, Mode::Nav) => {
+                self.toggle_sidebar()
+            }
             MouseEventKind::ScrollDown => {
                 self.scroll(WHEEL as isize);
                 vec![]
@@ -1121,6 +1159,7 @@ impl App {
                 if self.open.as_ref().is_some_and(|id| !self.sessions.iter().any(|s| &s.id == id)) {
                     (self.open, self.shown, self.feed) = (None, None, None);
                     self.focused_card = None;
+                    self.pending_html_focus = None;
                     self.before_focus = None;
                     self.posts.clear();
                     self.comments.clear();
@@ -1165,6 +1204,9 @@ impl App {
                     }
                 }
                 self.posts = posts;
+                if self.pending_html_focus.as_ref().is_some_and(|(id, version, _)| self.version_of(id) != Some(*version)) {
+                    self.pending_html_focus = None;
+                }
                 if self.focused_card.as_ref().is_some_and(|(id, _)| !self.posts.iter().any(|p| &p.id == id)) {
                     self.focused_card = None;
                     self.before_focus = None;
@@ -1549,6 +1591,71 @@ mod tests {
         assert_eq!(app.focused_card, None);
         assert_eq!((app.scroll, app.cursor), original);
         assert!(app.feed().lines.iter().any(|line| line.to_string().contains("first card")));
+    }
+
+    #[test]
+    fn sidebar_toggles_by_key_and_header_click() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = booted(&fake());
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let normal_width = ui::geometry_for(&app).main.width;
+        let _ = app.feed();
+        let original = (app.scroll, app.cursor);
+        let hidden = app.update(key(KeyCode::Char('s')));
+        assert!(app.sidebar_hidden);
+        assert_eq!(ui::geometry_for(&app).main.width, 100);
+        assert!(hidden.contains(&Effect::Request(StageRequest::CardCols(95))));
+        term.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let click = Msg::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 2, row: 0, modifiers: KeyModifiers::NONE });
+        app.update(click);
+        assert!(!app.sidebar_hidden);
+        assert_eq!(ui::geometry_for(&app).main.width, normal_width);
+        let _ = app.feed();
+        assert_eq!((app.scroll, app.cursor), original);
+    }
+
+    #[test]
+    fn html_focus_waits_for_the_resized_frame_without_a_narrow_intermediate_card() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = booted(&fake());
+        let id = PostId::from("b");
+        let post_key = (id.clone(), 2);
+        let p = Post { parts: vec![Part::Html { html: "<p>hello</p>".into(), kits: vec![], id: None }], ..post("b", "s1", 2, "") };
+        let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
+        app.loaded.get_mut(&post_key).unwrap().cards = Some(build_cards(&p, &r));
+        app.loaded.get_mut(&post_key).unwrap().post = Some(p);
+        let visual = (id, 2, 0);
+        let normal_width = app.target().width_px;
+        app.visuals.insert(visual.clone(), VisualState::Ready { w: normal_width, h: 200, max_scale: 1.0, rendered_at: app.target() });
+        app.feed = None;
+        app.cursor = app.feed().starts[1] + 2;
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(app.on_screen.iter().any(|shown| shown.key == visual));
+        let original = (app.scroll, app.cursor);
+        app.update(key(KeyCode::Char('z')));
+        assert_eq!(app.focused_card, None);
+        assert_eq!(app.pending_html_focus, Some(visual.clone()));
+        assert_eq!(ui::geometry_for(&app).sidebar.width, ui::geometry(app.size).sidebar.width);
+        assert_eq!((app.scroll, app.cursor), original);
+        let full_width = app.target().width_px;
+        assert!(full_width > normal_width);
+        app.update(Msg::VisualReady { key: visual.clone(), w: normal_width, h: 200, max_scale: 1.0 });
+        assert_eq!(app.pending_html_focus, Some(visual.clone()), "an old animation frame cannot enter focus");
+        app.update(Msg::VisualReady { key: visual.clone(), w: full_width, h: 230, max_scale: 1.0 });
+        assert_eq!(app.focused_card, Some((visual.0.clone(), 0)));
+        assert_eq!(app.pending_html_focus, None);
+        assert_eq!(ui::geometry_for(&app).sidebar.width, 0);
+        app.update(key(KeyCode::Esc));
+        let _ = app.feed();
+        assert_eq!((app.scroll, app.cursor), original);
+        term.draw(|f| ui::draw(f, &mut app)).unwrap();
+        app.update(key(KeyCode::Char('z')));
+        assert_eq!(app.pending_html_focus, Some(visual));
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.pending_html_focus, None);
+        assert_eq!(app.focused_card, None);
+        assert_eq!(app.target().width_px, normal_width);
     }
 
     #[test]

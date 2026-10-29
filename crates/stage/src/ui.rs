@@ -142,7 +142,7 @@ pub fn geometry((w, h): (u16, u16)) -> Geometry {
 /// Focus gives the selected card the whole pane instead of the session sidebar.
 pub fn geometry_for(app: &App) -> Geometry {
     let mut g = geometry(app.size);
-    if app.focused_card.is_some() {
+    if app.focused_card.is_some() || app.sidebar_hidden {
         g.sidebar.width = 0;
         g.main.x = 0;
         g.main.width = app.size.0;
@@ -226,7 +226,7 @@ fn clip(s: &str, max: usize) -> String {
 pub fn draw(f: &mut Frame, app: &mut App) {
     let g = geometry_for(app);
     let open = app.open.as_ref().and_then(|id| app.sessions.iter().find(|s| &s.id == id));
-    let mut head = vec![Span::styled(" stage", bold().fg(TEAL))];
+    let mut head = vec![Span::styled(" ≡ ", bold().fg(BLUE)), Span::styled("stage", bold().fg(TEAL))];
     if let Some(s) = open {
         let name = crate::sanitize::sanitize(s.title.as_deref().unwrap_or(&s.agent)).into_owned();
         head.push(Span::styled("  session ", dim()));
@@ -260,6 +260,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 ("/", "search"),
                 ("c", "comment"),
                 ("z", if app.focused_card.is_some() { "back" } else { "focus card" }),
+                ("s", "sidebar"),
                 ("r", "rename"),
                 ("d", "delete"),
                 (":", "command"),

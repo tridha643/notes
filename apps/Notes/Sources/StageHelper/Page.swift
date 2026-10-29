@@ -153,6 +153,8 @@ final class Page: NSObject, WKNavigationDelegate {
     private let web: WKWebView
 
     private var loaded = false, paused = false, snapping = false
+    /// Suppress snapshots while layout briefly uses a 1pt measurement viewport.
+    private var measuring = false, layoutVersion = 0
     private var frame = 0
     private var inFlight: Int?
     /// A capture came due while a frame was unacked or a snapshot was running.
@@ -205,13 +207,16 @@ final class Page: NSObject, WKNavigationDelegate {
 
     /// Size the viewport to the content (capped at maxHeight), wait for a paint, capture.
     private func layout() {
-        // Measure in a 1px-tall viewport: scrollHeight is never less than the viewport, and in
-        // quirks mode the root box fills it, so only a tiny one shows the content's own height.
+        // Measure in a 1pt-tall viewport without sending that intermediate size
+        // to stage. A newer resize also supersedes these asynchronous callbacks.
+        layoutVersion += 1
+        let version = layoutVersion
+        measuring = true
         setSize(width, 1)
         web.pageZoom = 1
         let measure = "[document.documentElement.scrollWidth, document.documentElement.scrollHeight]"
         web.evaluateJavaScript(measure) { [weak self] size, _ in
-            guard let self else { return }
+            guard let self, self.layoutVersion == version else { return }
             let size = (size as? [NSNumber])?.map(\.doubleValue) ?? []
             // A page wider than the card (a fixed-width teardown, a wide table) is zoomed
             // out to fit it, never in, and laid out again at that zoom.
@@ -219,7 +224,8 @@ final class Page: NSObject, WKNavigationDelegate {
             guard zoom < 0.999 else { return self.show(height: size.count == 2 ? size[1] : self.maxHeight) }
             self.web.pageZoom = zoom
             self.web.evaluateJavaScript("document.documentElement.scrollHeight") { [weak self] h, _ in
-                self?.show(height: ((h as? NSNumber)?.doubleValue ?? 0) * zoom)
+                guard let self, self.layoutVersion == version else { return }
+                self.show(height: ((h as? NSNumber)?.doubleValue ?? 0) * zoom)
             }
         }
     }
@@ -227,6 +233,7 @@ final class Page: NSObject, WKNavigationDelegate {
     /// Size the viewport to `height` points of content (capped) and capture.
     private func show(height content: Double) {
         setSize(width, max(1, min(content, maxHeight)))
+        measuring = false
         traceMark("html measured", since: opened)
         // takeSnapshot waits for the next committed paint itself, so no rAF round trip first.
         lastHash = nil
@@ -256,17 +263,23 @@ final class Page: NSObject, WKNavigationDelegate {
 
     private func capture() {
         guard loaded, !paused else { return }
+        if measuring { due = true; return }
         if inFlight != nil || snapping {
             due = true
             return
         }
         due = false
         snapping = true
+        let version = layoutVersion
         let (w, h) = (Int((width * scale).rounded()), Int((height * scale).rounded()))
         let t0 = DispatchTime.now().uptimeNanoseconds
         web.takeSnapshot(with: nil) { [weak self] image, _ in
             guard let self else { return }
             self.snapping = false
+            if version != self.layoutVersion {
+                if !self.measuring { self.capture() }
+                return
+            }
             let t1 = DispatchTime.now().uptimeNanoseconds
             guard !self.paused, let cg = image?.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
             let px = rgba(cg, w, h)

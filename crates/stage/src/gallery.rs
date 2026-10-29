@@ -202,7 +202,9 @@ impl Gallery {
     /// Connect to the shared helper, launching it (detached, so it outlives this
     /// stage and the next one starts warm) if nobody answers.
     fn connect(&self) -> Result<UnixStream, String> {
-        let sock = self.cache.join("helper.sock");
+        // A new socket keeps existing stages on their helper while this build
+        // starts one with the corrected HTML resize behavior.
+        let sock = self.cache.join("helper-v2.sock");
         if let Ok(stream) = UnixStream::connect(&sock) {
             return Ok(stream);
         }
@@ -257,6 +259,17 @@ impl Gallery {
 
     fn html_size(&self) -> (f64, f64) {
         (self.target.width_px as f64 / SCALE, self.target.max_height_px as f64 / SCALE)
+    }
+
+    fn resize_pages(&mut self, focused: Option<&VisualKey>) {
+        let (width, max_height) = self.html_size();
+        let pages: Vec<_> = self.pages.iter()
+            .filter(|(_, key)| focused.is_none_or(|selected| selected == *key))
+            .map(|(id, _)| *id)
+            .collect();
+        for page in pages {
+            let _ = self.send(json!({"op": "html-resize", "id": page, "width": width, "max_height": max_height, "scale": SCALE}));
+        }
     }
 
     /// Start making a visual's pixels. Failures come back as messages for the app.
@@ -351,10 +364,7 @@ impl Gallery {
         self.focused = focused.cloned();
         self.raster_epoch += 1;
         self.raster_target();
-        let (width, max_height) = self.html_size();
-        for page in self.pages.keys().copied().collect::<Vec<_>>() {
-            let _ = self.send(json!({"op": "html-resize", "id": page, "width": width, "max_height": max_height, "scale": SCALE}));
-        }
+        self.resize_pages(focused);
     }
 
     /// A request about an existing page (its id is the page id, not a new one).
@@ -484,6 +494,13 @@ impl Gallery {
                     let (Some(key), Some(shm), Some(size)) = (self.pages.get(&id).cloned(), v["shm"].as_str(), dims()) else {
                         return vec![];
                     };
+                    // A frame captured before a focus/resize can arrive after the
+                    // target changes. Never show it at an intermediate width.
+                    if size.0 != self.target.width_px {
+                        kitty::unlink(shm);
+                        let _ = self.send(json!({"op": "html-ack", "id": id, "frame": frame}));
+                        return vec![];
+                    }
                     let msg = self.show(out, key, shm, size, Some(id), None);
                     let _ = self.send(json!({"op": "html-ack", "id": id, "frame": frame}));
                     return msg.into_iter().collect();
@@ -582,11 +599,8 @@ impl Gallery {
             let _ = self.decode(key, file);
         }
         self.raster_target();
-        // A resize makes each page measure again and send a fresh frame.
-        let (width, max_height) = self.html_size();
-        for page in self.pages.keys().copied().collect::<Vec<_>>() {
-            let _ = self.send(json!({"op": "html-resize", "id": page, "width": width, "max_height": max_height, "scale": SCALE}));
-        }
+        // Only the focused page needs the new size while it fills the pane.
+        self.resize_pages(focused);
     }
 
     /// Remove every image (on quit).
@@ -627,6 +641,21 @@ mod tests {
         // Fully visible.
         let p = Place { src: (0, 0, 0, 10), rows: 10, ..p };
         assert_eq!(crop(&p, (400, 300)).src, (0, 0, 400, 300));
+    }
+
+    #[test]
+    fn html_frame_from_before_a_resize_is_never_transmitted() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 800, max_height_px: 400 });
+        let key: VisualKey = ("page".into(), 1, 0);
+        gallery.pages.insert(9, key.clone());
+        let mut out = Vec::new();
+        let old = Gfx::Helper(r#"{"id":9,"frame":3,"shm":"/stg-old","w":600,"h":200}"#.into());
+        assert!(gallery.handle(&mut out, old).is_empty());
+        assert!(out.is_empty());
+        assert!(!gallery.images.contains_key(&key));
+        let resized = Gfx::Helper(r#"{"id":9,"frame":4,"shm":"/stg-new","w":800,"h":200}"#.into());
+        assert!(matches!(gallery.handle(&mut out, resized).as_slice(), [Msg::VisualReady { w: 800, .. }]));
     }
 
     #[test]
