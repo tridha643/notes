@@ -20,7 +20,7 @@ use std::{
     thread,
 };
 
-use serde_json::{json, Value};
+use notes_proto::helper::{Failed, Frame, HelperReply, HelperRequest, Image, Mermaid};
 
 use crate::{
     app::{Msg, OnScreen, Target, VisualKey, ZoomView},
@@ -296,7 +296,7 @@ impl Gallery {
                 i.page
             }).collect();
             for page in pages {
-                let _ = self.send(json!({"op": "html-pause", "id": page}));
+                let _ = self.send(&HelperRequest::HtmlPause { id: page });
             }
         }
     }
@@ -305,7 +305,7 @@ impl Gallery {
     /// first visual doesn't pay for process launch, WebKit and font loading.
     pub fn warm(&mut self) {
         thread::spawn(fonts);
-        let _ = self.ask(json!({"op": "warm"}));
+        let _ = self.ask(|id| HelperRequest::Warm { id });
     }
 
     /// Connect to the shared helper, launching it (detached, so it outlives this
@@ -338,7 +338,7 @@ impl Gallery {
     }
 
     /// Send one request to stage-helper, connecting first if needed.
-    fn ask(&mut self, mut req: Value) -> Result<u64, String> {
+    fn ask(&mut self, req: impl FnOnce(u64) -> HelperRequest) -> Result<u64, String> {
         if self.helper.is_none() {
             let stream = self.connect()?;
             let reader = stream.try_clone().map_err(|e| e.to_string())?;
@@ -355,8 +355,7 @@ impl Gallery {
         }
         let id = self.next_req;
         self.next_req += 1;
-        req["id"] = json!(id);
-        self.send(req).map(|()| id)
+        self.send(&req(id)).map(|()| id)
     }
 
     fn write_cache(&self, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
@@ -376,7 +375,7 @@ impl Gallery {
             .map(|(id, _)| *id)
             .collect();
         for page in pages {
-            let _ = self.send(json!({"op": "html-resize", "id": page, "width": width, "max_height": max_height, "scale": SCALE}));
+            let _ = self.send(&HelperRequest::HtmlResize { id: page, width, max_height, scale: SCALE });
         }
     }
 
@@ -390,11 +389,13 @@ impl Gallery {
         };
         self.asked.insert(key.clone(), (std::time::Instant::now(), kind));
         let result = match &source {
-            VisualSource::Mermaid(src) => self
-                .ask(json!({"op": "mermaid", "source": src, "max_width": self.target.width_px as f64 / SCALE, "font_size": 14}))
-                .map(|req| {
-                    self.pending.insert(req, Pending::Mermaid(key.clone()));
-                }),
+            VisualSource::Mermaid(src) => {
+                let max_width = self.target.width_px as f64 / SCALE;
+                self.ask(|id| HelperRequest::Mermaid { id, source: src.clone(), max_width, font_size: 14.0 })
+                    .map(|req| {
+                        self.pending.insert(req, Pending::Mermaid(key.clone()));
+                    })
+            }
             VisualSource::Asset(asset) => {
                 // The file in the session folder, else the bytes over the socket.
                 let local = self.stage.join("assets").join(asset.as_str());
@@ -429,7 +430,7 @@ impl Gallery {
                     return msgs;
                 }
                 let (width, max_height) = self.html_size();
-                self.ask(json!({"op": "html-open", "path": path, "width": width, "max_height": max_height, "scale": SCALE, "fps": 60}))
+                self.ask(|id| HelperRequest::HtmlOpen { id, path, width, max_height, scale: SCALE, fps: 60.0 })
                     .map(|req| {
                         self.pages.insert(req, key.clone());
                     })
@@ -445,7 +446,7 @@ impl Gallery {
     /// in place when it can be), keeping its pixels on screen. `None`: no such page.
     fn update_page(&mut self, key: &VisualKey, path: &std::path::Path) -> Option<Vec<Msg>> {
         let (page, old) = self.pages.iter().find(|(_, k)| k.0 == key.0 && k.2 == key.2).map(|(page, k)| (*page, k.clone()))?;
-        self.send(json!({"op": "html-update", "id": page, "path": path})).ok()?;
+        self.send(&HelperRequest::HtmlUpdate { id: page, path: path.to_owned() }).ok()?;
         self.pages.insert(page, key.clone());
         self.asked.remove(key);
         let Some(img) = self.images.remove(&old) else { return Some(vec![]) };
@@ -456,7 +457,7 @@ impl Gallery {
 
     /// Ask the helper to decode a non-PNG image file.
     fn decode(&mut self, key: VisualKey, path: PathBuf) -> Result<(), String> {
-        let req = self.ask(json!({"op": "image", "path": path}))?;
+        let req = self.ask(|id| HelperRequest::Image { id, path: path.clone() })?;
         self.pending.insert(req, Pending::Image(key, path));
         Ok(())
     }
@@ -512,9 +513,10 @@ impl Gallery {
     }
 
     /// A request about an existing page (its id is the page id, not a new one).
-    fn send(&mut self, req: Value) -> Result<(), String> {
+    fn send(&mut self, req: &HelperRequest) -> Result<(), String> {
         let helper = self.helper.as_mut().ok_or("stage-helper isn't running")?;
-        if let Err(e) = helper.stream.write_all(format!("{req}\n").as_bytes()) {
+        let line = serde_json::to_string(req).map_err(|e| e.to_string())?;
+        if let Err(e) = helper.stream.write_all(format!("{line}\n").as_bytes()) {
             self.helper = None;
             return Err(format!("stage-helper stopped ({e})"));
         }
@@ -714,46 +716,42 @@ impl Gallery {
                 Err(reason) => vec![Msg::VisualFailed { key, reason }],
             },
             Gfx::Helper(line) => {
-                let Ok(v) = serde_json::from_str::<Value>(&line) else { return vec![] };
-                let id = v["id"].as_u64().unwrap_or(0);
-                let dims = || Some((v["w"].as_u64()? as u32, v["h"].as_u64()? as u32));
-                if let Some(frame) = v["frame"].as_u64() {
-                    let (Some(key), Some(shm), Some(size)) = (self.pages.get(&id).cloned(), v["shm"].as_str(), dims()) else {
-                        return vec![];
-                    };
-                    // A frame captured before a focus/resize can arrive after the
-                    // target changes. Never show it at an intermediate width.
-                    if size.0 != self.target.width_px {
-                        kitty::unlink(shm);
-                        let _ = self.send(json!({"op": "html-ack", "id": id, "frame": frame}));
-                        return vec![];
+                let Ok(reply) = serde_json::from_str::<HelperReply>(&line) else { return vec![] };
+                match reply {
+                    HelperReply::Frame(Frame { id, frame, shm, w, h }) => {
+                        let Some(key) = self.pages.get(&id).cloned() else { return vec![] };
+                        // A frame captured before a focus/resize can arrive after the
+                        // target changes. Never show it at an intermediate width.
+                        if w != self.target.width_px {
+                            kitty::unlink(&shm);
+                            let _ = self.send(&HelperRequest::HtmlAck { id, frame });
+                            return vec![];
+                        }
+                        let msg = self.show(out, key, &shm, (w, h), Some(id), None);
+                        let _ = self.send(&HelperRequest::HtmlAck { id, frame });
+                        msg.into_iter().collect()
                     }
-                    let msg = self.show(out, key, shm, size, Some(id), None);
-                    let _ = self.send(json!({"op": "html-ack", "id": id, "frame": frame}));
-                    return msg.into_iter().collect();
-                }
-                if v["ok"] == json!(false) {
-                    let reason = v["error"].as_str().unwrap_or("stage-helper failed").to_owned();
-                    let key = match self.pending.remove(&id) {
-                        Some(Pending::Mermaid(k) | Pending::Image(k, _)) => Some(k),
-                        None => self.pages.remove(&id),
-                    };
-                    return key.map(|key| Msg::VisualFailed { key, reason }).into_iter().collect();
-                }
-                match self.pending.remove(&id) {
-                    Some(Pending::Mermaid(key)) => {
-                        let svg = v["svg"].as_str().unwrap_or_default().to_owned();
+                    HelperReply::Failed(Failed { id, error: reason, .. }) => {
+                        let id = id.unwrap_or(0);
+                        let key = match self.pending.remove(&id) {
+                            Some(Pending::Mermaid(k) | Pending::Image(k, _)) => Some(k),
+                            None => self.pages.remove(&id),
+                        };
+                        key.map(|key| Msg::VisualFailed { key, reason }).into_iter().collect()
+                    }
+                    HelperReply::Mermaid(Mermaid { id, svg, .. }) => {
+                        let Some(Pending::Mermaid(key)) = self.pending.remove(&id) else { return vec![] };
                         self.svgs.insert(key.clone(), svg);
                         if self.focused.as_ref().is_none_or(|focused| focused == &key) {
                             self.raster(&key);
                         }
                         vec![]
                     }
-                    Some(Pending::Image(key, path)) => match (v["shm"].as_str(), dims()) {
-                        (Some(shm), Some(size)) => self.show(out, key, shm, size, None, Some(path)).into_iter().collect(),
-                        _ => vec![Msg::VisualFailed { key, reason: "stage-helper sent no pixels".into() }],
+                    HelperReply::Image(Image { id, shm, w, h, .. }) => match self.pending.remove(&id) {
+                        Some(Pending::Image(key, path)) => self.show(out, key, &shm, (w, h), None, Some(path)).into_iter().collect(),
+                        _ => vec![],
                     },
-                    None => vec![],
+                    HelperReply::Patched(_) | HelperReply::Done(_) => vec![],
                 }
             }
         }
@@ -838,10 +836,10 @@ impl Gallery {
         self.keep_diagrams_within_budget(out);
         self.frame += 1;
         for page in pause {
-            let _ = self.send(json!({"op": "html-pause", "id": page}));
+            let _ = self.send(&HelperRequest::HtmlPause { id: page });
         }
         for page in resume {
-            let _ = self.send(json!({"op": "html-resume", "id": page}));
+            let _ = self.send(&HelperRequest::HtmlResume { id: page });
         }
     }
 

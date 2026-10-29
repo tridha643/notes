@@ -296,7 +296,7 @@ final class Page: NSObject, WKNavigationDelegate {
                     let shm = try writeShm(px)
                     self.frame += 1
                     self.inFlight = self.frame
-                    self.client.send(["id": self.id, "frame": self.frame, "shm": shm, "w": w, "h": h])
+                    self.client.send(.frame(id: self.id, frame: self.frame, shm: shm, w: w, h: h))
                     if self.frame == 1 { traceMark("html first frame", since: self.opened) }
                 } catch {
                     self.client.fail(self.id, "shm: \(error)")
@@ -379,7 +379,7 @@ final class Page: NSObject, WKNavigationDelegate {
             self.web.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
         }
         guard loaded else {
-            client.send(["id": id, "ok": true, "patched": false])
+            client.send(.patched(id: id, patched: false))
             return reload()
         }
         let t0 = DispatchTime.now().uptimeNanoseconds
@@ -387,7 +387,7 @@ final class Page: NSObject, WKNavigationDelegate {
             guard let self else { return }
             let outcome = (try? result.get()) as? String ?? "patch-failed"
             traceMark("html update \(outcome)", since: t0)
-            self.client.send(["id": self.id, "ok": true, "patched": outcome == "ok"])
+            self.client.send(.patched(id: self.id, patched: outcome == "ok"))
             if outcome == "ok" { self.layout() } else { reload() }
         }
     }

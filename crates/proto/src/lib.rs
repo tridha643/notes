@@ -14,6 +14,7 @@ use std::{env, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod helper;
 pub mod posts;
 use posts::*;
 
