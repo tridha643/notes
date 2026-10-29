@@ -572,9 +572,23 @@ pub struct TraceSetArgs {
     pub steps: Vec<TraceStep>,
 }
 
-/// Setting stage writes on resize: how many cells of text fit in a card, so
-/// `notes post` and `notes guide` can tell agents what width to write for.
-pub const STAGE_CARD_COLS: &str = "stage.card_cols";
+/// Setting stage writes whenever its cards change size: a [`StageSpace`] as
+/// JSON, so `notes post` and `notes guide` can tell agents the room a post gets.
+pub const STAGE_SPACE: &str = "stage.space";
+
+/// The room a card in the user's stage gives each part of a post.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StageSpace {
+    /// Text cells per line in markdown, code, diff, terminal and json cards.
+    pub cols: u16,
+    /// Feed rows on screen.
+    pub rows: u16,
+    /// An html part's viewport in CSS px, also the width mermaid lays out to. A
+    /// wider page is zoomed out to fit; anything below `html_height` is cut off.
+    pub html_width: u32,
+    pub html_height: u32,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

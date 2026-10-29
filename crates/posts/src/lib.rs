@@ -56,7 +56,6 @@ mod ansi;
 mod diff;
 mod highlight;
 mod json_store;
-mod kits;
 mod migrate_json;
 mod render;
 mod sqlite_store;
@@ -65,7 +64,6 @@ mod store;
 mod validate;
 
 pub use json_store::{AssetMeta, PostRec, SessionFile, Store, VersionRec, SCHEMA};
-pub use kits::{kits, KIT_IDS};
 pub use render::{
     post_render, post_render_json, render_part, CacheStats, RenderCache,
     RENDER_VERSION,

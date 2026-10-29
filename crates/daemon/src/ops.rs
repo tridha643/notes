@@ -313,7 +313,7 @@ impl Tx<'_> {
             Verb::AssetGet(a) => value(p::asset_get(db, &a.id).map_err(Fail)?),
             Verb::TraceSet(a) => self.written_posts(p::trace_set(db, a)),
             Verb::TraceList(a) => value(p::trace_list(db, &a.id).map_err(Fail)?),
-            Verb::Kits => value(p::kits()),
+            Verb::Kits => value(notes_proto::kits::kits()),
             Verb::SettingGet(a) => value(p::setting_get(db, &a.key).map_err(Fail)?),
             Verb::SettingSet(a) => self.posts_events(p::setting_set(db, a)),
             other => Err(fail(

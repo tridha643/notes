@@ -538,7 +538,8 @@ pub fn post_part(s: &Store, args: &PostPartArgs) -> Result<Written<PostWriteResu
     write_version(s, file, at, None, Some(parts))
 }
 
-/// Most recently updated first, optionally in one session.
+/// Newest created first, optionally in one session. Updates never reorder posts:
+/// a session reads as the order its cards were made.
 pub fn post_list(s: &Store, args: &PostListArgs) -> Result<Vec<PostSummary>> {
     if let Some(id) = &args.session {
         load(s, id)?;
@@ -552,10 +553,10 @@ pub fn post_list(s: &Store, args: &PostListArgs) -> Result<Vec<PostSummary>> {
             e.data
                 .posts
                 .iter()
-                .map(|p| (p.updated_at, stage.index.post_ord(&p.id), summary(&e.data.id, p)))
+                .map(|p| (p.created_at, stage.index.post_ord(&p.id), summary(&e.data.id, p)))
         })
         .collect();
-    posts.sort_by_key(|(updated, ord, _)| Reverse((*updated, *ord)));
+    posts.sort_by_key(|(created, ord, _)| Reverse((*created, *ord)));
     let limit = args.limit.map_or(usize::MAX, |l| l as usize);
     Ok(posts.into_iter().take(limit).map(|p| p.2).collect())
 }

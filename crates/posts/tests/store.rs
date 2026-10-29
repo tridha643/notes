@@ -6,7 +6,7 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use notes_posts::*;
-use notes_proto::{posts::*, ErrorCode};
+use notes_proto::{kits::{kits, KIT_IDS}, posts::*, ErrorCode};
 use rusqlite::Connection;
 
 /// A store over an in-memory database and a fresh temp session folder.
@@ -1123,6 +1123,12 @@ fn post_list_orders_filters_and_limits() {
         [c.id.clone(), b.id.clone(), a.id.clone()]
     );
     assert_eq!(all[1].kinds, ["markdown", "code"]);
+    // A patch to an older post, a second later, leaves every post where it was.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    post_update(&conn, &PostUpdateArgs { id: a.id.clone(), title: None, parts: Some(vec![md("a2")]) }).unwrap();
+    let after = post_list(&conn, &PostListArgs::default()).unwrap();
+    assert_eq!(after.iter().map(|p| p.id.clone()).collect::<Vec<_>>(), [c.id.clone(), b.id.clone(), a.id.clone()]);
+    assert_eq!(after[2].version, 2);
     let one = post_list(
         &conn,
         &PostListArgs {

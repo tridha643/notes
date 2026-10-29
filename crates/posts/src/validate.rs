@@ -2,9 +2,9 @@
 //! its edge limits (app.ts). serde already enforces each kind's required
 //! fields and types; this checks what serde can't.
 
-use notes_proto::posts::Part;
+use notes_proto::{kits::KIT_IDS, posts::Part};
 
-use crate::{diff::patch_has_content, kits::KIT_IDS, usage, Result, Store};
+use crate::{diff::patch_has_content, usage, Result, Store};
 
 pub const MAX_PART_BYTES: usize = 2 << 20;
 pub const MAX_POST_BYTES: usize = 16 << 20;

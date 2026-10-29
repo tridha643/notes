@@ -157,7 +157,7 @@ at its first error.
 | `notes import <dir\|file> [FOLDER]` | Copy `.md` files into the vault, keeping their folder structure (Obsidian vaults included) |
 | `notes manifest` | Machine-readable JSON of every verb, its args, output schema and exit codes |
 | `notes agent-howto` | How agents post to stage (sessions, updates, reading comments) and use notes |
-| `notes guide` | The stage design guide for posts; `notes post` warns when a post breaks it |
+| `notes guide` | The stage design guide for posts, with the space the user's card gives each part; `notes post` refuses a post that can't fit it and warns about the rest |
 | `notes setup` | A block to paste into AGENTS.md or CLAUDE.md that points agents at stage |
 | `notes doctor` | Socket and database paths, daemon reachable, versions |
 | `notes completions zsh\|bash\|fish` | Shell completion script |

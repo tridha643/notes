@@ -32,9 +32,10 @@ first, _ = post(None, 0)
 open(f"{sys.argv[1]}/session", "w").write(first["session"])
 PY
 session=$(cat "$dir/session")
-sleep 1000 | STAGE_LATENCY_LOG="$dir/painted" script -q /dev/null sh -c "stty rows 40 cols 120; exec target/release/stage --session $session" >/dev/null &
+sleep 1000 2>/dev/null | STAGE_LATENCY_LOG="$dir/painted" script -q /dev/null sh -c "stty rows 40 cols 120; exec target/release/stage --session $session" >/dev/null &
 stage_pid=$!
-sleep 1
+# Publish once stage has painted the session, so startup isn't counted as post latency.
+for _ in $(seq 100); do [ -s "$dir/painted" ] && break; sleep 0.05; done
 python3 - "$dir" "$session" <<'PY'
 import json, os, socket, sys, time
 d, session = sys.argv[1], sys.argv[2]

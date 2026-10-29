@@ -25,7 +25,7 @@ use notes_proto::posts::{
     DiffLayout, IdArgs, Kit, Part, PartOp, Post, PostListArgs, PostNewArgs, PostPartArgs,
     PostId, PostShowArgs, PostSummary, PostUpdateArgs, PostWriteResult, Session, SessionHit,
     SessionDeleteArgs, SessionDeleteResult, SessionId, SessionRenameArgs, SessionRestoreResult,
-    SessionSearchArgs, TraceSetArgs, TraceStep, WaitArgs,
+    SessionSearchArgs, StageSpace, TraceSetArgs, TraceStep, WaitArgs,
 };
 use notes_proto::{
     default_socket_path, to_line, AppendArgs, BatchArgs, BatchOutcome, DeleteArgs, DiffArgs,
@@ -309,7 +309,7 @@ impl MoreParts {
         let MoreParts { markdown, mermaid, code, diff, terminal, html } = self;
         let mut kinds: Vec<PartKind> = markdown.into_iter().map(|file| PartKind::Markdown { file }).collect();
         kinds.extend(mermaid.into_iter().map(|file| PartKind::Mermaid { file }));
-        kinds.extend(code.into_iter().map(|file| PartKind::Code { file, language: None, filename: None, line_start: None }));
+        kinds.extend(code.into_iter().map(|file| PartKind::Code { file, language: None, filename: None, line_start: None, lines: None }));
         kinds.extend(diff.into_iter().map(|file| PartKind::Diff { file, layout: DiffLayout::Unified }));
         kinds.extend(terminal.into_iter().map(|file| PartKind::Terminal { file, cols: None, term_title: None }));
         kinds.extend(html.into_iter().map(|file| PartKind::Html { file, kit: Vec::new() }));
@@ -403,6 +403,9 @@ enum PartKind {
         /// Line number the excerpt starts at
         #[arg(long)]
         line_start: Option<u32>,
+        /// Post only lines A to B of the file, numbered as in the file
+        #[arg(long, value_parser = parse_lines, value_name = "A:B", conflicts_with = "line_start")]
+        lines: Option<LineRange>,
     },
     /// A unified or git patch
     Diff {
@@ -507,17 +510,43 @@ fn env_session() -> Option<SessionId> {
     env::var("NOTES_SESSION").ok().filter(|s| !s.is_empty()).map(SessionId::from)
 }
 
-/// The card width stage last reported, if it has run.
-fn card_cols(ask: &mut Ask<'_>) -> Option<usize> {
-    let key = notes_proto::posts::SettingGetArgs { key: notes_proto::posts::STAGE_CARD_COLS.into() };
-    ask(Verb::SettingGet(key)).ok()?.as_str()?.parse().ok()
+/// The space stage last reported for its cards, if it has run.
+fn stage_space(ask: &mut Ask<'_>) -> Option<StageSpace> {
+    let key = notes_proto::posts::SettingGetArgs { key: notes_proto::posts::STAGE_SPACE.into() };
+    serde_json::from_str(ask(Verb::SettingGet(key)).ok()?.as_str()?).ok()
 }
 
-/// Print the design guide's warnings for a post about to be sent.
-fn warn(title: Option<&str>, parts: &[Part], ask: &mut Ask<'_>) {
-    for w in lint::check(title, parts, card_cols(ask).unwrap_or(lint::CARD_COLS)) {
+/// One line per kind of part, saying how much room the card gives it.
+fn space_lines(s: &StageSpace) -> String {
+    let (w, h, cols) = (s.html_width, s.html_height, s.cols);
+    format!(
+        "- markdown, code, diff, terminal, json: {cols} cells per line.\n\
+         - html: a {w} x {h} px viewport (CSS px). A wider page is zoomed out to fit, so its\n  text shrinks; anything below {h} px is cut off.\n\
+         - mermaid and images: {w} px wide. A tall diagram scrolls.\n"
+    )
+}
+
+/// Check a post against the user's stage card before it's sent: print style
+/// warnings, and refuse a post that can't fit. Until stage has reported its
+/// space, overflow is checked against a default and only warned about.
+fn fit(title: Option<&str>, parts: &[Part], ask: &mut Ask<'_>) -> Result<(), ErrorBody> {
+    let reported = stage_space(ask);
+    let space = reported.unwrap_or(lint::DEFAULT_SPACE);
+    let found = lint::check(title, parts, &space);
+    for w in &found.style {
         eprintln!("warning: {w} (see `notes guide`)");
     }
+    if reported.is_none() || found.overflow.is_empty() {
+        for w in &found.overflow {
+            eprintln!("warning: {w} (see `notes guide`)");
+        }
+        return Ok(());
+    }
+    for e in &found.overflow {
+        eprintln!("error: {e}");
+    }
+    let message = format!("post doesn't fit the user's stage card, so it wasn't sent. The card gives:\n{}", space_lines(&space));
+    Err(fail(ErrorCode::Usage, message.trim_end(), "fix each error above and post again"))
 }
 
 /// Parse a flag value as one of a proto enum's kebab-case names.
@@ -702,16 +731,23 @@ fn build_part(
             language,
             filename,
             line_start,
+            lines,
         } => Part::Code {
-            code: read_all(&file, stdin)?,
-            language: language.or_else(|| language_for(&file)),
+            code: match (read_all(&file, stdin)?, lines) {
+                (all, Some(r)) => {
+                    let skip = r.start.saturating_sub(1) as usize;
+                    all.lines().skip(skip).take((r.end as usize).saturating_sub(skip)).collect::<Vec<_>>().join("\n")
+                }
+                (all, None) => all,
+            },
+            language: language.or_else(|| language_for(filename.as_deref().unwrap_or(&file))),
             title: filename.or_else(|| {
                 (file != "-")
                     .then(|| Path::new(&file).file_name())
                     .flatten()
                     .map(|n| n.to_string_lossy().into_owned())
             }),
-            line_start,
+            line_start: lines.map(|r| r.start).or(line_start),
             id: None,
         },
         PartKind::Diff { file, layout } => Part::Diff {
@@ -936,7 +972,7 @@ fn to_verb(
                     .chain(more.kinds())
                     .map(|k| build_part(k, &session, stdin, ask))
                     .collect::<Result<Vec<_>, _>>()?;
-                warn(title.as_deref(), &parts, ask);
+                fit(title.as_deref(), &parts, ask)?;
                 Verb::PostNew(PostNewArgs { parts, session, title, session_title, owner: owner::key() })
             }
             PostCmd::Update { id, part } => {
@@ -946,7 +982,7 @@ fn to_verb(
                 } else {
                     Some(kinds.into_iter().map(|k| build_part(k, &session, stdin, ask)).collect::<Result<Vec<_>, _>>()?)
                 };
-                warn(title.as_deref(), parts.as_deref().unwrap_or_default(), ask);
+                fit(title.as_deref(), parts.as_deref().unwrap_or_default(), ask)?;
                 Verb::PostUpdate(PostUpdateArgs { id, title, parts })
             }
             PostCmd::Part { id, op } => {
@@ -958,7 +994,7 @@ fn to_verb(
                 let part = part
                     .map(|p| build_part(p, &session, stdin, ask))
                     .transpose()?;
-                warn(title.as_deref(), part.as_slice(), ask);
+                fit(title.as_deref(), part.as_slice(), ask)?;
                 Verb::PostPart(PostPartArgs {
                     id,
                     op,
@@ -1452,11 +1488,16 @@ fn main() -> ExitCode {
             let mut out = include_str!("guide.md").to_owned();
             let sock = cli.sock.clone().unwrap_or_else(default_socket_path);
             let request = |verb| Request { v: PROTOCOL_VERSION, id: 1, verb, cwd: None, agent: None };
-            if let Some(cols) = card_cols(&mut |verb| ask(&sock, &request(verb))) {
-                out.push_str(&format!(
-                    "\n## Right now\n\nThe user's stage card is {cols} cells wide. Write for that width: a\ntable row, code line or diagram label wider than {cols} wraps.\n"
-                ));
-            }
+            out.push_str(&match stage_space(&mut |verb| ask(&sock, &request(verb))) {
+                Some(space) => format!(
+                    "\n## Right now\n\nThe user's stage card gives each part of a post:\n\n{}\n`notes post` refuses a post that doesn't fit, and says why.\n",
+                    space_lines(&space)
+                ),
+                None => format!(
+                    "\n## Right now\n\nstage hasn't reported its size yet. Assume:\n\n{}\n`notes post` only warns until stage reports one.\n",
+                    space_lines(&lint::DEFAULT_SPACE)
+                ),
+            });
             let _ = io::stdout().write_all(out.as_bytes());
             return ExitCode::SUCCESS;
         }
@@ -1746,6 +1787,32 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["notes", "post", "gif", "x"]).is_err());
         assert!(Cli::try_parse_from(["notes", "comment", "p1", "hi", "--part", "1"]).is_err());
+    }
+
+    #[test]
+    fn code_excerpts_keep_their_line_numbers() {
+        let Verb::PostNew(a) = verb(&["post", "code", "-", "--lines", "2:3", "--filename", "src/x.rs"], "a\nb\nc\nd").unwrap() else { panic!() };
+        let Part::Code { code, language, title, line_start, .. } = &a.parts[0] else { panic!() };
+        assert_eq!((code.as_str(), language.as_deref(), title.as_deref(), *line_start), ("b\nc", Some("rust"), Some("src/x.rs"), Some(2)));
+    }
+
+    #[test]
+    fn a_post_that_overflows_the_reported_card_is_refused() {
+        let space = StageSpace { cols: 60, rows: 40, html_width: 480, html_height: 500 };
+        let mut ask = |v: Verb| match v {
+            Verb::SettingGet(_) => Ok(Value::from(serde_json::to_string(&space).unwrap())),
+            _ => panic!("unit tests have no daemon"),
+        };
+        let mut run = |args: &[&str], stdin: &str| {
+            let cli = Cli::try_parse_from(std::iter::once("notes").chain(args.iter().copied())).unwrap();
+            to_verb(cli.cmd, cli.if_version, &mut stdin.as_bytes(), &mut ask)
+        };
+        let wide = run(&["post", "html", "-"], r#"<div style="width:760px">x</div>"#).unwrap_err();
+        assert_eq!(wide.code, ErrorCode::Usage);
+        assert!(wide.message.contains("480 x 500 px"), "{}", wide.message);
+        assert!(run(&["post", "html", "-"], r#"<svg width="100%" viewBox="0 0 760 330"></svg>"#).is_ok());
+        // Without a reported space the same post only warns.
+        assert!(verb(&["post", "html", "-"], r#"<div style="width:760px">x</div>"#).is_ok());
     }
 
     #[test]

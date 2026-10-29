@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod helper;
+pub mod kits;
 pub mod posts;
 use posts::*;
 
