@@ -925,7 +925,7 @@ impl App {
         let left = self.pending_sidebar.as_ref().is_some_and(|(_, waiting)| {
             waiting.iter().any(|key| !self.on_screen.iter().any(|shown| &shown.key == key))
         });
-        if let Some((hidden, _)) = self.pending_sidebar.take().filter(|_| left) {
+        if let Some((hidden, _)) = self.pending_sidebar.take_if(|_| left) {
             self.sidebar_hidden = hidden;
             self.visuals.extend(self.pending_sidebar_frames.drain());
             self.visual_gen += 1;
@@ -1980,6 +1980,8 @@ mod tests {
         assert!(!app.sidebar_hidden);
         assert_eq!(ui::geometry_for(&app).main, old_geometry);
         assert!(!effects.iter().any(|e| matches!(e, Effect::Request(StageRequest::CardCols(_)))));
+        app.after_draw();
+        assert!(app.pending_sidebar.is_some(), "a redraw with the card still on screen keeps waiting");
         let wide = app.target().width_px;
         assert!(wide > narrow);
         app.update(Msg::VisualReady { key: visual.clone(), w: narrow, h: 200, max_scale: 1.0 });
