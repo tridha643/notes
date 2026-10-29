@@ -8,7 +8,7 @@
 //
 // Every pixel buffer is a new shm object that we never unlink: the consumer (kitty via
 // `t=s`, or stage when it drops a frame) does. Requests run on the main thread except
-// pele, which has its own queue.
+// mermaid, which never touches AppKit and goes straight to pele's own queue.
 
 import Accelerate
 import AppKit
@@ -102,14 +102,14 @@ func rgba(_ image: CGImage, _ w: Int, _ h: Int) -> [UInt8] {
 /// Renders still running on pele's queue; EOF waits for them before exiting.
 let renders = DispatchGroup()
 
-@MainActor
+/// Called from the reader thread, so a diagram never waits behind WebKit work on the main thread.
 func mermaid(_ req: [String: Any], id: Any, client: Client) {
     guard let source = req["source"] as? String else { return client.fail(id, "mermaid needs a source") }
     let maxWidth = (req["max_width"] as? NSNumber)?.doubleValue
     let fontSize = (req["font_size"] as? NSNumber)?.doubleValue ?? 14
     nonisolated(unsafe) let id = id
     let theme = peleTheme
-    // pele blocks on its own queue, so render off the main thread.
+    // pele blocks on its own queue, so render off the reader thread.
     renders.enter()
     DispatchQueue.global(qos: .userInitiated).async {
         defer { renders.leave() }
@@ -140,10 +140,7 @@ func image(_ req: [String: Any], id: Any, client: Client) {
 }
 
 @MainActor
-func handle(_ line: String, from client: Client) {
-    guard let data = line.data(using: .utf8),
-          let req = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-    else { return client.fail(NSNull(), "bad request: not a JSON object") }
+func handle(_ req: [String: Any], from client: Client) {
     let id: Any = req["id"] ?? NSNull()
     let op = req["op"] as? String ?? ""
     let pageId = (req["id"] as? NSNumber)?.intValue ?? -1
@@ -151,7 +148,6 @@ func handle(_ line: String, from client: Client) {
     switch op {
     // Sent by stage at startup to launch the helper early; launching is the warm-up.
     case "warm": client.send(["id": id, "ok": true])
-    case "mermaid": mermaid(req, id: id, client: client)
     case "image": image(req, id: id, client: client)
     case "html-open":
         guard let path = req["path"] as? String, let width = num("width"), width > 0 else {
@@ -179,16 +175,24 @@ func handle(_ line: String, from client: Client) {
     }
 }
 
-/// Lines from `fd` until EOF, each handled on the main thread for `client`.
+/// Lines from `fd` until EOF for `client`: mermaid starts here, the rest is handled on the main thread.
 func readLines(_ fd: Int32, for client: Client) {
     guard let file = fdopen(fd, "r") else { return }
     var line: UnsafeMutablePointer<CChar>?
     var cap = 0
     while getline(&line, &cap, file) > 0 {
         let text = String(cString: line!).trimmingCharacters(in: .newlines)
-        if !text.isEmpty {
-            DispatchQueue.main.async { MainActor.assumeIsolated { handle(text, from: client) } }
+        if text.isEmpty { continue }
+        guard let parsed = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any] else {
+            client.fail(NSNull(), "bad request: not a JSON object")
+            continue
         }
+        if parsed["op"] as? String == "mermaid" {
+            mermaid(parsed, id: parsed["id"] ?? NSNull(), client: client)
+            continue
+        }
+        nonisolated(unsafe) let req = parsed
+        DispatchQueue.main.async { MainActor.assumeIsolated { handle(req, from: client) } }
     }
     free(line)
     fclose(file)
@@ -256,16 +260,17 @@ func scheduleIdleExit() {
     DispatchQueue.main.asyncAfter(deadline: .now() + 600, execute: work)
 }
 
-// No Dock icon, no menu bar, never takes focus.
-let app = NSApplication.shared
-app.setActivationPolicy(.prohibited)
-// Warm up before the first request: pele's JavaScript on its queue, a spare web
-// view (and with it WebKit's web process) on the main thread.
+// Warm up before the first request: pele's JavaScript on its queue first (it doesn't
+// need AppKit, which takes ~40 ms to start cold), then a spare web view (and with it
+// WebKit's web process) on the main thread.
 renders.enter()
 DispatchQueue.global(qos: .userInitiated).async {
     _ = try? Pele.shared.render("flowchart TD\n  a --> b", maxWidth: nil, fontSize: 14)
     renders.leave()
 }
+// No Dock icon, no menu bar, never takes focus.
+let app = NSApplication.shared
+app.setActivationPolicy(.prohibited)
 DispatchQueue.main.async { MainActor.assumeIsolated { Spare.prepare() } }
 let args = CommandLine.arguments
 if args.count == 3, args[1] == "--serve" {

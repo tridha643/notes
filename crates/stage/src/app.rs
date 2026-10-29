@@ -43,17 +43,19 @@ pub type VisualKey = (PostId, u64, usize);
 #[derive(Debug, Clone, PartialEq)]
 pub enum VisualState {
     Pending,
-    /// Pixels exist at `w`×`h` for `rendered_at`; `max_scale` normally
-    /// prevents upscaling, except for a temporary focused Mermaid preview.
-    Ready { w: u32, h: u32, max_scale: f32, rendered_at: Target },
+    /// Pixels exist at `w`×`h`; `max_scale` caps upscaling (1: never).
+    Ready { w: u32, h: u32, max_scale: f32 },
     Failed(String),
 }
 
-/// Pixel budget for a visual: the card's inner width and half the visible height.
+/// Pixel budget for a visual: card width and the live HTML viewport height.
+/// Mermaid can extend beyond that height so the feed scrolls through it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Target {
     pub width_px: u32,
     pub max_height_px: u32,
+    /// Cell size in px: rasters are padded to whole cells so kitty never resamples them.
+    pub cell_px: (u16, u16),
 }
 
 /// A visual on screen this frame: top-left cell, size in cells, and how many
@@ -290,12 +292,6 @@ impl App {
         vec![Effect::Request(StageRequest::SessionList)]
     }
 
-    pub fn update(&mut self, msg: Msg) -> Vec<Effect> {
-        let mut fx = self.step(msg);
-        fx.extend(self.request_visuals());
-        fx
-    }
-
     /// The visual key selected for full-width card focus, if any.
     pub fn focused_visual(&self) -> Option<VisualKey> {
         if let Some(key) = &self.pending_html_focus { return Some(key.clone()); }
@@ -317,31 +313,62 @@ impl App {
         Target {
             width_px: inner * self.cell_px.0 as u32,
             max_height_px: rows.max(1) as u32 * self.cell_px.1 as u32,
+            cell_px: self.cell_px,
         }
     }
 
-    /// Ask once for the pixels of each visual card in the open session's posts.
-    fn request_visuals(&mut self) -> Vec<Effect> {
+    /// Ask once for the pixels of the visual cards on screen and, once none of
+    /// those is still rendering, of the nearest one within a page above and
+    /// below, so off-screen diagrams never compete with visible ones for CPU.
+    /// `main` calls this after each draw, when the feed is laid out for what's shown.
+    pub fn request_visuals(&mut self) -> Vec<Effect> {
+        let page = self.page();
+        self.feed();
+        let (scroll, Some((_, feed))) = (self.scroll, &self.feed) else { return vec![] };
+        let hits = &feed.hits;
+        let end = (scroll + page).min(hits.len());
+        let at = |i: usize| self.visual_key(hits[i]);
+        let mut want: Vec<VisualKey> = Vec::new();
+        for key in (scroll..end).filter_map(at) {
+            if !want.contains(&key) {
+                want.push(key);
+            }
+        }
+        let rendering = want.iter().any(|k| matches!(self.visuals.get(k), None | Some(VisualState::Pending)));
+        if !rendering {
+            want.extend((end..(end + page).min(hits.len())).find_map(at));
+            want.extend((scroll.saturating_sub(page)..scroll.min(hits.len())).rev().find_map(at));
+        }
         let target = self.target();
         let mut fx = Vec::new();
-        let posts: Vec<(PostId, u64)> =
-            self.posts.iter().filter_map(|p| Some((p.id.clone(), self.version_of(&p.id)?))).collect();
-        for (id, version) in posts {
-            let Some(cards) = self.loaded.get(&(id.clone(), version)).and_then(|l| l.cards.as_ref()) else { continue };
-            for (c, card) in cards.iter().enumerate() {
-                if let CardBody::Visual { source, .. } = &card.body {
-                    let key = (id.clone(), version, c);
-                    if !self.visuals.contains_key(&key) {
-                        self.visuals.insert(key.clone(), VisualState::Pending);
-                        fx.push(Effect::NeedVisual { key, source: source.clone(), target });
-                    }
-                }
+        for key in want {
+            if self.visuals.contains_key(&key) {
+                continue;
+            }
+            if let Some(source) = self.visual_source(&key) {
+                fx.push(Effect::NeedVisual { key: key.clone(), source: source.clone(), target });
+                self.visuals.insert(key, VisualState::Pending);
             }
         }
         fx
     }
 
-    fn step(&mut self, msg: Msg) -> Vec<Effect> {
+    /// The visual card a feed line belongs to, if it belongs to one.
+    fn visual_key(&self, (p, hit): (usize, Hit)) -> Option<VisualKey> {
+        let Hit::Card(c) = hit else { return None };
+        let id = &self.posts.get(p)?.id;
+        let key = (id.clone(), self.version_of(id)?, c);
+        self.visual_source(&key).map(|_| key)
+    }
+
+    fn visual_source(&self, (id, version, c): &VisualKey) -> Option<&VisualSource> {
+        match &self.loaded.get(&(id.clone(), *version))?.cards.as_ref()?.get(*c)?.body {
+            CardBody::Visual { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+
+    pub fn update(&mut self, msg: Msg) -> Vec<Effect> {
         match msg {
             Msg::Key(k) if k.kind != KeyEventKind::Release => {
                 self.toast = None;
@@ -396,14 +423,14 @@ impl App {
                 let target = self.target();
                 if self.sidebar_waits_for(&key) {
                     if w != target.width_px { return vec![]; }
-                    let state = VisualState::Ready { w, h, max_scale, rendered_at: target };
+                    let state = VisualState::Ready { w, h, max_scale };
                     self.pending_sidebar_frames.insert(key.clone(), state);
                     let mut fx = self.sidebar_frame_done(&key);
                     fx.push(Effect::Redraw);
                     return fx;
                 }
                 let resized_html = self.pending_html_focus.as_ref() == Some(&key) && w == target.width_px;
-                self.visuals.insert(key, VisualState::Ready { w, h, max_scale, rendered_at: target });
+                self.visuals.insert(key, VisualState::Ready { w, h, max_scale });
                 self.visual_gen += 1;
                 let mut fx = if resized_html { self.enter_card_focus() } else { vec![] };
                 fx.push(Effect::Redraw);
@@ -561,7 +588,7 @@ impl App {
     fn post_laid(&mut self, id: &PostId, version: u64, width: u16, page: u16) -> Option<&Laid> {
         let comments = self.comments_on(id);
         let cards = self.loaded.get(&(id.clone(), version))?.cards.as_ref()?;
-        let (cell, visuals, target) = (self.cell_px, &self.visuals, self.target());
+        let (cell, visuals) = (self.cell_px, &self.visuals);
         let view = self.views.entry(id.clone()).or_default();
         let selected = self.focused_card.as_ref().filter(|(post, _)| post == id).map(|(_, card)| *card);
         let key = (version, width, page, cell, self.comments_gen, view.fold_gen, self.visual_gen, selected);
@@ -569,13 +596,14 @@ impl App {
             let inner = width.saturating_sub(4).max(1);
             let rows = if selected.is_some() { page.saturating_sub(3) } else { page / 2 };
             let fit = |c: usize| match visuals.get(&(id.clone(), version, c)) {
-                Some(VisualState::Ready { w, h, max_scale, rendered_at }) => {
-                    // Reuse the old pixels as a full-size preview while the
-                    // focused Mermaid re-rasterizes crisply in the background.
-                    let preview = selected == Some(c) && *rendered_at != target
-                        && matches!(&cards[c].body, CardBody::Visual { source: VisualSource::Mermaid(_), .. });
-                    let scale = if preview { max_scale * 2.0 } else { *max_scale };
-                    fit_cells((*w, *h), scale, inner, rows, cell)
+                Some(VisualState::Ready { w, h, max_scale }) => {
+                    // Scroll through tall Mermaid diagrams instead of shrinking their labels;
+                    // a focused one shows its pixels 1:1 until the full-width raster lands.
+                    let rows = match &cards[c].body {
+                        CardBody::Visual { source: VisualSource::Mermaid(_), .. } => u16::MAX,
+                        _ => rows,
+                    };
+                    fit_cells((*w, *h), *max_scale, inner, rows, cell)
                 },
                 Some(VisualState::Failed(why)) => Fit::Failed(why.clone()),
                 // Hold about the room a diagram or page usually takes.
@@ -1483,6 +1511,62 @@ mod tests {
     }
 
     #[test]
+    fn visuals_render_on_screen_first_then_their_nearest_neighbors() {
+        let mut app = booted(&fake());
+        let mut post = post("b", "s1", 2, "");
+        post.parts = (0..8).map(|i| Part::Mermaid { mermaid: format!("graph TD\nA{i}-->B"), id: None }).collect();
+        let render = PostRender { id: "b".into(), version: 2, parts: vec![notes_proto::posts::PartRender::Native; 8] };
+        app.loaded.get_mut(&("b".into(), 2)).unwrap().cards = Some(cards::build_cards(&post, &render));
+        app.views.get_mut(&PostId::from("b")).unwrap().laid = None;
+        app.feed = None;
+        // As `main` does: update, draw, then ask for what the drawn feed shows.
+        let needed = |app: &mut App, msg: Msg| -> Vec<usize> {
+            app.update(msg);
+            app.request_visuals().into_iter().filter_map(|e| match e { Effect::NeedVisual { key, .. } => Some(key.2), _ => None }).collect()
+        };
+        let first = needed(&mut app, Msg::Resize(100, 30));
+        let (scroll, page) = (app.scroll, app.page());
+        let shown: HashSet<usize> = app.feed().hits[scroll..scroll + page].iter().filter_map(|h| match h.1 { Hit::Card(c) => Some(c), _ => None }).collect();
+        assert!(!first.is_empty() && first.iter().all(|c| shown.contains(c)), "{first:?} vs on screen {shown:?}");
+        // Nothing off screen starts while an on-screen diagram is still rendering.
+        assert!(needed(&mut app, Msg::Resize(100, 30)).is_empty());
+        for &c in &first {
+            app.update(Msg::VisualReady { key: ("b".into(), 2, c), w: 80, h: 40, max_scale: 1.0 });
+        }
+        let mut asked: HashSet<usize> = first.iter().copied().collect();
+        asked.extend(needed(&mut app, Msg::Resize(100, 30)));
+        assert!(asked.len() <= first.len() + 2, "the nearest one above and below, not the whole session: {asked:?}");
+        // Scrolling to the end reaches the last diagram.
+        for _ in 0..8 {
+            asked.extend(needed(&mut app, key(KeyCode::Char('G'))));
+            for c in asked.clone() {
+                app.update(Msg::VisualReady { key: ("b".into(), 2, c), w: 80, h: 40, max_scale: 1.0 });
+            }
+        }
+        assert!(asked.contains(&7), "{asked:?}");
+    }
+
+    #[test]
+    fn tall_mermaid_scrolls_at_readable_size_while_html_stays_within_viewport() {
+        let mut app = booted(&fake());
+        app.cell_px = (10, 20);
+        let mut post = post("b", "s1", 2, "");
+        post.parts = vec![
+            Part::Mermaid { mermaid: "flowchart TD\n A --> B".into(), id: None },
+            Part::Html { html: "<p>page</p>".into(), kits: vec![], id: None },
+        ];
+        let render = PostRender { id: "b".into(), version: 2, parts: vec![notes_proto::posts::PartRender::Native; 2] };
+        app.loaded.get_mut(&("b".into(), 2)).unwrap().cards = Some(cards::build_cards(&post, &render));
+        for card in 0..2 {
+            app.update(Msg::VisualReady { key: ("b".into(), 2, card), w: 700, h: 879, max_scale: 1.0 });
+        }
+        let page = app.page() as u16;
+        let slots = &app.feed().slots;
+        assert!(slots[0].1.rows > page, "the Mermaid card must scroll instead of shrinking to half a screen");
+        assert!(slots[1].1.rows <= page / 2, "live HTML still fits within half a screen");
+    }
+
+    #[test]
     fn boots_into_the_newest_session_and_its_latest_post() {
         let db = fake();
         let app = booted(&db);
@@ -1700,7 +1784,7 @@ mod tests {
         app.loaded.get_mut(&post_key).unwrap().post = Some(post);
         let visual = (id, 2, 0);
         let narrow = app.target().width_px;
-        app.visuals.insert(visual.clone(), VisualState::Ready { w: narrow, h: 200, max_scale: 1.0, rendered_at: app.target() });
+        app.visuals.insert(visual.clone(), VisualState::Ready { w: narrow, h: 200, max_scale: 1.0 });
         app.feed = None;
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
         term.draw(|f| ui::draw(f, &mut app)).unwrap();
@@ -1755,7 +1839,7 @@ mod tests {
         let narrow = app.target().width_px;
         let keys: Vec<_> = (0..2).map(|card| (id.clone(), 2, card)).collect();
         for (card, key) in keys.iter().enumerate() {
-            app.visuals.insert(key.clone(), VisualState::Ready { w: narrow, h: 200, max_scale: 1.0, rendered_at: app.target() });
+            app.visuals.insert(key.clone(), VisualState::Ready { w: narrow, h: 200, max_scale: 1.0 });
             app.on_screen.push(OnScreen { key: key.clone(), col: 26, row: 3 + card as u16 * 12, cols: 70, top: 0, rows: 10, total: 10 });
         }
         app.update(key(KeyCode::Char('s')));
@@ -1780,7 +1864,7 @@ mod tests {
         app.loaded.get_mut(&post_key).unwrap().post = Some(p);
         let visual = (id, 2, 0);
         let normal_width = app.target().width_px;
-        app.visuals.insert(visual.clone(), VisualState::Ready { w: normal_width, h: 200, max_scale: 1.0, rendered_at: app.target() });
+        app.visuals.insert(visual.clone(), VisualState::Ready { w: normal_width, h: 200, max_scale: 1.0 });
         app.feed = None;
         app.cursor = app.feed().starts[1] + 2;
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
@@ -1813,7 +1897,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_mermaid_uses_existing_pixels_as_a_full_size_preview() {
+    fn focused_mermaid_keeps_its_pixels_1_to_1_until_the_full_width_raster() {
         let mut app = booted(&fake());
         let id = PostId::from("b");
         let post_key = (id.clone(), 2);
@@ -1822,19 +1906,19 @@ mod tests {
         app.loaded.get_mut(&post_key).unwrap().cards = Some(build_cards(&p, &r));
         app.loaded.get_mut(&post_key).unwrap().post = Some(p);
         let visual = (id, 2, 0);
-        let normal = app.target();
-        app.visuals.insert(visual.clone(), VisualState::Ready { w: 200, h: 200, max_scale: 1.0, rendered_at: normal });
+        app.visuals.insert(visual.clone(), VisualState::Ready { w: 200, h: 200, max_scale: 1.0 });
         app.feed = None;
         let post_index = app.posts.iter().position(|p| p.id == visual.0).unwrap();
         app.cursor = app.feed().starts[post_index];
         let normal_slot = app.feed().slots.iter().find(|(key, _)| key == &visual).unwrap().1;
         app.update(key(KeyCode::Char('z')));
         let preview_slot = app.feed().slots.iter().find(|(key, _)| key == &visual).unwrap().1;
-        assert!(preview_slot.cols > normal_slot.cols && preview_slot.rows > normal_slot.rows);
+        // Upscaling the old raster would blur it: same size until the crisp one lands.
+        assert_eq!((preview_slot.cols, preview_slot.rows), (normal_slot.cols, normal_slot.rows));
         app.update(Msg::VisualReady { key: visual.clone(), w: 380, h: 380, max_scale: 1.0 });
         let crisp_slot = app.feed().slots.iter().find(|(key, _)| key == &visual).unwrap().1;
-        assert!(crisp_slot.cols >= preview_slot.cols);
-        assert_eq!(app.visuals[&visual], VisualState::Ready { w: 380, h: 380, max_scale: 1.0, rendered_at: app.target() });
+        assert!(crisp_slot.cols > preview_slot.cols);
+        assert_eq!(app.visuals[&visual], VisualState::Ready { w: 380, h: 380, max_scale: 1.0 });
     }
 
     #[test]

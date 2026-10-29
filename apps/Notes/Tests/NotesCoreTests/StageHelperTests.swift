@@ -89,6 +89,17 @@ private func page(_ html: String) throws -> String {
         #expect((r["width"] as? Double ?? 0) > 0 && (r["height"] as? Double ?? 0) > 0)
     }
 
+    @Test func mermaidDoesNotWaitBehindWebKitStartup() throws {
+        // A fresh helper spends its first ~100 ms building a spare web view on the main
+        // thread; `warm` is answered there, so mermaid must not queue behind it.
+        let h = try Helper()
+        try h.send(["op": "mermaid", "id": 1, "source": "flowchart TD\n  A --> B"])
+        try h.send(["op": "warm", "id": 2])
+        let first = try #require(h.next())
+        #expect(first["id"] as? Int == 1 && first["ok"] as? Bool == true, "\(first)")
+        #expect(try #require(h.next())["id"] as? Int == 2)
+    }
+
     @Test func imageRoundTripsThroughShm() throws {
         // 2×1: opaque red, half-transparent blue.
         let px: [UInt8] = [255, 0, 0, 255, 0, 0, 255, 128]

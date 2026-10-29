@@ -273,6 +273,11 @@ fn main() -> ExitCode {
             if let Some(f) = loop_trace.as_mut() {
                 let _ = writeln!(f, "draw {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
             }
+            // Pixels for the visuals this frame shows (then their neighbors).
+            pending = app.request_visuals();
+            if !pending.is_empty() {
+                continue;
+            }
         }
         // While scrolling, live pages hold still; 150 ms after the last scroll
         // they resume (the only timer, and only while scrolling).
