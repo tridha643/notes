@@ -402,6 +402,22 @@ impl App {
         fx
     }
 
+    /// Visual cards with a line on screen in the current feed: not the last drawn frame,
+    /// which keys handled in the same batch may already have scrolled away from.
+    fn visuals_in_view(&mut self) -> Vec<VisualKey> {
+        let page = self.page();
+        self.feed();
+        let (scroll, Some((_, feed))) = (self.scroll, &self.feed) else { return vec![] };
+        let end = (scroll + page).min(feed.hits.len());
+        let mut last = None;
+        feed.hits[scroll.min(end)..end]
+            .iter()
+            .filter_map(|(p, hit)| match hit { Hit::Card(c) => Some((*p, *c)), _ => None })
+            .filter(|card| last.replace(*card) != Some(*card))
+            .filter_map(|card| self.visual_key(card))
+            .collect()
+    }
+
     /// Post `p`'s card `c`, if it's a visual card.
     fn visual_key(&self, (p, c): (usize, usize)) -> Option<VisualKey> {
         let id = &self.posts.get(p)?.id;
@@ -887,13 +903,9 @@ impl App {
             return vec![];
         }
         let hidden = !self.sidebar_hidden;
-        let visible_html: HashSet<_> = self.on_screen.iter().filter_map(|shown| {
-            let (id, version, card) = &shown.key;
-            let loaded = self.loaded.get(&(id.clone(), *version))?;
-            let body = &loaded.cards.as_ref()?.get(*card)?.body;
-            (matches!(body, CardBody::Visual { source: VisualSource::Html(_), .. })
-                && matches!(self.visuals.get(&shown.key), Some(VisualState::Ready { .. })))
-                .then(|| shown.key.clone())
+        let visible_html: HashSet<_> = self.visuals_in_view().into_iter().filter(|key| {
+            matches!(self.visual_source(key), Some(VisualSource::Html(_)))
+                && matches!(self.visuals.get(key), Some(VisualState::Ready { .. }))
         }).collect();
         if !visible_html.is_empty() && self.focused_card.is_none()
             && ui::geometry(self.size).sidebar.width > 0 {
@@ -1000,7 +1012,7 @@ impl App {
         let Some(selected) = self.loaded.get(&(key.0.clone(), key.1)).and_then(|loaded| loaded.cards.as_ref()?.get(key.2)) else { return vec![] };
         let html_ready = matches!(selected.body, CardBody::Visual { source: VisualSource::Html(_), .. })
             && matches!(self.visuals.get(&key), Some(VisualState::Ready { .. }))
-            && self.on_screen.iter().any(|shown| shown.key == key)
+            && self.visuals_in_view().contains(&key)
             && ui::geometry_for(self).main.width != self.size.0;
         self.pending_html_focus = Some(key);
         if html_ready { vec![] } else { self.enter_card_focus() }
@@ -2168,6 +2180,27 @@ mod tests {
         app.update(key(KeyCode::Char('+')));
         app.update(key(KeyCode::Char('z')));
         assert_eq!(app.zoom_view, ZoomView::default(), "leaving focus resets the zoom");
+    }
+
+    #[test]
+    fn z_right_after_moving_onto_an_html_card_waits_for_its_wide_frame() {
+        // Codex review: keys drained in one batch saw the last frame's on_screen, so z on an
+        // HTML card just scrolled to focused at once on its narrow pixels.
+        let mut app = booted(&fake());
+        let id = PostId::from("b");
+        let p = Post { parts: vec![Part::Html { html: "<p>hi</p>".into(), kits: vec![], id: None }], ..post("b", "s1", 2, "") };
+        let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
+        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, &r));
+        let narrow = app.target().width_px;
+        app.visuals.insert((id.clone(), 2, 0), VisualState::Ready { w: narrow, h: 200, max_scale: 1.0 });
+        app.feed = None;
+        app.on_screen.clear(); // nothing drawn since the cursor moved
+        let post_index = app.posts.iter().position(|p| p.id == id).unwrap();
+        app.cursor = app.feed().starts[post_index];
+        app.scroll = app.cursor;
+        app.update(key(KeyCode::Char('z')));
+        assert_eq!(app.pending_html_focus, Some((id, 2, 0)), "waits for the full-width frame");
+        assert_eq!(app.focused_card, None);
     }
 
     #[test]
