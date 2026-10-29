@@ -58,7 +58,8 @@ private func checkResponse<Result: Codable & Sendable>(_ verb: String, _: Result
     try checkRequest("session-new", SessionNewArgs.self)
     try checkRequest("session-list", NoArgs.self)
     try checkRequest("session-rename", SessionRenameArgs.self)
-    try checkRequest("session-delete", IdArgs.self)
+    try checkRequest("session-delete", SessionDeleteArgs.self)
+    try checkRequest("session-restore", IdArgs.self)
     try checkRequest("post-new", PostNewArgs.self)
     try checkRequest("post-update", PostUpdateArgs.self)
     try checkRequest("post-part", PostPartArgs.self)
@@ -82,6 +83,8 @@ private func checkResponse<Result: Codable & Sendable>(_ verb: String, _: Result
 @Test func sideshowResultsDecodeFromTheRustContract() throws {
     try checkResponse("session-new", Session.self)
     try checkResponse("session-list", [Session].self)
+    try checkResponse("session-delete", SessionDeleteResult.self)
+    try checkResponse("session-restore", SessionRestoreResult.self)
     try checkResponse("post-new", PostWriteResult.self)
     try checkResponse("post-list", [PostSummary].self)
     try checkResponse("post-show", Post.self)

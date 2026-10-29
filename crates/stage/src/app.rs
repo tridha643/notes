@@ -1013,7 +1013,10 @@ impl App {
             Mode::Rename { id, input } => self.rename_key(k, id, input),
             Mode::Delete { what, request } => match k.code {
                 KeyCode::Char('y') => {
-                    self.toast = Some(format!("deleted {what}"));
+                    self.toast = Some(match &request {
+                        StageRequest::SessionDelete(id) => format!("deleted {what}; restore: notes session restore {id}"),
+                        _ => format!("deleted {what}"),
+                    });
                     vec![Effect::Request(request)]
                 }
                 _ => vec![],
@@ -1338,7 +1341,7 @@ impl App {
         let mine = session.is_some() && session == self.open;
         let mut fx = Vec::new();
         match e.kind.as_str() {
-            "session-created" | "session-updated" => fx.push(Effect::Request(StageRequest::SessionList)),
+            "session-created" | "session-updated" | "session-restored" => fx.push(Effect::Request(StageRequest::SessionList)),
             "session-deleted" => {
                 if mine {
                     self.banner = Some("session ended".into());
@@ -2188,6 +2191,7 @@ mod tests {
         // D deletes the selected session; once it's gone the next one opens.
         app.update(key(KeyCode::Char('D')));
         assert_eq!(requests(&app.update(key(KeyCode::Char('y')))), [StageRequest::SessionDelete("s1".into())]);
+        assert!(app.toast.as_deref().is_some_and(|t| t.contains("notes session restore s1")), "{:?}", app.toast);
         db.sessions.remove(0);
         let ev = Event { seq: 12, kind: "session-deleted".into(), path: None, version: None, id: Some("s1".into()), session: Some("s1".into()) };
         let fx = app.update(Msg::Event(ev));

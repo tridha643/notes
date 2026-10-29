@@ -451,6 +451,32 @@ public struct SessionRenameArgs: Codable, Sendable, Equatable {
     public var title: String
 }
 
+public struct SessionDeleteArgs: Codable, Sendable, Equatable {
+    public var id: String
+    /// Delete for good instead of moving to the trash.
+    public var purge: Bool
+
+    public init(id: String, purge: Bool = false) {
+        self.id = id
+        self.purge = purge
+    }
+}
+
+/// `already`: nothing changed (it was already in the trash, or already gone).
+public struct SessionDeleteResult: Codable, Sendable, Equatable {
+    public var id: String
+    public var trashed: Bool
+    public var purged: Bool
+    public var already: Bool
+}
+
+/// `already`: the session was live, so nothing changed.
+public struct SessionRestoreResult: Codable, Sendable, Equatable {
+    public var id: String
+    public var restored: Bool
+    public var already: Bool
+}
+
 public struct IdArgs: Codable, Sendable, Equatable {
     public var id: String
 }

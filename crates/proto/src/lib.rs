@@ -100,7 +100,9 @@ pub enum Verb {
     SessionList,
     SessionSearch(SessionSearchArgs),
     SessionRename(SessionRenameArgs),
-    SessionDelete(IdArgs<SessionId>),
+    /// Moves to a trash kept 30 days; `purge` deletes for good.
+    SessionDelete(SessionDeleteArgs),
+    SessionRestore(IdArgs<SessionId>),
     PostNew(PostNewArgs),
     PostUpdate(PostUpdateArgs),
     PostPart(PostPartArgs),

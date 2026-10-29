@@ -173,11 +173,40 @@ pub fn session_rename(s: &Store, args: &SessionRenameArgs) -> Result<Written<Ses
     ))
 }
 
-/// Deletes the session's file, and its assets unless a surviving post
-/// references them (assets are shared by content hash).
-pub fn session_delete(s: &Store, id: &str) -> Result<Vec<Event>> {
-    load(s, id)?;
-    s.remove_session(&id.into())?;
+const TRASH_SECS: i64 = 30 * 86_400;
+
+/// Moves the session to the trash (assets stay) so `session_restore` can bring it back;
+/// `purge` deletes it for good instead, from the trash too. Deleting what is already in
+/// the trash changes nothing (`already`); purging an id that is neither live nor
+/// trashed is `not_found`, which is also what a second purge gets.
+pub fn session_delete(s: &Store, args: &SessionDeleteArgs) -> Result<Written<SessionDeleteResult>> {
+    let id = args.id.as_str();
+    let trashed = s.trashed().into_iter().find(|t| t.2.id == id);
+    let result = |trashed, purged, already| SessionDeleteResult { id: args.id.clone(), trashed, purged, already };
+    if !args.purge {
+        return if s.stage().sessions.contains_key(id) {
+            s.trash_session(&args.id, now())?;
+            Ok((result(true, false, false), vec![event("session-deleted", id, Some(id), None)]))
+        } else if trashed.is_some() {
+            Ok((result(true, false, true), Vec::new()))
+        } else {
+            Err(session_missing(id))
+        };
+    }
+    let live = s.stage().sessions.contains_key(id);
+    match (live, trashed) {
+        (true, _) => s.remove_session(&args.id)?,
+        (false, Some((path, ..))) => s.delete_trashed(&path)?,
+        (false, None) => return Err(session_missing(id)),
+    }
+    delete_unreferenced_assets(s, id)?;
+    let events = if live { vec![event("session-deleted", id, Some(id), None)] } else { Vec::new() };
+    Ok((result(false, true, false), events))
+}
+
+/// Deletes the session's assets unless a live or trashed post references them
+/// (assets are shared by content hash).
+fn delete_unreferenced_assets(s: &Store, id: &str) -> Result<()> {
     let referenced = referenced_assets(s);
     for meta in asset_metas(s) {
         if meta.session.as_deref() == Some(id) && !referenced.contains(meta.id.as_str()) {
@@ -185,7 +214,34 @@ pub fn session_delete(s: &Store, id: &str) -> Result<Vec<Event>> {
             s.delete_asset_file(&s.asset_path(&format!("{}.json", meta.id)))?;
         }
     }
-    Ok(vec![event("session-deleted", id, Some(id), None)])
+    Ok(())
+}
+
+/// Brings a trashed session back with its posts, comments and assets. A live session
+/// with that id is the `already` case; an id that is neither live nor trashed is `not_found`.
+pub fn session_restore(s: &Store, id: &str) -> Result<Written<SessionRestoreResult>> {
+    let result = |already| SessionRestoreResult { id: id.into(), restored: true, already };
+    if s.stage().sessions.contains_key(id) {
+        return Ok((result(true), Vec::new()));
+    }
+    let (path, _, data) = s
+        .trashed()
+        .into_iter()
+        .find(|t| t.2.id == id)
+        .ok_or_else(|| session_missing(id))?;
+    s.untrash_session(&path, data)?;
+    Ok((result(false), vec![event("session-restored", id, Some(id), None)]))
+}
+
+/// Purges sessions trashed more than 30 days before `at`, with their unreferenced assets.
+pub fn trash_purge(s: &Store, at: i64) -> Result<()> {
+    for (path, deleted_at, data) in s.trashed() {
+        if deleted_at < at - TRASH_SECS {
+            s.delete_trashed(&path)?;
+            delete_unreferenced_assets(s, &data.id)?;
+        }
+    }
+    Ok(())
 }
 
 /// Sessions matching `query` by title, agent or cwd (best), or by post titles,
@@ -771,12 +827,13 @@ fn asset_metas(s: &Store) -> Vec<AssetMeta> {
         .collect()
 }
 
-/// Every asset id a post (current or past version) still points at.
+/// Every asset id a post (current or past version, live or trashed session) still points at.
 fn referenced_assets(s: &Store) -> std::collections::HashSet<String> {
     let stage = s.stage();
+    let trashed = s.trashed();
     let mut ids = std::collections::HashSet::new();
-    for e in stage.sessions.values() {
-        for p in &e.data.posts {
+    for data in stage.sessions.values().map(|e| &e.data).chain(trashed.iter().map(|t| &t.2)) {
+        for p in &data.posts {
             let versions = std::iter::once(&p.parts).chain(p.history.iter().map(|h| &h.parts));
             for part in versions.flatten() {
                 match part {

@@ -410,6 +410,32 @@ pub struct SessionRenameArgs {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct SessionDeleteArgs {
+    pub id: SessionId,
+    /// Delete for good, assets included, instead of moving to the trash.
+    #[serde(default)]
+    pub purge: bool,
+}
+
+/// `already`: nothing changed (it was already in the trash, or already gone).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionDeleteResult {
+    pub id: SessionId,
+    pub trashed: bool,
+    pub purged: bool,
+    pub already: bool,
+}
+
+/// `already`: the session was live, so nothing changed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionRestoreResult {
+    pub id: SessionId,
+    pub restored: bool,
+    pub already: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IdArgs<T> {
     pub id: T,
 }

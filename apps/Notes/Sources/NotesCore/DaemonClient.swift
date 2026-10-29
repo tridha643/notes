@@ -87,8 +87,15 @@ public final class DaemonClient: Sendable {
         let _: Ignored = try call("session-rename", SessionRenameArgs(id: id, title: title))
     }
 
-    public func sessionDelete(_ id: String) throws {
-        let _: Ignored = try call("session-delete", IdArgs(id: id))
+    /// Moves the session to the trash (kept 30 days); `purge` deletes it for good.
+    @discardableResult
+    public func sessionDelete(_ id: String, purge: Bool = false) throws -> SessionDeleteResult {
+        try call("session-delete", SessionDeleteArgs(id: id, purge: purge))
+    }
+
+    @discardableResult
+    public func sessionRestore(_ id: String) throws -> SessionRestoreResult {
+        try call("session-restore", IdArgs(id: id))
     }
 
     public func postList(session: String?, limit: UInt32? = nil) throws -> [PostSummary] {
