@@ -611,7 +611,7 @@ impl App {
             };
             let empty = Vec::new();
             let comments = if selected.is_some() { &empty } else { &comments };
-            view.laid = Some((key, cards::layout_selected(cards, comments, width, &view.folds, &fit, selected)));
+            view.laid = Some((key, cards::layout(cards, comments, width, &view.folds, &fit, selected)));
         }
         view.laid.as_ref().map(|(_, l)| l)
     }
