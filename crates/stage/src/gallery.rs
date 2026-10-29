@@ -559,17 +559,14 @@ impl Gallery {
         let mut pause = Vec::new();
         let mut resume = Vec::new();
         for (key, img) in self.images.iter_mut() {
-            let wanted = on_screen.iter().find(|o| &o.key == key).map(|o| {
+            let shown = on_screen.iter().find(|o| &o.key == key);
+            let wanted = shown.map(|o| {
                 crop(&Place { col: o.col, row: o.row, cols: o.cols, rows: o.rows, src: (0, o.top as u32, 0, o.total as u32) }, (img.w, img.h))
             });
-            // While the sidebar still has its old geometry, leave its old pixels
-            // alone. The new image is transmitted but not placed until the redraw
-            // moves the card to its new cell rectangle.
-            if let (Some(new), Some(old), Some(_)) = (wanted, img.placed, img.previous) {
-                if (new.col, new.row, new.cols) == (old.col, old.row, old.cols)
-                    && old.src.2 != img.w {
-                    continue;
-                }
+            // Resized pixels wait (the old image stays) until the layout is sized for
+            // them: the app holds old sizes while a sidebar change waits for every HTML card.
+            if img.previous.is_some() && img.placed.is_some() && shown.is_some_and(|o| o.px != (img.w, img.h)) {
+                continue;
             }
             if let Some(old) = img.previous.take() {
                 let _ = out.write_all(&kitty::delete(old));
@@ -702,7 +699,7 @@ mod tests {
         let frame = |n: u64| Gfx::Helper(format!(r#"{{"id":9,"frame":{n},"shm":"/stg-test-{n}","w":660,"h":360}}"#));
         let mut out = Vec::new();
         g.handle(&mut out, frame(1));
-        g.place(&mut Vec::new(), &[OnScreen { key: key.clone(), col: 3, row: 4, cols: 40, top: 0, rows: 10, total: 10 }]);
+        g.place(&mut Vec::new(), &[OnScreen { key: key.clone(), col: 3, row: 4, cols: 40, top: 0, rows: 10, total: 10, px: (660, 360) }]);
         out.clear();
         g.handle(&mut out, frame(2));
         let s = String::from_utf8_lossy(&out);
@@ -717,7 +714,7 @@ mod tests {
         gallery.pages.insert(9, key.clone());
         let frame = |number, width| Gfx::Helper(format!(r#"{{"id":9,"frame":{number},"shm":"/stg-test-{number}","w":{width},"h":200}}"#));
         gallery.handle(&mut Vec::new(), frame(1, 600));
-        let old = OnScreen { key: key.clone(), col: 25, row: 4, cols: 70, top: 0, rows: 10, total: 10 };
+        let old = OnScreen { key: key.clone(), col: 25, row: 4, cols: 70, top: 0, rows: 10, total: 10, px: (600, 200) };
         gallery.place(&mut Vec::new(), std::slice::from_ref(&old));
         let old_id = gallery.images[&key].id;
 
@@ -732,10 +729,34 @@ mod tests {
         assert!(still_old.is_empty(), "the old sidebar layout keeps the old pixels");
 
         let mut switched = Vec::new();
-        gallery.place(&mut switched, &[OnScreen { col: 0, cols: 95, ..old }]);
+        gallery.place(&mut switched, &[OnScreen { col: 0, cols: 95, px: (800, 200), ..old }]);
         let output = String::from_utf8_lossy(&switched);
         assert!(output.contains(&format!("a=d,d=i,i={old_id}")));
         assert!(output.contains(&format!("a=p,i={new_id}")));
+    }
+
+    #[test]
+    fn leaving_focus_places_the_narrow_raster_once_the_layout_uses_it() {
+        // z→z with the sidebar shown: the full-width raster is still on screen in the
+        // normal column (same cell rect) when the normal-width one lands.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 950, max_height_px: 400, cell_px: (10, 20) });
+        let key: VisualKey = ("diagram".into(), 1, 0);
+        let shms: Vec<String> = [(950, 400), (690, 300)].iter().map(|(w, h)| kitty::shm_write(&vec![0; w * h * 4]).unwrap()).collect();
+        let raster = |shm: &str, w, h| Gfx::Raster { key: key.clone(), epoch: 0, done: Ok((shm.to_owned(), w, h)) };
+        gallery.handle(&mut Vec::new(), raster(&shms[0], 950, 400));
+        let at = OnScreen { key: key.clone(), col: 29, row: 7, cols: 69, top: 0, rows: 20, total: 20, px: (950, 400) };
+        gallery.place(&mut Vec::new(), std::slice::from_ref(&at));
+        let wide_id = gallery.images[&key].id;
+        gallery.handle(&mut Vec::new(), raster(&shms[1], 690, 300));
+        let narrow_id = gallery.images[&key].id;
+        let mut out = Vec::new();
+        gallery.place(&mut out, std::slice::from_ref(&at));
+        assert!(out.is_empty(), "the layout still sizes the card for the wide pixels");
+        gallery.place(&mut out, &[OnScreen { rows: 15, total: 15, px: (690, 300), ..at }]);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains(&format!("a=d,d=i,i={wide_id}")) && s.contains(&format!("a=p,i={narrow_id},p=1,x=0,y=0,w=690,h=300,c=69,r=15")), "{s}");
+        shms.iter().for_each(|shm| kitty::unlink(shm)); // no terminal here to consume them
     }
 
     #[test]

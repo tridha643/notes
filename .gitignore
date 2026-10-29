@@ -2,6 +2,7 @@ target/
 docs/ref/
 .worktrees/
 logs/
-.claude/
+.claude/*
+!.claude/skills/
 build/
 apps/Notes/.build/

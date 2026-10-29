@@ -429,7 +429,7 @@ fn main(f: &mut Frame, app: &mut App, area: Rect) {
         }
     }
     // Visuals whose reserved rows are on screen, cropped at the top and bottom edges.
-    let on_screen: Vec<crate::app::OnScreen> = feed
+    let mut on_screen: Vec<crate::app::OnScreen> = feed
         .slots
         .iter()
         .filter_map(|(key, slot)| {
@@ -448,6 +448,7 @@ fn main(f: &mut Frame, app: &mut App, area: Rect) {
                 top,
                 rows: (end.min(bottom) - first) as u16,
                 total: slot.rows,
+                px: (0, 0),
             })
         })
         .collect();
@@ -455,5 +456,11 @@ fn main(f: &mut Frame, app: &mut App, area: Rect) {
     // rewrites the column (~one screen of bytes). DECSTBM+DECSLRM margin scrolling
     // needs a custom backend write path; add it if wheel scrolling lags in Rex.
     f.render_widget(Paragraph::new(lines), content);
+    // The pixel size each card was laid out for, so the gallery knows when new pixels fit.
+    for o in &mut on_screen {
+        if let Some(crate::app::VisualState::Ready { w, h, .. }) = app.visuals.get(&o.key) {
+            o.px = (*w, *h);
+        }
+    }
     app.on_screen = on_screen;
 }

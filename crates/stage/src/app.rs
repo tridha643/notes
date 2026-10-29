@@ -69,6 +69,8 @@ pub struct OnScreen {
     pub top: u16,
     pub rows: u16,
     pub total: u16,
+    /// The pixel size the layout sized this card for (its `VisualState::Ready`).
+    pub px: (u32, u32),
 }
 
 /// The only requests stage can make. Its writes are `CommentNew`, `SessionRename`
@@ -1836,7 +1838,7 @@ mod tests {
         let keys: Vec<_> = (0..2).map(|card| (id.clone(), 2, card)).collect();
         for (card, key) in keys.iter().enumerate() {
             app.visuals.insert(key.clone(), VisualState::Ready { w: narrow, h: 200, max_scale: 1.0 });
-            app.on_screen.push(OnScreen { key: key.clone(), col: 26, row: 3 + card as u16 * 12, cols: 70, top: 0, rows: 10, total: 10 });
+            app.on_screen.push(OnScreen { key: key.clone(), col: 26, row: 3 + card as u16 * 12, cols: 70, top: 0, rows: 10, total: 10, px: (narrow, 200) });
         }
         app.update(key(KeyCode::Char('s')));
         let wide = app.target().width_px;
