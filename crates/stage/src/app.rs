@@ -123,6 +123,8 @@ pub enum Msg {
     /// A visual's pixels are ready, or can't be made.
     VisualReady { key: VisualKey, w: u32, h: u32, max_scale: f32 },
     VisualFailed { key: VisualKey, reason: String },
+    /// A focused card's zoomed pixels are showing (ignored once focus has moved on).
+    ZoomShown { key: VisualKey, w: u32, h: u32 },
     /// A zoomed raster for `key` is ready ahead of `z` (see `Effect::PrefetchZoom`).
     ZoomReady { key: VisualKey, w: u32, h: u32 },
     /// Graphics plumbing (helper replies, rasterized frames); `main` handles these.
@@ -241,6 +243,9 @@ pub struct App {
     /// closes, and the layout must match them in that same frame.
     unzoomed: Option<(VisualKey, VisualState)>,
     zoom_ahead: Option<ZoomAhead>,
+    /// What a card showed when focus closed, until the next draw: `z` again before the
+    /// gallery has seen focus close finds it still showing those pixels.
+    left_focus: Option<(VisualKey, VisualState)>,
     feed: Option<(FeedKey, Feed)>,
     /// A post to bring to the top on the next layout (a sidebar pick, a follow).
     jump: Option<PostId>,
@@ -301,6 +306,7 @@ impl App {
             before_focus: None,
             unzoomed: None,
             zoom_ahead: None,
+            left_focus: None,
             feed: None,
             jump: None,
             remembered: HashMap::new(),
@@ -447,6 +453,10 @@ impl App {
                     return fx;
                 }
                 let resized_html = self.pending_html_focus.as_ref() == Some(&key) && w == target.width_px;
+                // Feed pixels that land while their card is zoomed are what leaving focus puts back.
+                if let Some((_, state)) = self.unzoomed.as_mut().filter(|(unzoomed, _)| *unzoomed == key) {
+                    *state = VisualState::Ready { w, h, max_scale };
+                }
                 self.visuals.insert(key, VisualState::Ready { w, h, max_scale });
                 self.visual_gen += 1;
                 let mut fx = if resized_html { self.enter_card_focus() } else { vec![] };
@@ -466,6 +476,18 @@ impl App {
                 let mut fx = if failed_html { self.enter_card_focus() } else { vec![] };
                 fx.push(Effect::Redraw);
                 fx
+            }
+            Msg::ZoomShown { key, w, h } => {
+                if self.focused_visual().as_ref() != Some(&key) {
+                    // Focus closed but the gallery hasn't drawn since: it shows these now.
+                    if let Some((_, shown)) = self.left_focus.as_mut().filter(|(left, _)| *left == key) {
+                        *shown = VisualState::Ready { w, h, max_scale: 1.0 };
+                    }
+                    return vec![];
+                }
+                self.visuals.insert(key, VisualState::Ready { w, h, max_scale: 1.0 });
+                self.visual_gen += 1;
+                vec![Effect::Redraw]
             }
             Msg::ZoomReady { key, w, h } => {
                 if let Some(ahead) = self.zoom_ahead.as_mut().filter(|ahead| ahead.key == key) {
@@ -820,6 +842,11 @@ impl App {
         let key = self.version_of(&id).map(|version| (id.clone(), version, card));
         self.unzoomed = key.clone().filter(|key| matches!(self.visual_source(key), Some(VisualSource::Mermaid(_))))
             .and_then(|key| Some((key.clone(), self.visuals.get(&key)?.clone())));
+        // Back before a draw: the gallery still shows what focus showed.
+        if let Some((key, shown)) = self.left_focus.take().filter(|(left, _)| Some(left) == key.as_ref()) {
+            self.visuals.insert(key, shown);
+            self.visual_gen += 1;
+        }
         // Its zoomed raster was made ahead: lay it out at that size from the first frame.
         let target = self.zoom_target();
         if let Some(ZoomAhead { key, size: Some((w, h)), .. }) = self.zoom_ahead.take().filter(|ahead| Some(&ahead.key) == key.as_ref() && ahead.target == target) {
@@ -861,6 +888,7 @@ impl App {
     /// left the screen happens now (that card re-renders at the new width later), then
     /// the visuals this frame shows are asked for.
     pub fn after_draw(&mut self) -> Vec<Effect> {
+        self.left_focus = None;
         let mut fx = Vec::new();
         let left = self.pending_sidebar.as_ref().is_some_and(|(_, waiting)| {
             waiting.iter().any(|key| !self.on_screen.iter().any(|shown| &shown.key == key))
@@ -963,7 +991,8 @@ impl App {
         self.focused_card = None;
         self.feed = None;
         if let Some((key, state)) = self.unzoomed.take() {
-            self.visuals.insert(key, state);
+            let shown = self.visuals.insert(key.clone(), state);
+            self.left_focus = shown.map(|shown| (key, shown));
             self.visual_gen += 1;
         }
         self.zoom_ahead = None;
@@ -2029,7 +2058,7 @@ mod tests {
         app.cursor = app.feed().starts[post_index];
         let feed_slot = app.feed().slots.iter().find(|(key, _)| key == &visual).unwrap().1;
         app.update(key(KeyCode::Char('z')));
-        app.update(Msg::VisualReady { key: visual.clone(), w: 1150, h: 830, max_scale: 1.0 });
+        app.update(Msg::ZoomShown { key: visual.clone(), w: 1150, h: 830 });
         app.update(key(KeyCode::Char('z')));
         let slot = app.feed().slots.iter().find(|(key, _)| key == &visual).unwrap().1;
         assert_eq!((slot.cols, slot.rows), (feed_slot.cols, feed_slot.rows), "no frame at the zoomed size squeezed into the card");

@@ -493,18 +493,37 @@ impl Gallery {
         self.spawn_raster(key.clone(), svg, made_for);
     }
 
-    /// Make the zoomed raster for `key` at `target` ahead of `z` (one at a time).
-    pub fn prefetch_zoom(&mut self, key: VisualKey, target: Target) {
-        let made_for = (target.width_px, target.max_height_px, target.cell_px, true);
-        if self.focused.is_some() || self.prefetch.as_ref().is_some_and(|ahead| ahead.key == key && ahead.made_for == made_for) {
+    /// Set the card's feed image aside while it's zoomed. Pixels it still holds back for
+    /// a resize are deleted now: hidden under the zoom, they'd stay on screen.
+    fn park(&mut self, key: &VisualKey) {
+        if !self.zoom.as_ref().is_some_and(|zoom| &zoom.key == key && zoom.img.is_none()) {
             return;
         }
-        let Some(svg) = self.svgs.get(&key).cloned() else { return };
+        let Some(mut img) = self.images.remove(key) else { return };
+        if let Some(previous) = img.previous.take() {
+            self.dead.push(previous);
+            img.placed = None;
+        }
+        self.zoom.as_mut().expect("checked").img = Some(img);
+    }
+
+    /// Make the zoomed raster for `key` at `target` ahead of `z` (one at a time). Asked
+    /// again for one already made, it says so again: the app may have forgotten its size.
+    pub fn prefetch_zoom(&mut self, key: VisualKey, target: Target) -> Option<Msg> {
+        let made_for = (target.width_px, target.max_height_px, target.cell_px, true);
+        if let Some(ahead) = self.prefetch.as_ref().filter(|ahead| ahead.key == key && ahead.made_for == made_for) {
+            return ahead.done.as_ref().map(|(_, w, h)| Msg::ZoomReady { key, w: *w, h: *h });
+        }
+        if self.focused.is_some() {
+            return None;
+        }
+        let svg = self.svgs.get(&key).cloned()?;
         if let Some((shm, ..)) = self.prefetch.take().and_then(|ahead| ahead.done) {
             kitty::unlink(&shm);
         }
         self.prefetch = Some(Prefetch { key: key.clone(), made_for, done: None });
         self.spawn_raster(key, svg, made_for);
+        None
     }
 
     fn spawn_raster(&self, key: VisualKey, svg: String, made_for: RasterTarget) {
@@ -619,15 +638,25 @@ impl Gallery {
                 if self.rastered.get(&key) == Some(&made_for) {
                     self.rastered.remove(&key);
                 }
+                // Nor do the feed pixels set aside while zoomed come from it.
+                if let Some(zoom) = self.zoom.as_mut().filter(|zoom| zoom.key == key && zoom.made_for == Some(made_for)) {
+                    zoom.made_for = None;
+                }
                 vec![]
             }
             Gfx::Raster { key, made_for, done } => match done {
                 Ok((shm, w, h)) => {
                     // A zoomed raster gets its own image; the feed-size one waits for focus to close.
-                    if let Some(zoom) = self.zoom.as_mut().filter(|zoom| made_for.3 && zoom.key == key && zoom.img.is_none()) {
-                        zoom.img = self.images.remove(&key);
+                    if made_for.3 {
+                        self.park(&key);
                     }
-                    self.show(out, key, &shm, (w, h), None, None).into_iter().collect()
+                    let shown = self.show(out, key, &shm, (w, h), None, None);
+                    // Zoomed pixels only count while the app still focuses this card: a `z`
+                    // back in the same loop turn must not leave the feed laid out zoomed.
+                    match shown {
+                        Some(Msg::VisualReady { key, w, h, .. }) if made_for.3 => vec![Msg::ZoomShown { key, w, h }],
+                        other => other.into_iter().collect(),
+                    }
                 }
                 Err(reason) => vec![Msg::VisualFailed { key, reason }],
             },
@@ -681,11 +710,15 @@ impl Gallery {
     /// frame's synchronized-output brackets, after ratatui drew it.
     pub fn place(&mut self, out: &mut impl Write, on_screen: &[OnScreen]) {
         if let Some((key, (shm, w, h))) = self.ready_zoom.take() {
-            if let Some(zoom) = self.zoom.as_mut().filter(|zoom| zoom.key == key && zoom.img.is_none()) {
-                zoom.img = self.images.remove(&key);
+            if on_screen.iter().any(|o| o.key == key && o.px == (w, h)) {
+                // The app laid the card out at this size (`Msg::ZoomReady`): show it in this frame.
+                self.park(&key);
+                let _ = self.show(out, key, &shm, (w, h), None, None);
+            } else {
+                // The app doesn't know its size yet: hand it over like a raster just made.
+                let made_for = self.raster_target(&key);
+                let _ = self.tx.send(Msg::Gfx(Gfx::Raster { key, made_for, done: Ok((shm, w, h)) }));
             }
-            // The app already laid the card out at this size (`Msg::ZoomReady`).
-            let _ = self.show(out, key, &shm, (w, h), None, None);
         }
         // Diagrams on screen (only the focused one while focused) at the current target.
         for o in on_screen {
@@ -1063,7 +1096,7 @@ mod tests {
         let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), feed);
         let key: VisualKey = ("chart".into(), 1, 0);
         gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
-        gallery.prefetch_zoom(key.clone(), focus);
+        assert!(gallery.prefetch_zoom(key.clone(), focus).is_none());
         let (key_, made_for, done) = next_raster(&rx);
         assert_eq!(made_for, (1000, 400, (1, 1), true));
         assert!(matches!(gallery.handle(&mut Vec::new(), Gfx::Raster { key: key_, made_for, done }).as_slice(), [Msg::ZoomReady { w: 800, h: 400, .. }]));
@@ -1098,6 +1131,24 @@ mod tests {
         let (key, _, done) = next_raster(&rx);
         assert_eq!(key, keys[0], "seen again, it rasterizes again");
         kitty::unlink(&done.unwrap().0);
+    }
+
+    #[test]
+    fn asking_again_for_a_zoom_already_made_says_its_size_again() {
+        // Found by the stage-pixels model: z, z before a draw, then z again showed
+        // zoomed pixels squeezed into the feed layout, because the app forgot the size.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let feed = Target { width_px: 800, max_height_px: 400, cell_px: (1, 1) };
+        let focus = Target { width_px: 1000, ..feed };
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), feed);
+        let key: VisualKey = ("chart".into(), 1, 0);
+        gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
+        assert!(gallery.prefetch_zoom(key.clone(), focus).is_none());
+        let (key_, made_for, done) = next_raster(&rx);
+        gallery.handle(&mut Vec::new(), Gfx::Raster { key: key_, made_for, done });
+        assert!(matches!(gallery.prefetch_zoom(key.clone(), focus), Some(Msg::ZoomReady { w: 800, h: 400, .. })));
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "and doesn't rasterize it again");
+        if let Some(Prefetch { done: Some((shm, ..)), .. }) = gallery.prefetch.take() { kitty::unlink(&shm); }
     }
 
     #[test]
