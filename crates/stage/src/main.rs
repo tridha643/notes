@@ -213,6 +213,7 @@ fn main() -> ExitCode {
             }
         });
     }
+    exit_on_hangup();
     drop(tx);
 
     let mut client = StageClient::new(sock);
@@ -341,6 +342,34 @@ mod tests {
         assert_eq!(super::base64_lite::encode(b"hi"), "aGk=");
         assert_eq!(super::base64_lite::encode(b"h"), "aA==");
     }
+}
+
+/// Exit once the terminal hangs up (its pane closed). crossterm's reader spins on a
+/// hung-up tty instead of failing, and a closed pane doesn't always send SIGHUP, so
+/// an orphaned stage would burn a core forever. Blocks in `kevent`, waking only for
+/// the user's keystrokes.
+fn exit_on_hangup() {
+    thread::spawn(|| {
+        // SAFETY: plain kqueue calls on stdin with zeroed, fully initialized kevents.
+        unsafe {
+            let kq = libc::kqueue();
+            let mut change: libc::kevent = std::mem::zeroed();
+            change.ident = libc::STDIN_FILENO as usize;
+            change.filter = libc::EVFILT_READ;
+            change.flags = libc::EV_ADD | libc::EV_CLEAR;
+            if kq < 0 || libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) < 0 {
+                return;
+            }
+            let mut event: libc::kevent = std::mem::zeroed();
+            loop {
+                match libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, std::ptr::null()) {
+                    1 if event.flags & libc::EV_EOF != 0 => std::process::exit(0),
+                    n if n < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted => return,
+                    _ => {}
+                }
+            }
+        }
+    });
 }
 
 /// Cell size in px from the tty's pixel size, when the terminal reports one.
