@@ -124,6 +124,7 @@ fn main() -> ExitCode {
     let mut draw = |term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App, gallery: &mut Gallery| {
         let _ = term.backend_mut().write_all(b"\x1b[?2026h");
         let _ = term.draw(|f| ui::draw(f, app));
+        app.cancel_sidebar_if_visuals_left();
         // A resize makes ratatui clear the screen (inside `draw`), and Rex frees the
         // images with it: send them again after the clear, before placing them.
         let focused = app.focused_visual();

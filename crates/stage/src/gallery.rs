@@ -47,6 +47,8 @@ struct Img {
     w: u32,
     h: u32,
     placed: Option<Place>,
+    /// The old image stays at its original size until the resized one is placed.
+    previous: Option<u32>,
     /// The html page streaming into this image, if live.
     page: Option<u64>,
     paused: bool,
@@ -417,7 +419,7 @@ impl Gallery {
         let img = self.images.entry(key.clone()).or_insert_with(|| {
             let id = *next_id;
             *next_id += 1;
-            Img { id, w, h, placed: None, page: None, paused: false, file: None }
+            Img { id, w, h, placed: None, previous: None, page: None, paused: false, file: None }
         });
         img.file = Some(path.to_owned());
         let _ = out.write_all(&kitty::transmit_png(img.id, path));
@@ -436,22 +438,33 @@ impl Gallery {
         let img = self.images.entry(key.clone()).or_insert_with(|| {
             let id = *next_id;
             *next_id += 1;
-            Img { id, w, h, placed: None, page, paused: false, file: None }
+            Img { id, w, h, placed: None, previous: None, page, paused: false, file: None }
         });
         if file.is_some() {
             img.file = file;
         }
         let resized = (img.w, img.h) != (w, h);
+        if resized && (img.placed.is_some() || img.previous.is_some()) {
+            // Reusing the id would replace the pixels in the old placement before
+            // the layout switches widths, visibly stretching the HTML card.
+            if img.previous.is_some() {
+                let _ = out.write_all(&kitty::delete(img.id));
+            } else {
+                img.previous = Some(img.id);
+            }
+            img.id = *next_id;
+            *next_id += 1;
+        }
         (img.w, img.h) = (w, h);
         // Same size and on screen: replace the frame in place. Otherwise just
         // transmit; the next `place` positions it.
         // `placed` already holds the pixel rect (see `place`); don't crop it twice.
-        let place = img.placed.filter(|_| !resized);
+        let place = img.placed.filter(|_| !resized && img.previous.is_none());
         let _ = out.write_all(b"\x1b[?2026h");
         let _ = out.write_all(&kitty::transmit(img.id, shm, (w, h), place.as_ref()));
         let _ = out.write_all(b"\x1b[?2026l");
         let _ = out.flush();
-        if place.is_none() {
+        if place.is_none() && img.previous.is_none() {
             img.placed = None;
         }
         (fresh || resized).then_some(Msg::VisualReady { key, w, h, max_scale: 1.0 })
@@ -541,6 +554,19 @@ impl Gallery {
             let wanted = on_screen.iter().find(|o| &o.key == key).map(|o| {
                 crop(&Place { col: o.col, row: o.row, cols: o.cols, rows: o.rows, src: (0, o.top as u32, 0, o.total as u32) }, (img.w, img.h))
             });
+            // While the sidebar still has its old geometry, leave its old pixels
+            // alone. The new image is transmitted but not placed until the redraw
+            // moves the card to its new cell rectangle.
+            if let (Some(new), Some(old), Some(_)) = (wanted, img.placed, img.previous) {
+                if (new.col, new.row, new.cols) == (old.col, old.row, old.cols)
+                    && old.src.2 != img.w {
+                    continue;
+                }
+            }
+            if let Some(old) = img.previous.take() {
+                let _ = out.write_all(&kitty::delete(old));
+                img.placed = None;
+            }
             match (wanted, img.placed) {
                 (Some(p), Some(q)) if p == q => {}
                 (Some(p), _) => {
@@ -587,6 +613,7 @@ impl Gallery {
         let mut decode = Vec::new();
         for (key, img) in self.images.iter_mut() {
             img.placed = None;
+            img.previous = None;
             match img.file.as_ref().map(|f| (kitty::png_size(&read_head(f)).is_some(), f)) {
                 Some((true, file)) => {
                     let _ = out.write_all(&kitty::transmit_png(img.id, file));
@@ -672,6 +699,35 @@ mod tests {
         g.handle(&mut out, frame(2));
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("a=T") && s.contains("x=0,y=0,w=660,h=360,c=40,r=10"), "{s}");
+    }
+
+    #[test]
+    fn resized_html_keeps_old_pixels_until_the_card_moves_to_its_new_width() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 600, max_height_px: 400 });
+        let key: VisualKey = ("page".into(), 1, 0);
+        gallery.pages.insert(9, key.clone());
+        let frame = |number, width| Gfx::Helper(format!(r#"{{"id":9,"frame":{number},"shm":"/stg-test-{number}","w":{width},"h":200}}"#));
+        gallery.handle(&mut Vec::new(), frame(1, 600));
+        let old = OnScreen { key: key.clone(), col: 25, row: 4, cols: 70, top: 0, rows: 10, total: 10 };
+        gallery.place(&mut Vec::new(), std::slice::from_ref(&old));
+        let old_id = gallery.images[&key].id;
+
+        gallery.target.width_px = 800;
+        let mut transmitted = Vec::new();
+        gallery.handle(&mut transmitted, frame(2, 800));
+        let new_id = gallery.images[&key].id;
+        assert_ne!(new_id, old_id);
+        assert!(!String::from_utf8_lossy(&transmitted).contains(&format!("a=d,d=i,i={old_id}")));
+        let mut still_old = Vec::new();
+        gallery.place(&mut still_old, std::slice::from_ref(&old));
+        assert!(still_old.is_empty(), "the old sidebar layout keeps the old pixels");
+
+        let mut switched = Vec::new();
+        gallery.place(&mut switched, &[OnScreen { col: 0, cols: 95, ..old }]);
+        let output = String::from_utf8_lossy(&switched);
+        assert!(output.contains(&format!("a=d,d=i,i={old_id}")));
+        assert!(output.contains(&format!("a=p,i={new_id}")));
     }
 
     #[test]
