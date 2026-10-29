@@ -35,9 +35,12 @@ pub enum Gfx {
     /// One JSON line from stage-helper.
     Helper(String),
     HelperExited,
-    /// A mermaid diagram rasterized into shared memory (or why it couldn't be).
-    Raster { key: VisualKey, epoch: u64, done: Result<(String, u32, u32), String> },
+    /// A mermaid diagram rasterized into shared memory for `made_for` (or why it couldn't be).
+    Raster { key: VisualKey, made_for: RasterTarget, done: Result<(String, u32, u32), String> },
 }
+
+/// What a Mermaid raster depends on: the card width and the cell size, both in px.
+pub type RasterTarget = (u32, (u16, u16));
 
 /// CSS px → device px for helper renders (Retina).
 const SCALE: f64 = 2.0;
@@ -82,8 +85,9 @@ pub struct Gallery {
     svgs: HashMap<VisualKey, String>,
     target: Target,
     focused: Option<VisualKey>,
-    /// Invalidates raster jobs started for an earlier focus or pane size.
-    raster_epoch: u64,
+    /// The target each diagram's latest raster job was started for. Diagrams are
+    /// rasterized for the current target only when on screen (or focused).
+    rastered: HashMap<VisualKey, RasterTarget>,
     cache: PathBuf,
     /// The session folder; assets are read straight from its `assets/` (notesd only writes it).
     stage: PathBuf,
@@ -178,7 +182,7 @@ impl Gallery {
             svgs: HashMap::new(),
             target,
             focused: None,
-            raster_epoch: 0,
+            rastered: HashMap::new(),
             cache,
             stage,
             trace: std::env::var_os("STAGE_TRACE").and_then(|p| std::fs::File::create(p).ok()),
@@ -364,23 +368,19 @@ impl Gallery {
         Ok(())
     }
 
-    /// Re-render only the focused Mermaid card when its full-width target changes.
-    /// Other cards retain their pixels until focus closes; then they render at
-    /// the normal target again. This avoids competing with the card the user sees.
+    /// A new target or focus: resize live pages. Diagrams follow in `place`, which
+    /// re-rasterizes only the ones on screen (just the focused one while focused).
     pub fn retarget(&mut self, target: Target, focused: Option<&VisualKey>) {
         if target == self.target && focused == self.focused.as_ref() {
             return;
         }
-        // Diagrams depend on the focus, card width and cell size, not the pane height.
-        let rerender = focused != self.focused.as_ref()
-            || (target.width_px, target.cell_px) != (self.target.width_px, self.target.cell_px);
         self.target = target;
         self.focused = focused.cloned();
-        if rerender {
-            self.raster_epoch += 1;
-            self.raster_target();
-        }
         self.resize_pages();
+    }
+
+    fn raster_target(&self) -> RasterTarget {
+        (self.target.width_px, self.target.cell_px)
     }
 
     /// A request about an existing page (its id is the page id, not a new one).
@@ -393,20 +393,15 @@ impl Gallery {
         Ok(())
     }
 
-    fn raster_target(&self) {
-        if let Some(key) = &self.focused {
-            if let Some(svg) = self.svgs.get(key) {
-                self.raster(key.clone(), svg.clone());
-            }
-        } else {
-            for (key, svg) in &self.svgs {
-                self.raster(key.clone(), svg.clone());
-            }
+    /// Rasterize `key` for the current target, unless a job for it already exists.
+    fn raster(&mut self, key: &VisualKey) {
+        let made_for = self.raster_target();
+        if self.rastered.get(key) == Some(&made_for) {
+            return;
         }
-    }
-
-    fn raster(&self, key: VisualKey, svg: String) {
-        let (tx, width, cell, epoch) = (self.tx.clone(), self.target.width_px, self.target.cell_px, self.raster_epoch);
+        let Some(svg) = self.svgs.get(key).cloned() else { return };
+        self.rastered.insert(key.clone(), made_for);
+        let (tx, key, (width, cell)) = (self.tx.clone(), key.clone(), made_for);
         thread::spawn(move || {
             let t0 = std::time::Instant::now();
             let raster = rasterize(&svg, width, MAX_MERMAID_HEIGHT_PX, cell);
@@ -416,7 +411,7 @@ impl Gallery {
             let done = raster.and_then(|(px, w, h)| {
                 kitty::shm_write(&px).map(|shm| (shm, w, h)).map_err(|e| format!("shared memory: {e}"))
             });
-            let _ = tx.send(Msg::Gfx(Gfx::Raster { key, epoch, done }));
+            let _ = tx.send(Msg::Gfx(Gfx::Raster { key, made_for, done }));
         });
     }
 
@@ -499,8 +494,12 @@ impl Gallery {
                 msgs.extend(self.pages.drain().map(|(_, key)| Msg::VisualFailed { key, reason: "stage-helper stopped".into() }));
                 msgs
             }
-            Gfx::Raster { epoch, done, .. } if epoch != self.raster_epoch => {
+            Gfx::Raster { key, made_for, done } if made_for != self.raster_target() => {
+                // Made for an earlier width: drop it, and let `place` ask again if it's on screen.
                 if let Ok((shm, ..)) = done { kitty::unlink(&shm); }
+                if self.rastered.get(&key) == Some(&made_for) {
+                    self.rastered.remove(&key);
+                }
                 vec![]
             }
             Gfx::Raster { key, done, .. } => match done {
@@ -537,9 +536,9 @@ impl Gallery {
                 match self.pending.remove(&id) {
                     Some(Pending::Mermaid(key)) => {
                         let svg = v["svg"].as_str().unwrap_or_default().to_owned();
-                        self.svgs.insert(key.clone(), svg.clone());
+                        self.svgs.insert(key.clone(), svg);
                         if self.focused.as_ref().is_none_or(|focused| focused == &key) {
-                            self.raster(key, svg);
+                            self.raster(&key);
                         }
                         vec![]
                     }
@@ -556,6 +555,12 @@ impl Gallery {
     /// Match kitty placements to what's on screen this frame. Call between a
     /// frame's synchronized-output brackets, after ratatui drew it.
     pub fn place(&mut self, out: &mut impl Write, on_screen: &[OnScreen]) {
+        // Diagrams on screen (only the focused one while focused) at the current target.
+        for o in on_screen {
+            if self.focused.as_ref().is_none_or(|focused| focused == &o.key) {
+                self.raster(&o.key);
+            }
+        }
         let mut pause = Vec::new();
         let mut resume = Vec::new();
         for (key, img) in self.images.iter_mut() {
@@ -613,12 +618,15 @@ impl Gallery {
     pub fn replace_all(&mut self, out: &mut impl Write, target: Target, focused: Option<&VisualKey>) {
         self.target = target;
         self.focused = focused.cloned();
-        self.raster_epoch += 1;
+        // The terminal dropped every image: diagrams rasterize again as they come on screen.
+        self.rastered.clear();
         note(&mut self.trace, format_args!("clear: sending {} images again", self.images.len()));
         let mut decode = Vec::new();
         for (key, img) in self.images.iter_mut() {
             img.placed = None;
-            img.previous = None;
+            if let Some(old) = img.previous.take() {
+                let _ = out.write_all(&kitty::delete(old));
+            }
             match img.file.as_ref().map(|f| (kitty::png_size(&read_head(f)).is_some(), f)) {
                 Some((true, file)) => {
                     let _ = out.write_all(&kitty::transmit_png(img.id, file));
@@ -630,7 +638,6 @@ impl Gallery {
         for (key, file) in decode {
             let _ = self.decode(key, file);
         }
-        self.raster_target();
         // Only the focused page needs the new size while it fills the pane.
         self.resize_pages();
     }
@@ -743,7 +750,7 @@ mod tests {
         let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 950, max_height_px: 400, cell_px: (10, 20) });
         let key: VisualKey = ("diagram".into(), 1, 0);
         let shms: Vec<String> = [(950, 400), (690, 300)].iter().map(|(w, h)| kitty::shm_write(&vec![0; w * h * 4]).unwrap()).collect();
-        let raster = |shm: &str, w, h| Gfx::Raster { key: key.clone(), epoch: 0, done: Ok((shm.to_owned(), w, h)) };
+        let raster = |shm: &str, w, h| Gfx::Raster { key: key.clone(), made_for: (950, (10, 20)), done: Ok((shm.to_owned(), w, h)) };
         gallery.handle(&mut Vec::new(), raster(&shms[0], 950, 400));
         let at = OnScreen { key: key.clone(), col: 29, row: 7, cols: 69, top: 0, rows: 20, total: 20, px: (950, 400) };
         gallery.place(&mut Vec::new(), std::slice::from_ref(&at));
@@ -759,31 +766,49 @@ mod tests {
         shms.iter().for_each(|shm| kitty::unlink(shm)); // no terminal here to consume them
     }
 
+    /// `place` with these cards on screen, as the app would after a draw.
+    fn shown(keys: &[&VisualKey]) -> Vec<OnScreen> {
+        keys.iter().map(|k| OnScreen { key: (*k).clone(), col: 0, row: 0, cols: 10, top: 0, rows: 5, total: 5, px: (0, 0) }).collect()
+    }
+
+    fn next_raster(rx: &std::sync::mpsc::Receiver<Msg>) -> (VisualKey, RasterTarget, Result<(String, u32, u32), String>) {
+        let Msg::Gfx(Gfx::Raster { key, made_for, done }) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap() else { panic!("no raster") };
+        (key, made_for, done)
+    }
+
     #[test]
-    fn focusing_rasterizes_only_the_selected_mermaid_and_ignores_old_pixels() {
+    fn only_diagrams_on_screen_rasterize_and_only_the_focused_one_while_focused() {
         let (tx, rx) = std::sync::mpsc::channel();
         let normal = Target { width_px: 100, max_height_px: 100, cell_px: (1, 1) };
-        let focused_target = Target { width_px: 200, max_height_px: 200, cell_px: (1, 1) };
         let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), normal);
-        let first: VisualKey = ("first".into(), 1, 0);
-        let second: VisualKey = ("second".into(), 1, 0);
+        let (first, second, off): (VisualKey, VisualKey, VisualKey) = (("first".into(), 1, 0), ("second".into(), 1, 0), ("off".into(), 1, 0));
         let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="#89b4fa"/></svg>"##;
-        gallery.svgs.insert(first.clone(), svg.into());
-        gallery.svgs.insert(second.clone(), svg.into());
-        gallery.retarget(focused_target, Some(&second));
-        let Msg::Gfx(Gfx::Raster { key, epoch, done }) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap() else { panic!("no raster") };
-        assert_eq!(key, second);
-        assert!(rx.try_recv().is_err(), "offscreen Mermaid cards must not render during focus");
-        let (shm, ..) = done.unwrap();
-        assert!(gallery.handle(&mut Vec::new(), Gfx::Raster { key, epoch: epoch - 1, done: Ok((shm.clone(), 200, 100)) }).is_empty());
-        assert!(!gallery.images.contains_key(&second));
-        // The stale completion owns its shm and must unlink it.
-        assert!(kitty::shm_read(&shm, 1).is_err());
-        gallery.retarget(normal, None);
-        let mut keys = [rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(), rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap()]
-            .into_iter().map(|msg| match msg { Msg::Gfx(Gfx::Raster { key, done: Ok((shm, ..)), .. }) => { kitty::unlink(&shm); key }, _ => panic!("no raster") }).collect::<Vec<_>>();
+        for k in [&first, &second, &off] {
+            gallery.svgs.insert(k.clone(), svg.into());
+        }
+        let unlink = |done: Result<(String, u32, u32), String>| kitty::unlink(&done.unwrap().0);
+        gallery.place(&mut Vec::new(), &shown(&[&first, &second]));
+        let mut keys = [next_raster(&rx), next_raster(&rx)].map(|(key, _, done)| { unlink(done); key });
         keys.sort();
-        assert_eq!(keys, [first, second]);
+        assert_eq!(keys, [first.clone(), second.clone()]);
+        // Drawn again at the same target: nothing new.
+        gallery.place(&mut Vec::new(), &shown(&[&first, &second]));
+        assert!(rx.try_recv().is_err());
+
+        gallery.retarget(Target { width_px: 200, ..normal }, Some(&second));
+        gallery.place(&mut Vec::new(), &shown(&[&second]));
+        let (key, made_for, done) = next_raster(&rx);
+        assert_eq!((key, made_for), (second.clone(), (200, (1, 1))));
+        unlink(done);
+        assert!(rx.try_recv().is_err(), "nothing but the focused card renders during focus");
+
+        // Back to the normal width: the focused card renders again, the unchanged one doesn't.
+        gallery.retarget(normal, None);
+        gallery.place(&mut Vec::new(), &shown(&[&first, &second]));
+        let (key, made_for, done) = next_raster(&rx);
+        assert_eq!((key, made_for), (second, (100, (1, 1))));
+        unlink(done);
+        assert!(rx.try_recv().is_err(), "an off-screen or already-current diagram never rasterizes");
     }
 
     #[test]
@@ -800,27 +825,43 @@ mod tests {
     #[test]
     fn resize_cannot_replace_crisp_pixels_with_an_older_raster() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 100, max_height_px: 100, cell_px: (1, 1) });
+        let at = |width_px| Target { width_px, max_height_px: 100, cell_px: (1, 1) };
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), at(120));
         let key: VisualKey = ("diagram".into(), 1, 0);
         gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
-        gallery.retarget(Target { width_px: 120, max_height_px: 100, cell_px: (1, 1) }, None);
-        gallery.retarget(Target { width_px: 180, max_height_px: 100, cell_px: (1, 1) }, None);
-        let jobs = [rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(), rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap()];
-        let mut old = None;
-        let mut latest = None;
-        for msg in jobs {
-            let Msg::Gfx(Gfx::Raster { key: job_key, epoch, done }) = msg else { panic!("expected raster") };
-            assert_eq!(job_key, key);
-            if epoch == gallery.raster_epoch { latest = Some(done.unwrap()); } else { old = Some(done.unwrap()); }
-        }
-        let (shm, w, h) = latest.unwrap();
+        gallery.place(&mut Vec::new(), &shown(&[&key]));
+        let old = next_raster(&rx);
+        gallery.retarget(at(180), None);
+        gallery.place(&mut Vec::new(), &shown(&[&key]));
+        let latest = next_raster(&rx);
+        let (shm, w, h) = latest.2.unwrap();
         assert_eq!((w, h), (180, 90));
-        assert_eq!(gallery.handle(&mut Vec::new(), Gfx::Raster { key: key.clone(), epoch: gallery.raster_epoch, done: Ok((shm.clone(), w, h)) }).len(), 1);
+        assert_eq!(gallery.handle(&mut Vec::new(), Gfx::Raster { key: key.clone(), made_for: latest.1, done: Ok((shm.clone(), w, h)) }).len(), 1);
         kitty::unlink(&shm); // the test has no terminal to consume the transmitted pixels
-        let (stale_shm, stale_w, stale_h) = old.unwrap();
-        assert!(gallery.handle(&mut Vec::new(), Gfx::Raster { key: key.clone(), epoch: gallery.raster_epoch - 1, done: Ok((stale_shm.clone(), stale_w, stale_h)) }).is_empty());
-        assert!(kitty::shm_read(&stale_shm, 1).is_err());
+        let (stale_shm, stale_w, stale_h) = old.2.unwrap();
+        assert!(gallery.handle(&mut Vec::new(), Gfx::Raster { key: key.clone(), made_for: old.1, done: Ok((stale_shm.clone(), stale_w, stale_h)) }).is_empty());
+        assert!(kitty::shm_read(&stale_shm, 1).is_err(), "a dropped raster's shm is unlinked");
         assert_eq!((gallery.images[&key].w, gallery.images[&key].h), (180, 90));
+    }
+
+    #[test]
+    fn a_dropped_raster_is_asked_for_again_when_its_width_comes_back() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let at = |width_px| Target { width_px, max_height_px: 100, cell_px: (1, 1) };
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), at(100));
+        let key: VisualKey = ("diagram".into(), 1, 0);
+        gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
+        gallery.place(&mut Vec::new(), &shown(&[&key]));
+        let first = next_raster(&rx);
+        // It lands while the width is briefly different (a focus round trip), so it's dropped…
+        gallery.retarget(at(200), None);
+        gallery.handle(&mut Vec::new(), Gfx::Raster { key: key.clone(), made_for: first.1, done: first.2 });
+        gallery.retarget(at(100), None);
+        // …and the next draw asks again instead of waiting forever for pixels already thrown away.
+        gallery.place(&mut Vec::new(), &shown(&[&key]));
+        let again = next_raster(&rx);
+        assert_eq!(again.1, (100, (1, 1)));
+        kitty::unlink(&again.2.unwrap().0);
     }
 
     #[test]

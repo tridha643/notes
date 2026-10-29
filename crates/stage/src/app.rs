@@ -223,7 +223,8 @@ pub struct App {
     /// Hold resized visual dimensions until every visible HTML card can switch together.
     pending_sidebar_frames: HashMap<VisualKey, VisualState>,
     /// Feed position to restore when the focus view closes.
-    before_focus: Option<(usize, usize)>,
+    /// Feed position and follow to restore when the focus view closes.
+    before_focus: Option<(usize, usize, bool)>,
     feed: Option<(FeedKey, Feed)>,
     /// A post to bring to the top on the next layout (a sidebar pick, a follow).
     jump: Option<PostId>,
@@ -322,8 +323,8 @@ impl App {
     /// Ask once for the pixels of the visual cards on screen and, once none of
     /// those is still rendering, of the nearest one within a page above and
     /// below, so off-screen diagrams never compete with visible ones for CPU.
-    /// `main` calls this after each draw, when the feed is laid out for what's shown.
-    pub fn request_visuals(&mut self) -> Vec<Effect> {
+    /// Runs after each draw (see `after_draw`), when the feed is laid out for what's shown.
+    fn request_visuals(&mut self) -> Vec<Effect> {
         let page = self.page();
         self.feed();
         let (scroll, Some((_, feed))) = (self.scroll, &self.feed) else { return vec![] };
@@ -580,6 +581,14 @@ impl App {
                 self.builds += 1;
             }
         }
+        // A new version without the focused part: nothing left to focus on.
+        let gone = self.focused_card.as_ref().is_some_and(|(id, card)| {
+            self.version_of(id) == Some(key.1) && &key.0 == id
+                && self.loaded.get(&key).and_then(|l| l.cards.as_ref()).is_some_and(|cards| *card >= cards.len())
+        });
+        if gone {
+            self.leave_focus();
+        }
     }
 
     /// One post laid out at `width`, memoized in its view on everything it reads.
@@ -781,7 +790,9 @@ impl App {
     /// Enter card focus, preserving the feed position for when it closes.
     fn enter_card_focus(&mut self) -> Vec<Effect> {
         let Some((id, _, card)) = self.pending_html_focus.take() else { return vec![] };
-        self.before_focus = Some((self.scroll, self.cursor));
+        // Following would jump the focused view to each new post.
+        self.before_focus = Some((self.scroll, self.cursor, self.follow));
+        self.follow = false;
         self.focused_card = Some((id, card));
         self.feed = None;
         self.scroll = 0;
@@ -813,14 +824,23 @@ impl App {
         self.report_card_width()
     }
 
-    /// Cancel a sidebar resize if navigation moved a waiting HTML card off screen.
-    pub fn cancel_sidebar_if_visuals_left(&mut self) {
-        if self.pending_sidebar.as_ref().is_some_and(|(_, waiting)| {
+    /// After each draw: a sidebar change still waiting on an HTML card that has since
+    /// left the screen happens now (that card re-renders at the new width later), then
+    /// the visuals this frame shows are asked for.
+    pub fn after_draw(&mut self) -> Vec<Effect> {
+        let mut fx = Vec::new();
+        let left = self.pending_sidebar.as_ref().is_some_and(|(_, waiting)| {
             waiting.iter().any(|key| !self.on_screen.iter().any(|shown| &shown.key == key))
-        }) {
-            self.pending_sidebar = None;
-            self.pending_sidebar_frames.clear();
+        });
+        if let Some((hidden, _)) = self.pending_sidebar.take().filter(|_| left) {
+            self.sidebar_hidden = hidden;
+            self.visuals.extend(self.pending_sidebar_frames.drain());
+            self.visual_gen += 1;
+            fx.extend(self.report_card_width());
+            fx.push(Effect::Redraw);
         }
+        fx.extend(self.request_visuals());
+        fx
     }
 
     fn sidebar_waits_for(&self, key: &VisualKey) -> bool {
@@ -852,11 +872,7 @@ impl App {
         self.pending_sidebar_frames.clear();
         if self.pending_html_focus.take().is_some() { return vec![]; }
         if self.focused_card.is_some() {
-            self.focused_card = None;
-            self.feed = None;
-            if let Some((scroll, cursor)) = self.before_focus.take() {
-                (self.scroll, self.cursor) = (scroll, cursor);
-            }
+            self.leave_focus();
             return self.report_card_width();
         }
         let (post, hit) = self.hit_at_cursor();
@@ -870,9 +886,17 @@ impl App {
             && matches!(self.visuals.get(&key), Some(VisualState::Ready { .. }))
             && self.on_screen.iter().any(|shown| shown.key == key)
             && ui::geometry_for(self).main.width != self.size.0;
-        self.follow = false;
         self.pending_html_focus = Some(key);
         if html_ready { vec![] } else { self.enter_card_focus() }
+    }
+
+    /// Back to the feed where it was, following again if it was.
+    fn leave_focus(&mut self) {
+        self.focused_card = None;
+        self.feed = None;
+        if let Some((scroll, cursor, follow)) = self.before_focus.take() {
+            (self.scroll, self.cursor, self.follow) = (scroll, cursor, follow);
+        }
     }
 
     fn key(&mut self, k: KeyEvent) -> Vec<Effect> {
@@ -1308,9 +1332,7 @@ impl App {
                     self.pending_html_focus = None;
                 }
                 if self.focused_card.as_ref().is_some_and(|(id, _)| !self.posts.iter().any(|p| &p.id == id)) {
-                    self.focused_card = None;
-                    self.before_focus = None;
-                    self.feed = None;
+                    self.leave_focus();
                 }
                 let target = match &self.shown {
                     Some(id) if !self.follow && self.posts.iter().any(|p| &p.id == id) => Some(id.clone()),
@@ -1520,7 +1542,7 @@ mod tests {
         // As `main` does: update, draw, then ask for what the drawn feed shows.
         let needed = |app: &mut App, msg: Msg| -> Vec<usize> {
             app.update(msg);
-            app.request_visuals().into_iter().filter_map(|e| match e { Effect::NeedVisual { key, .. } => Some(key.2), _ => None }).collect()
+            app.after_draw().into_iter().filter_map(|e| match e { Effect::NeedVisual { key, .. } => Some(key.2), _ => None }).collect()
         };
         let first = needed(&mut app, Msg::Resize(100, 30));
         let (scroll, page) = (app.scroll, app.page());
@@ -1815,15 +1837,17 @@ mod tests {
         app.update(key(KeyCode::Char('s')));
         assert!(app.pending_sidebar.is_some());
         app.on_screen.clear();
-        app.cancel_sidebar_if_visuals_left();
+        let effects = app.after_draw();
         assert!(app.pending_sidebar.is_none(), "scrolling away cannot leave the toggle waiting forever");
+        assert!(app.sidebar_hidden, "and the toggle the user asked for still happens");
+        assert!(effects.contains(&Effect::Request(StageRequest::CardCols(95))));
         term.draw(|f| ui::draw(f, &mut app)).unwrap();
         app.update(key(KeyCode::Char('s')));
         assert!(app.pending_sidebar.is_some());
         app.update(key(KeyCode::Char('s')));
-        assert!(app.pending_sidebar.is_none());
-        assert!(!app.sidebar_hidden);
-        assert_eq!(app.target().width_px, narrow);
+        assert!(app.pending_sidebar.is_none(), "a second s cancels a waiting one");
+        assert!(app.sidebar_hidden);
+        assert_eq!(app.target().width_px, wide);
     }
 
     #[test]
