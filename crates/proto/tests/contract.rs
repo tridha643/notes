@@ -248,3 +248,95 @@ fn unknown_fields_in_args_and_parts_are_rejected() {
         assert!(e.contains(field), "{field}: {e}");
     }
 }
+
+/// stage ↔ stage-helper: one fixture per request and reply shape in fixtures/helper/.
+/// Requests round-trip and reject unknown fields; the Swift mirror decodes the same files.
+mod helper {
+    use super::*;
+    use notes_proto::helper::*;
+
+    fn read(file: &str) -> String {
+        let path = fixtures().join("helper").join(file);
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    fn files(suffix: &str) -> Vec<String> {
+        let mut names: Vec<_> = fs::read_dir(fixtures().join("helper"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(suffix))
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn json(s: &str) -> Value {
+        serde_json::from_str(s).expect("fixture is JSON")
+    }
+
+    /// One sample per `HelperRequest` variant; exhaustive so a new op needs a fixture.
+    fn request_name(req: &HelperRequest) -> &'static str {
+        match req {
+            HelperRequest::Warm { .. } => "warm",
+            HelperRequest::Mermaid { .. } => "mermaid",
+            HelperRequest::Image { .. } => "image",
+            HelperRequest::HtmlOpen { .. } => "html-open",
+            HelperRequest::HtmlUpdate { .. } => "html-update",
+            HelperRequest::HtmlAck { .. } => "html-ack",
+            HelperRequest::HtmlPause { .. } => "html-pause",
+            HelperRequest::HtmlResume { .. } => "html-resume",
+            HelperRequest::HtmlClose { .. } => "html-close",
+            HelperRequest::HtmlResize { .. } => "html-resize",
+        }
+    }
+
+    #[test]
+    fn requests_round_trip_and_reject_unknown_fields() {
+        let names = files(".request.json");
+        assert_eq!(names.len(), 10, "one fixture per op");
+        let mut seen = Vec::new();
+        for file in names {
+            let line = read(&file);
+            let req: HelperRequest = serde_json::from_str(&line).unwrap_or_else(|e| panic!("{file}: {e}"));
+            assert_eq!(format!("{}.request.json", request_name(&req)), file);
+            assert_eq!(serde_json::to_value(&req).unwrap(), json(&line), "{file}");
+            seen.push(request_name(&req));
+            let mut extra = json(&line);
+            extra["bogus"] = json!(1);
+            assert!(serde_json::from_value::<HelperRequest>(extra).is_err(), "{file} accepted an unknown field");
+            let mut missing = json(&line);
+            missing.as_object_mut().unwrap().remove("id");
+            assert!(serde_json::from_value::<HelperRequest>(missing).is_err(), "{file} accepted no id");
+        }
+        seen.dedup();
+        assert_eq!(seen.len(), 10);
+        assert!(serde_json::from_str::<HelperRequest>(r#"{"op":"nope","id":1}"#).is_err());
+    }
+
+    #[test]
+    fn replies_round_trip_into_their_variant() {
+        let expect = |file: &str, reply: &HelperReply| {
+            let ok = match reply {
+                HelperReply::Frame(_) => "frame",
+                HelperReply::Failed(f) if f.id.is_none() => "failed-no-id",
+                HelperReply::Failed(_) => "failed",
+                HelperReply::Mermaid(_) => "mermaid",
+                HelperReply::Patched(_) => "patched",
+                HelperReply::Image(_) => "image",
+                HelperReply::Done(_) => "done",
+            };
+            assert_eq!(format!("{ok}.reply.json"), file);
+        };
+        let names = files(".reply.json");
+        assert_eq!(names.len(), 7);
+        for file in names {
+            let line = read(&file);
+            let reply: HelperReply = serde_json::from_str(&line).unwrap_or_else(|e| panic!("{file}: {e}"));
+            expect(&file, &reply);
+            assert_eq!(serde_json::to_value(&reply).unwrap(), json(&line), "{file}");
+        }
+        for bad in [r#"{"id":1,"ok":false,"svg":"","width":1.0,"height":1.0}"#, r#"{"id":1,"ok":true,"error":"x"}"#] {
+            assert!(serde_json::from_str::<HelperReply>(bad).is_err(), "{bad}");
+        }
+    }
+}

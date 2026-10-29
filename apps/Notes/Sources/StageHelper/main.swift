@@ -29,6 +29,12 @@ final class Client: @unchecked Sendable {
     private let out: Int32
     /// Guards writes so a reply sent off the main thread never interleaves with a frame.
     private let lock = NSLock()
+    /// Used under `lock`.
+    private let encoder: JSONEncoder = {
+        let e = JSONEncoder()
+        e.outputFormatting = .withoutEscapingSlashes
+        return e
+    }()
     /// Main thread only.
     var pages: [Int: Page] = [:]
 
@@ -36,11 +42,11 @@ final class Client: @unchecked Sendable {
 
     /// One reply line. Callable from any thread: replies that don't touch AppKit
     /// (mermaid) go out from their own queue instead of waiting on the main thread.
-    func send(_ message: [String: Any]) {
-        guard var data = try? JSONSerialization.data(withJSONObject: message, options: [.withoutEscapingSlashes]) else { return }
-        data.append(0x0A)
+    func send(_ reply: HelperReply) {
         lock.lock()
         defer { lock.unlock() }
+        guard var data = try? encoder.encode(reply) else { return }
+        data.append(0x0A)
         data.withUnsafeBytes { buf in
             var sent = 0
             while sent < buf.count {
@@ -51,8 +57,8 @@ final class Client: @unchecked Sendable {
         }
     }
 
-    func fail(_ id: Any, _ error: String) {
-        send(["id": id, "ok": false, "error": error])
+    func fail(_ id: Int?, _ error: String) {
+        send(.failed(id: id, error: error))
     }
 }
 
@@ -103,11 +109,7 @@ func rgba(_ image: CGImage, _ w: Int, _ h: Int) -> [UInt8] {
 let renders = DispatchGroup()
 
 /// Called from the reader thread, so a diagram never waits behind WebKit work on the main thread.
-func mermaid(_ req: [String: Any], id: Any, client: Client) {
-    guard let source = req["source"] as? String else { return client.fail(id, "mermaid needs a source") }
-    let maxWidth = (req["max_width"] as? NSNumber)?.doubleValue
-    let fontSize = (req["font_size"] as? NSNumber)?.doubleValue ?? 14
-    nonisolated(unsafe) let id = id
+func mermaid(id: Int, source: String, maxWidth: Double, fontSize: Double, client: Client) {
     let theme = peleTheme
     // pele blocks on its own queue, so render off the reader thread.
     renders.enter()
@@ -118,7 +120,7 @@ func mermaid(_ req: [String: Any], id: Any, client: Client) {
             let d = try Pele.shared.render(source, maxWidth: maxWidth, fontSize: fontSize)
             traceMark("pele render", since: t0)
             let svg = resolvePeleSVG(d.svg, theme: theme).replacingOccurrences(of: Pele.fontFamily, with: "Helvetica Neue")
-            client.send(["id": id, "ok": true, "svg": svg, "width": d.width, "height": d.height])
+            client.send(.mermaid(id: id, svg: svg, width: d.width, height: d.height))
         } catch {
             client.fail(id, "\(error)")
         }
@@ -126,52 +128,44 @@ func mermaid(_ req: [String: Any], id: Any, client: Client) {
 }
 
 @MainActor
-func image(_ req: [String: Any], id: Any, client: Client) {
-    guard let path = req["path"] as? String else { return client.fail(id, "image needs a path") }
+func image(id: Int, path: String, client: Client) {
     guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
           let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
     else { return client.fail(id, "can't decode \(path)") }
     do {
         let shm = try writeShm(rgba(image, image.width, image.height))
-        client.send(["id": id, "ok": true, "shm": shm, "w": image.width, "h": image.height])
+        client.send(.image(id: id, shm: shm, w: image.width, h: image.height))
     } catch {
         client.fail(id, "shm: \(error)")
     }
 }
 
 @MainActor
-func handle(_ req: [String: Any], from client: Client) {
-    let id: Any = req["id"] ?? NSNull()
-    let op = req["op"] as? String ?? ""
-    let pageId = (req["id"] as? NSNumber)?.intValue ?? -1
-    let num = { (key: String) in (req[key] as? NSNumber)?.doubleValue }
-    switch op {
+func handle(_ req: HelperRequest, from client: Client) {
+    switch req {
     // Sent by stage at startup to launch the helper early; launching is the warm-up.
-    case "warm": client.send(["id": id, "ok": true])
-    case "image": image(req, id: id, client: client)
-    case "html-open":
-        guard let path = req["path"] as? String, let width = num("width"), width > 0 else {
-            return client.fail(id, "html-open needs a path and a width")
-        }
-        client.pages[pageId]?.close()
-        client.pages[pageId] = Page(id: pageId, client: client, path: path, width: width, maxHeight: num("max_height") ?? 2000,
-                                    scale: num("scale") ?? 2, fps: num("fps") ?? 60)
-    case "html-update":
-        guard let path = req["path"] as? String else { return client.fail(id, "html-update needs a path") }
-        guard let page = client.pages[pageId] else { return client.fail(id, "no page \(pageId)") }
+    case .warm(let id): client.send(.done(id: id))
+    // Handled on the reader thread, see `readLines`.
+    case .mermaid(let id, let source, let maxWidth, let fontSize): mermaid(id: id, source: source, maxWidth: maxWidth, fontSize: fontSize, client: client)
+    case .image(let id, let path): image(id: id, path: path, client: client)
+    case .htmlOpen(let id, let path, let width, let maxHeight, let scale, let fps):
+        guard width > 0 else { return client.fail(id, "html-open needs a width") }
+        client.pages[id]?.close()
+        client.pages[id] = Page(id: id, client: client, path: path, width: width, maxHeight: maxHeight, scale: scale, fps: fps)
+    case .htmlUpdate(let id, let path):
+        guard let page = client.pages[id] else { return client.fail(id, "no page \(id)") }
         page.update(path: path)
-    case "html-ack", "html-pause", "html-resume", "html-resize", "html-close":
-        guard let page = client.pages[pageId] else { return client.fail(id, "no page \(pageId)") }
-        switch op {
-        case "html-ack": page.ack((req["frame"] as? NSNumber)?.intValue ?? -1)
-        case "html-pause": page.pause()
-        case "html-resume": page.resume()
-        case "html-resize": page.resize(width: num("width"), maxHeight: num("max_height"), scale: num("scale"))
+    case .htmlAck(let id, _), .htmlPause(let id), .htmlResume(let id), .htmlResize(let id, _, _, _), .htmlClose(let id):
+        guard let page = client.pages[id] else { return client.fail(id, "no page \(id)") }
+        switch req {
+        case .htmlAck(_, let frame): page.ack(frame)
+        case .htmlPause: page.pause()
+        case .htmlResume: page.resume()
+        case .htmlResize(_, let width, let maxHeight, let scale): page.resize(width: width, maxHeight: maxHeight, scale: scale)
         default:
             page.close()
-            client.pages[pageId] = nil
+            client.pages[id] = nil
         }
-    default: client.fail(id, "unknown op \"\(op)\"")
     }
 }
 
@@ -183,15 +177,15 @@ func readLines(_ fd: Int32, for client: Client) {
     while getline(&line, &cap, file) > 0 {
         let text = String(cString: line!).trimmingCharacters(in: .newlines)
         if text.isEmpty { continue }
-        guard let parsed = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any] else {
-            client.fail(NSNull(), "bad request: not a JSON object")
+        let req: HelperRequest
+        do { req = try HelperRequest.parse(Data(text.utf8)) } catch let e as HelperRequestError {
+            client.fail(e.id, "bad request: \(e.message)")
+            continue
+        } catch { continue }
+        if case .mermaid(let id, let source, let maxWidth, let fontSize) = req {
+            mermaid(id: id, source: source, maxWidth: maxWidth, fontSize: fontSize, client: client)
             continue
         }
-        if parsed["op"] as? String == "mermaid" {
-            mermaid(parsed, id: parsed["id"] ?? NSNull(), client: client)
-            continue
-        }
-        nonisolated(unsafe) let req = parsed
         DispatchQueue.main.async { MainActor.assumeIsolated { handle(req, from: client) } }
     }
     free(line)
