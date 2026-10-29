@@ -123,6 +123,8 @@ pub enum Msg {
     /// A visual's pixels are ready, or can't be made.
     VisualReady { key: VisualKey, w: u32, h: u32, max_scale: f32 },
     VisualFailed { key: VisualKey, reason: String },
+    /// A zoomed raster for `key` is ready ahead of `z` (see `Effect::PrefetchZoom`).
+    ZoomReady { key: VisualKey, w: u32, h: u32 },
     /// Graphics plumbing (helper replies, rasterized frames); `main` handles these.
     Gfx(crate::gallery::Gfx),
 }
@@ -140,6 +142,8 @@ pub enum Effect {
     Fatal(String),
     /// Make pixels for a visual card.
     NeedVisual { key: VisualKey, source: VisualSource },
+    /// Rasterize the diagram under the cursor for focus now, so `z` shows it crisp at once.
+    PrefetchZoom { key: VisualKey, target: Target },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -228,6 +232,9 @@ pub struct App {
     /// A focused diagram's feed-size pixels: the gallery puts them back when focus
     /// closes, and the layout must match them in that same frame.
     unzoomed: Option<(VisualKey, VisualState)>,
+    /// The diagram whose zoomed raster was asked for ahead of `z`, for which
+    /// target, and its size once it's ready.
+    zoom_ahead: Option<(VisualKey, Target, Option<(u32, u32)>)>,
     feed: Option<(FeedKey, Feed)>,
     /// A post to bring to the top on the next layout (a sidebar pick, a follow).
     jump: Option<PostId>,
@@ -287,6 +294,7 @@ impl App {
             pending_sidebar_frames: HashMap::new(),
             before_focus: None,
             unzoomed: None,
+            zoom_ahead: None,
             feed: None,
             jump: None,
             remembered: HashMap::new(),
@@ -452,6 +460,12 @@ impl App {
                 let mut fx = if failed_html { self.enter_card_focus() } else { vec![] };
                 fx.push(Effect::Redraw);
                 fx
+            }
+            Msg::ZoomReady { key, w, h } => {
+                if let Some((_, _, size)) = self.zoom_ahead.as_mut().filter(|(ahead, ..)| *ahead == key) {
+                    *size = Some((w, h));
+                }
+                vec![]
             }
             Msg::Gfx(_) => vec![],
         }
@@ -798,8 +812,14 @@ impl App {
         self.before_focus = Some((self.scroll, self.cursor, self.follow));
         self.follow = false;
         let key = self.version_of(&id).map(|version| (id.clone(), version, card));
-        self.unzoomed = key.filter(|key| matches!(self.visual_source(key), Some(VisualSource::Mermaid(_))))
+        self.unzoomed = key.clone().filter(|key| matches!(self.visual_source(key), Some(VisualSource::Mermaid(_))))
             .and_then(|key| Some((key.clone(), self.visuals.get(&key)?.clone())));
+        // Its zoomed raster was made ahead: lay it out at that size from the first frame.
+        let target = self.zoom_target();
+        if let Some((ahead, _, Some((w, h)))) = self.zoom_ahead.take().filter(|(ahead, at, _)| Some(ahead) == key.as_ref() && *at == target) {
+            self.visuals.insert(ahead, VisualState::Ready { w, h, max_scale: 1.0 });
+            self.visual_gen += 1;
+        }
         self.focused_card = Some((id, card));
         self.feed = None;
         self.scroll = 0;
@@ -847,7 +867,47 @@ impl App {
             fx.push(Effect::Redraw);
         }
         fx.extend(self.request_visuals());
+        fx.extend(self.zoom_ahead());
         fx
+    }
+
+    /// Once nothing on screen is still rendering, the Mermaid card under the cursor gets
+    /// its zoomed raster made ahead, so `z` shows it at full resolution in its first frame.
+    fn zoom_ahead(&mut self) -> Option<Effect> {
+        if self.focused_card.is_some() || self.pending_html_focus.is_some() {
+            return None;
+        }
+        if self.on_screen.iter().any(|o| matches!(self.visuals.get(&o.key), None | Some(VisualState::Pending))) {
+            return None;
+        }
+        let key = self.card_at_cursor()?;
+        let ready = matches!(self.visual_source(&key), Some(VisualSource::Mermaid(_)))
+            && matches!(self.visuals.get(&key), Some(VisualState::Ready { .. }));
+        let target = self.zoom_target();
+        if !ready || self.zoom_ahead.as_ref().is_some_and(|(ahead, at, _)| *ahead == key && *at == target) {
+            return None;
+        }
+        self.zoom_ahead = Some((key.clone(), target, None));
+        Some(Effect::PrefetchZoom { key, target })
+    }
+
+    /// `target()` as it will be once a card is focused (no sidebar, nearly the whole pane).
+    fn zoom_target(&self) -> Target {
+        let inner = self.size.0.saturating_sub(5).max(1) as u32;
+        Target {
+            width_px: inner * self.cell_px.0 as u32,
+            max_height_px: self.page().saturating_sub(3).max(1) as u32 * self.cell_px.1 as u32,
+            cell_px: self.cell_px,
+        }
+    }
+
+    /// The card `z` would focus: the one under the cursor, or a post's first on its title.
+    fn card_at_cursor(&mut self) -> Option<VisualKey> {
+        let (post, hit) = self.hit_at_cursor();
+        let id = self.posts.get(post?)?.id.clone();
+        let card = match hit { Hit::Card(c) | Hit::Node(c, _) => c, Hit::None => 0 };
+        let version = self.version_of(&id)?;
+        Some((id, version, card))
     }
 
     fn sidebar_waits_for(&self, key: &VisualKey) -> bool {
@@ -882,13 +942,8 @@ impl App {
             self.leave_focus();
             return self.report_card_width();
         }
-        let (post, hit) = self.hit_at_cursor();
-        let Some(id) = post.and_then(|i| self.posts.get(i)).map(|p| p.id.clone()) else { return vec![] };
-        let card = match hit { Hit::Card(c) | Hit::Node(c, _) => c, Hit::None => 0 };
-        let Some(version) = self.version_of(&id) else { return vec![] };
-        let Some(cards) = self.loaded.get(&(id.clone(), version)).and_then(|loaded| loaded.cards.as_ref()) else { return vec![] };
-        let Some(selected) = cards.get(card) else { return vec![] };
-        let key = (id.clone(), version, card);
+        let Some(key) = self.card_at_cursor() else { return vec![] };
+        let Some(selected) = self.loaded.get(&(key.0.clone(), key.1)).and_then(|loaded| loaded.cards.as_ref()?.get(key.2)) else { return vec![] };
         let html_ready = matches!(selected.body, CardBody::Visual { source: VisualSource::Html(_), .. })
             && matches!(self.visuals.get(&key), Some(VisualState::Ready { .. }))
             && self.on_screen.iter().any(|shown| shown.key == key)
@@ -905,6 +960,7 @@ impl App {
             self.visuals.insert(key, state);
             self.visual_gen += 1;
         }
+        self.zoom_ahead = None;
         if let Some((scroll, cursor, follow)) = self.before_focus.take() {
             (self.scroll, self.cursor, self.follow) = (scroll, cursor, follow);
         }
@@ -1971,6 +2027,29 @@ mod tests {
         app.update(key(KeyCode::Char('z')));
         let slot = app.feed().slots.iter().find(|(key, _)| key == &visual).unwrap().1;
         assert_eq!((slot.cols, slot.rows), (feed_slot.cols, feed_slot.rows), "no frame at the zoomed size squeezed into the card");
+    }
+
+    #[test]
+    fn z_lays_out_a_zoom_made_ahead_from_its_first_frame() {
+        let mut app = booted(&fake());
+        let id = PostId::from("b");
+        let p = Post { parts: vec![Part::Mermaid { mermaid: "flowchart TD\n A-->B".into(), id: None }], ..post("b", "s1", 2, "") };
+        let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
+        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, &r));
+        let visual = (id, 2, 0);
+        app.visuals.insert(visual.clone(), VisualState::Ready { w: 360, h: 260, max_scale: 1.0 });
+        app.feed = None;
+        let post_index = app.posts.iter().position(|p| p.id == visual.0).unwrap();
+        app.cursor = app.feed().starts[post_index];
+        let fx = app.after_draw();
+        let target = app.zoom_target();
+        assert!(fx.contains(&Effect::PrefetchZoom { key: visual.clone(), target }), "{fx:?}");
+        assert!(!app.after_draw().iter().any(|e| matches!(e, Effect::PrefetchZoom { .. })), "asked once");
+        let wide = target.width_px;
+        app.update(Msg::ZoomReady { key: visual.clone(), w: wide, h: wide / 2 });
+        app.update(key(KeyCode::Char('z')));
+        let slot = app.feed().slots.iter().find(|(key, _)| key == &visual).unwrap().1;
+        assert_eq!(slot.cols as u32 * app.cell_px.0 as u32, wide, "the first focused layout is already the zoomed size");
     }
 
     #[test]

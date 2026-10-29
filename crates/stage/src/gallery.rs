@@ -74,6 +74,14 @@ struct Unzoomed {
     img: Option<Img>,
 }
 
+/// A zoomed raster made ahead of `z` for the diagram under the cursor: its pixels wait
+/// in shared memory until focus opens on it (then they're shown in that first frame).
+struct Prefetch {
+    key: VisualKey,
+    made_for: RasterTarget,
+    done: Option<(String, u32, u32)>,
+}
+
 /// The connection to the shared helper (see `stage-helper --serve`).
 struct Helper {
     stream: UnixStream,
@@ -101,6 +109,9 @@ pub struct Gallery {
     /// rasterized for the current target only when on screen (or focused).
     rastered: HashMap<VisualKey, RasterTarget>,
     zoom: Option<Unzoomed>,
+    prefetch: Option<Prefetch>,
+    /// Prefetched zoomed pixels to show at the next `place`, the first frame of focus.
+    ready_zoom: Option<(VisualKey, (String, u32, u32))>,
     /// Images to delete at the next `place` (which has the terminal).
     dead: Vec<u32>,
     cache: PathBuf,
@@ -199,6 +210,8 @@ impl Gallery {
             focused: None,
             rastered: HashMap::new(),
             zoom: None,
+            prefetch: None,
+            ready_zoom: None,
             dead: Vec::new(),
             cache,
             stage,
@@ -393,6 +406,16 @@ impl Gallery {
         }
         self.target = target;
         self.focused = focused.cloned();
+        if let Some(ahead) = self.prefetch.take_if(|ahead| focused == Some(&ahead.key)) {
+            if ahead.made_for == self.raster_target(&ahead.key) {
+                // Made for exactly this: no raster job; a pending one lands as the focused raster.
+                self.zoom = Some(Unzoomed { key: ahead.key.clone(), made_for: self.rastered.get(&ahead.key).copied(), img: None });
+                self.rastered.insert(ahead.key.clone(), ahead.made_for);
+                self.ready_zoom = ahead.done.map(|done| (ahead.key, done));
+            } else if let Some((shm, ..)) = ahead.done {
+                kitty::unlink(&shm);
+            }
+        }
         if let Some(zoom) = self.zoom.take_if(|zoom| focused != Some(&zoom.key)) {
             if let Some(zoomed) = zoom.img.and_then(|img| self.images.insert(zoom.key.clone(), img)) {
                 self.dead.extend([Some(zoomed.id), zoomed.previous].into_iter().flatten());
@@ -430,7 +453,25 @@ impl Gallery {
             self.zoom = Some(Unzoomed { key: key.clone(), made_for: self.rastered.get(key).copied(), img: None });
         }
         self.rastered.insert(key.clone(), made_for);
-        let (tx, key, (width, cell, zoom)) = (self.tx.clone(), key.clone(), made_for);
+        self.spawn_raster(key.clone(), svg, made_for);
+    }
+
+    /// Make the zoomed raster for `key` at `target` ahead of `z` (one at a time).
+    pub fn prefetch_zoom(&mut self, key: VisualKey, target: Target) {
+        let made_for = (target.width_px, target.cell_px, true);
+        if self.focused.is_some() || self.prefetch.as_ref().is_some_and(|ahead| ahead.key == key && ahead.made_for == made_for) {
+            return;
+        }
+        let Some(svg) = self.svgs.get(&key).cloned() else { return };
+        if let Some((shm, ..)) = self.prefetch.take().and_then(|ahead| ahead.done) {
+            kitty::unlink(&shm);
+        }
+        self.prefetch = Some(Prefetch { key: key.clone(), made_for, done: None });
+        self.spawn_raster(key, svg, made_for);
+    }
+
+    fn spawn_raster(&self, key: VisualKey, svg: String, made_for: RasterTarget) {
+        let (tx, (width, cell, zoom)) = (self.tx.clone(), made_for);
         thread::spawn(move || {
             let t0 = std::time::Instant::now();
             let raster = match zoom {
@@ -526,6 +567,21 @@ impl Gallery {
                 msgs.extend(self.pages.drain().map(|(_, key)| Msg::VisualFailed { key, reason: "stage-helper stopped".into() }));
                 msgs
             }
+            Gfx::Raster { key, made_for, done }
+                if self.focused.as_ref() != Some(&key)
+                    && self.prefetch.as_ref().is_some_and(|ahead| ahead.key == key && ahead.made_for == made_for && ahead.done.is_none()) =>
+            {
+                match done {
+                    Ok((shm, w, h)) => {
+                        self.prefetch.as_mut().expect("checked").done = Some((shm, w, h));
+                        vec![Msg::ZoomReady { key, w, h }]
+                    }
+                    Err(_) => {
+                        self.prefetch = None;
+                        vec![]
+                    }
+                }
+            }
             Gfx::Raster { key, made_for, done } if made_for != self.raster_target(&key) => {
                 // Made for an earlier width: drop it, and let `place` ask again if it's on screen.
                 if let Ok((shm, ..)) = done { kitty::unlink(&shm); }
@@ -593,6 +649,13 @@ impl Gallery {
     /// Match kitty placements to what's on screen this frame. Call between a
     /// frame's synchronized-output brackets, after ratatui drew it.
     pub fn place(&mut self, out: &mut impl Write, on_screen: &[OnScreen]) {
+        if let Some((key, (shm, w, h))) = self.ready_zoom.take() {
+            if let Some(zoom) = self.zoom.as_mut().filter(|zoom| zoom.key == key && zoom.img.is_none()) {
+                zoom.img = self.images.remove(&key);
+            }
+            // The app already laid the card out at this size (`Msg::ZoomReady`).
+            let _ = self.show(out, key, &shm, (w, h), None, None);
+        }
         // Diagrams on screen (only the focused one while focused) at the current target.
         for o in on_screen {
             if self.focused.as_ref().is_none_or(|focused| focused == &o.key) {
@@ -667,6 +730,10 @@ impl Gallery {
         self.focused = focused.cloned();
         // The terminal dropped every image: diagrams rasterize again as they come on screen.
         self.rastered.clear();
+        let ahead = self.prefetch.take().and_then(|ahead| ahead.done);
+        for (shm, ..) in ahead.into_iter().chain(self.ready_zoom.take().map(|(_, done)| done)) {
+            kitty::unlink(&shm);
+        }
         if let Some(zoom) = self.zoom.as_mut() {
             zoom.made_for = None;
             if let Some(img) = zoom.img.as_mut() {
@@ -922,6 +989,26 @@ mod tests {
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains(&format!("a=p,i={feed_id},")) && s.contains(&format!("a=d,d=i,i={zoomed_id},q=2")), "{s}");
         assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "the feed pixels are still right: no raster");
+    }
+
+    #[test]
+    fn a_zoom_made_ahead_shows_in_the_first_focused_frame() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let feed = Target { width_px: 800, max_height_px: 400, cell_px: (1, 1) };
+        let focus = Target { width_px: 1000, ..feed };
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), feed);
+        let key: VisualKey = ("chart".into(), 1, 0);
+        gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
+        gallery.prefetch_zoom(key.clone(), focus);
+        let (key_, made_for, done) = next_raster(&rx);
+        assert_eq!(made_for, (1000, (1, 1), true));
+        assert!(matches!(gallery.handle(&mut Vec::new(), Gfx::Raster { key: key_, made_for, done }).as_slice(), [Msg::ZoomReady { w: 1000, h: 500, .. }]));
+        gallery.retarget(focus, Some(&key));
+        let mut out = Vec::new();
+        gallery.place(&mut out, &[OnScreen { key: key.clone(), col: 0, row: 0, cols: 1000, top: 0, rows: 500, total: 500, px: (1000, 500) }]);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("s=1000,v=500") && s.contains("a=p,") && s.contains("w=1000,h=500"), "{s}");
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "focus starts no raster: it was made ahead");
     }
 
     #[test]
