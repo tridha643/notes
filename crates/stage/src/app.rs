@@ -35,7 +35,7 @@ pub struct Feed {
 
 /// Everything the feed reads: per post (id, version, fold generation, built),
 /// width, page height, cell px, and the comment and visual generations.
-type FeedKey = (Vec<(PostId, u64, u64, bool)>, u16, u16, (u16, u16), u64, u64);
+type FeedKey = (Vec<(PostId, u64, u64, bool)>, u16, u16, (u16, u16), u64, u64, Option<(PostId, usize)>);
 
 /// One visual card: (post, version, card index).
 pub type VisualKey = (PostId, u64, usize);
@@ -156,7 +156,7 @@ pub struct Loaded {
 }
 
 /// Everything a layout reads: version, width, height, cell px, comment, fold and visual generations.
-type LaidKey = (u64, u16, u16, (u16, u16), u64, u64, u64);
+type LaidKey = (u64, u16, u16, (u16, u16), u64, u64, u64, Option<usize>);
 
 /// Per post: folds, a pinned version, and the post's own layout cache.
 #[derive(Default)]
@@ -208,6 +208,10 @@ pub struct App {
     /// Feed scroll (first line on screen) and cursor line.
     pub scroll: usize,
     pub cursor: usize,
+    /// The post and card isolated in the full-width focus view.
+    pub focused_card: Option<(PostId, usize)>,
+    /// Feed position to restore when the focus view closes.
+    before_focus: Option<(usize, usize)>,
     feed: Option<(FeedKey, Feed)>,
     /// A post to bring to the top on the next layout (a sidebar pick, a follow).
     jump: Option<PostId>,
@@ -260,6 +264,8 @@ impl App {
             on_screen: Vec::new(),
             scroll: 0,
             cursor: 0,
+            focused_card: None,
+            before_focus: None,
             feed: None,
             jump: None,
             remembered: HashMap::new(),
@@ -280,10 +286,11 @@ impl App {
 
     /// Pixel budget for visual cards at the current pane size.
     pub fn target(&self) -> Target {
-        let inner = ui::geometry(self.size).main.width.saturating_sub(5).max(1) as u32;
+        let inner = ui::geometry_for(self).main.width.saturating_sub(5).max(1) as u32;
+        let rows = if self.focused_card.is_some() { self.page().saturating_sub(3) } else { self.page() / 2 };
         Target {
             width_px: inner * self.cell_px.0 as u32,
-            max_height_px: (self.page() as u32 / 2).max(1) * self.cell_px.1 as u32,
+            max_height_px: rows.max(1) as u32 * self.cell_px.1 as u32,
         }
     }
 
@@ -322,7 +329,7 @@ impl App {
                 self.size = (w, h);
                 let mut fx = vec![Effect::Redraw];
                 // A card's text width: the feed column less its border and padding.
-                let cols = ui::geometry(self.size).main.width.saturating_sub(5);
+                let cols = ui::geometry_for(self).main.width.saturating_sub(5);
                 if cols != self.card_cols {
                     self.card_cols = cols;
                     fx.push(Effect::Request(StageRequest::CardCols(cols)));
@@ -391,6 +398,8 @@ impl App {
             };
             self.remembered.insert(old, r);
         }
+        self.focused_card = None;
+        self.before_focus = None;
         self.open = Some(id.clone());
         self.feed = None;
         self.jump = None;
@@ -504,16 +513,20 @@ impl App {
         let cards = self.loaded.get(&(id.clone(), version))?.cards.as_ref()?;
         let (cell, visuals) = (self.cell_px, &self.visuals);
         let view = self.views.entry(id.clone()).or_default();
-        let key = (version, width, page, cell, self.comments_gen, view.fold_gen, self.visual_gen);
+        let selected = self.focused_card.as_ref().filter(|(post, _)| post == id).map(|(_, card)| *card);
+        let key = (version, width, page, cell, self.comments_gen, view.fold_gen, self.visual_gen, selected);
         if view.laid.as_ref().is_none_or(|(k, _)| *k != key) {
             let inner = width.saturating_sub(4).max(1);
+            let rows = if selected.is_some() { page.saturating_sub(3) } else { page / 2 };
             let fit = |c: usize| match visuals.get(&(id.clone(), version, c)) {
-                Some(VisualState::Ready { w, h, max_scale }) => fit_cells((*w, *h), *max_scale, inner, page / 2, cell),
+                Some(VisualState::Ready { w, h, max_scale }) => fit_cells((*w, *h), *max_scale, inner, rows, cell),
                 Some(VisualState::Failed(why)) => Fit::Failed(why.clone()),
                 // Hold about the room a diagram or page usually takes.
                 Some(VisualState::Pending) | None => Fit::Pending { rows: (page / 3).clamp(3, 12) },
             };
-            view.laid = Some((key, cards::layout(cards, &comments, width, &view.folds, &fit)));
+            let empty = Vec::new();
+            let comments = if selected.is_some() { &empty } else { &comments };
+            view.laid = Some((key, cards::layout_selected(cards, comments, width, &view.folds, &fit, selected)));
         }
         view.laid.as_ref().map(|(_, l)| l)
     }
@@ -522,7 +535,7 @@ impl App {
     /// A rebuild (a post loading above, a resize rewrapping everything, a fold)
     /// keeps the line under the cursor where it was on screen.
     pub fn feed(&mut self) -> &Feed {
-        let width = ui::geometry(self.size).main.width.saturating_sub(1);
+        let width = ui::geometry_for(self).main.width.saturating_sub(1);
         let page = self.page() as u16;
         let posts: Vec<(PostId, u64, u64, bool)> = self
             .posts
@@ -534,7 +547,7 @@ impl App {
                 Some((p.id.clone(), v, fold_gen, built))
             })
             .collect();
-        let key: FeedKey = (posts.clone(), width, page, self.cell_px, self.comments_gen, self.visual_gen);
+        let key: FeedKey = (posts.clone(), width, page, self.cell_px, self.comments_gen, self.visual_gen, self.focused_card.clone());
         if self.feed.as_ref().is_none_or(|(k, _)| *k != key) {
             // Where the cursor was: which post, how far into it, how far down the screen.
             let anchor = self.feed.as_ref().and_then(|(_, f)| {
@@ -544,6 +557,9 @@ impl App {
             let mut feed = Feed::default();
             for (i, (id, version, _, _)) in posts.iter().enumerate() {
                 feed.starts.push(feed.lines.len());
+                if self.focused_card.as_ref().is_some_and(|(post, _)| post != id) {
+                    continue;
+                }
                 feed.lines.push(self.header(i));
                 feed.hits.push((i, Hit::None));
                 let start = feed.lines.len();
@@ -594,7 +610,7 @@ impl App {
     }
 
     fn page(&self) -> usize {
-        ui::geometry(self.size).main.height.saturating_sub(1).max(1) as usize
+        ui::geometry_for(self).main.height.saturating_sub(1).max(1) as usize
     }
 
     /// The shown post follows the cursor through the feed.
@@ -680,6 +696,38 @@ impl App {
 
     // ---- Input ------------------------------------------------------------------
 
+    /// `z` focuses the card at the cursor; `z` or Escape restores the feed.
+    fn toggle_card_focus(&mut self) -> Vec<Effect> {
+        if self.focused_card.is_some() {
+            self.focused_card = None;
+            self.feed = None;
+            if let Some((scroll, cursor)) = self.before_focus.take() {
+                (self.scroll, self.cursor) = (scroll, cursor);
+            }
+        } else {
+            let (post, hit) = self.hit_at_cursor();
+            let Some(id) = post.and_then(|i| self.posts.get(i)).map(|p| p.id.clone()) else { return vec![] };
+            let card = match hit { Hit::Card(c) | Hit::Node(c, _) => c, Hit::None => 0 };
+            let Some(version) = self.version_of(&id) else { return vec![] };
+            let Some(cards) = self.loaded.get(&(id.clone(), version)).and_then(|loaded| loaded.cards.as_ref()) else { return vec![] };
+            if card >= cards.len() { return vec![]; }
+            self.before_focus = Some((self.scroll, self.cursor));
+            self.focused_card = Some((id, card));
+            self.follow = false;
+            self.feed = None;
+            self.scroll = 0;
+            self.cursor = 0;
+            self.follow_cursor();
+        }
+        let cols = ui::geometry_for(self).main.width.saturating_sub(5);
+        if cols != self.card_cols {
+            self.card_cols = cols;
+            vec![Effect::Request(StageRequest::CardCols(cols))]
+        } else {
+            vec![]
+        }
+    }
+
     fn key(&mut self, k: KeyEvent) -> Vec<Effect> {
         if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
             return vec![Effect::Quit];
@@ -746,11 +794,13 @@ impl App {
         let page = self.page() as isize;
         match k.code {
             KeyCode::Char('q') => vec![Effect::Quit],
-            KeyCode::Char('j') => {
+            KeyCode::Char('z') => self.toggle_card_focus(),
+            KeyCode::Esc if self.focused_card.is_some() => self.toggle_card_focus(),
+            KeyCode::Char('j') if self.focused_card.is_none() => {
                 self.step_post(true);
                 vec![]
             }
-            KeyCode::Char('k') => {
+            KeyCode::Char('k') if self.focused_card.is_none() => {
                 self.step_post(false);
                 vec![]
             }
@@ -924,7 +974,7 @@ impl App {
     }
 
     fn mouse(&mut self, m: MouseEvent) -> Vec<Effect> {
-        let g = ui::geometry(self.size);
+        let g = ui::geometry_for(self);
         let inside = |r: ratatui::layout::Rect| {
             m.column >= r.x && m.column < r.x + r.width && m.row >= r.y && m.row < r.y + r.height
         };
@@ -982,7 +1032,7 @@ impl App {
 
     /// A mouse position in the feed as (line, cell column inside the content area).
     fn feed_point(&mut self, column: u16, row: u16) -> (usize, u16) {
-        let g = ui::geometry(self.size);
+        let g = ui::geometry_for(self);
         let line = self.scroll + row.saturating_sub(g.main.y + 1) as usize;
         (line, column.saturating_sub(g.main.x + 1))
     }
@@ -1057,6 +1107,8 @@ impl App {
                 // The open session was deleted: drop it and open the newest.
                 if self.open.as_ref().is_some_and(|id| !self.sessions.iter().any(|s| &s.id == id)) {
                     (self.open, self.shown, self.feed) = (None, None, None);
+                    self.focused_card = None;
+                    self.before_focus = None;
                     self.posts.clear();
                     self.comments.clear();
                 }
@@ -1100,6 +1152,11 @@ impl App {
                     }
                 }
                 self.posts = posts;
+                if self.focused_card.as_ref().is_some_and(|(id, _)| !self.posts.iter().any(|p| &p.id == id)) {
+                    self.focused_card = None;
+                    self.before_focus = None;
+                    self.feed = None;
+                }
                 let target = match &self.shown {
                     Some(id) if !self.follow && self.posts.iter().any(|p| &p.id == id) => Some(id.clone()),
                     Some(id) if !self.follow => {
@@ -1107,6 +1164,7 @@ impl App {
                         self.toast = Some(format!("post {id} was deleted"));
                         self.posts.last().map(|p| p.id.clone())
                     }
+                    _ if self.focused_card.is_some() => self.focused_card.as_ref().map(|(id, _)| id.clone()),
                     _ => self.posts.last().map(|p| p.id.clone()),
                 };
                 // The feed shows every post, so load them all.
@@ -1438,6 +1496,46 @@ mod tests {
         let _ = app.feed();
         assert_eq!(app.shown, before.0);
         assert_eq!(app.cursor - app.scroll, before.1, "the cursor's row on screen survives a rewrap");
+    }
+
+    #[test]
+    fn focus_isolates_the_selected_card_and_restores_the_feed() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = booted(&fake());
+        let id = PostId::from("b");
+        let post_key = (id.clone(), 2);
+        let p = Post {
+            parts: vec![
+                Part::Markdown { markdown: "first card\n\n".repeat(50), id: None },
+                Part::Markdown { markdown: "second card".into(), id: None },
+            ],
+            ..post("b", "s1", 2, "")
+        };
+        let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native; 2] };
+        app.loaded.get_mut(&post_key).unwrap().cards = Some(build_cards(&p, &r));
+        app.loaded.get_mut(&post_key).unwrap().post = Some(p);
+        app.feed = None;
+        let b = app.posts.iter().position(|post| post.id == id).unwrap();
+        let second = app.feed().hits.iter().position(|hit| *hit == (b, Hit::Card(1))).unwrap();
+        app.cursor = second;
+        app.scroll = second.saturating_sub(app.page() - 2).min(app.feed().lines.len().saturating_sub(app.page()));
+        let original = (app.scroll, app.cursor);
+        let normal_width = ui::geometry_for(&app).main.width;
+        app.update(key(KeyCode::Char('z')));
+        assert_eq!(app.focused_card, Some((id, 1)));
+        assert_eq!(ui::geometry_for(&app).main.width, app.size.0);
+        assert!(app.target().width_px > (normal_width as u32 - 5) * app.cell_px.0 as u32);
+        let feed = app.feed();
+        assert!(feed.lines.iter().any(|line| line.to_string().contains("second card")));
+        assert!(!feed.lines.iter().any(|line| line.to_string().contains("first card")));
+        assert!(feed.hits.contains(&(b, Hit::Card(1))));
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| ui::draw(f, &mut app)).unwrap();
+        app.update(key(KeyCode::Esc));
+        let _ = app.feed();
+        assert_eq!(app.focused_card, None);
+        assert_eq!((app.scroll, app.cursor), original);
+        assert!(app.feed().lines.iter().any(|line| line.to_string().contains("first card")));
     }
 
     #[test]

@@ -139,6 +139,17 @@ pub fn geometry((w, h): (u16, u16)) -> Geometry {
     }
 }
 
+/// Focus gives the selected card the whole pane instead of the session sidebar.
+pub fn geometry_for(app: &App) -> Geometry {
+    let mut g = geometry(app.size);
+    if app.focused_card.is_some() {
+        g.sidebar.width = 0;
+        g.main.x = 0;
+        g.main.width = app.size.0;
+    }
+    g
+}
+
 /// First sidebar row on screen, so the selection stays visible.
 pub fn sidebar_offset(app: &App, height: u16) -> usize {
     (app.sel + 1).saturating_sub(height as usize)
@@ -213,7 +224,7 @@ fn clip(s: &str, max: usize) -> String {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    let g = geometry(app.size);
+    let g = geometry_for(app);
     let open = app.open.as_ref().and_then(|id| app.sessions.iter().find(|s| &s.id == id));
     let mut head = vec![Span::styled(" stage", bold().fg(TEAL))];
     if let Some(s) = open {
@@ -248,6 +259,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 ("enter", "fold"),
                 ("/", "search"),
                 ("c", "comment"),
+                ("z", if app.focused_card.is_some() { "back" } else { "focus card" }),
                 ("r", "rename"),
                 ("d", "delete"),
                 (":", "command"),
@@ -382,6 +394,10 @@ fn main(f: &mut Frame, app: &mut App, area: Rect) {
         let at = app.shown_post().map(|p| when(p.updated_at)).unwrap_or_default();
         let by = agent.map(|a| format!(" · {}", crate::sanitize::sanitize(a))).unwrap_or_default();
         spans.push(Span::styled(format!("  v{v}{pinned} · {at}{by}"), dim()));
+    }
+    if let Some((_, card)) = &app.focused_card {
+        let label = app.shown_cards().and_then(|cards| cards.get(*card)).map(|card| card.label.as_str()).unwrap_or("card");
+        spans.push(Span::styled(format!("  · {} · focus (z/esc to close)", clip(label, 24)), Style::new().fg(TEAL)));
     }
     if total > body.height as usize {
         let last = (scroll + body.height as usize).min(total);
