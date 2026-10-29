@@ -62,7 +62,9 @@ def run(n, home):
     raw = bytearray()
     # live: what kitty would show now (id -> placement), after places and deletes.
     sizes, placements, live, pending_keys, sent = {}, [], {}, list(keys), []
+    held = {}  # image id -> bytes the terminal stores (freed by d=I / d=A, not by d=i)
     final = None
+    memory = None
     quit_at = None
     while True:
         now = time.monotonic() - t0
@@ -88,6 +90,13 @@ def run(n, home):
                         shm_unlink(base64.b64decode(m.group(4)).decode())
                 if b"s" in k and b"i" in k:
                     sizes[int(k[b"i"])] = (int(k[b"s"]), int(k[b"v"]))
+                    held[int(k[b"i"])] = int(k[b"s"]) * int(k[b"v"]) * 4
+                elif k.get(b"t") == b"f" and b"i" in k:
+                    held[int(k[b"i"])] = 0  # a PNG file; size unknown here
+                if k.get(b"a") == b"d" and k.get(b"d") == b"I" and b"i" in k:
+                    held.pop(int(k[b"i"]), None)
+                if k.get(b"a") == b"d" and k.get(b"d") == b"A":
+                    held.clear()
                 if k.get(b"a") == b"d" and b"i" in k:
                     live.pop(int(k[b"i"]), None)
                 if k.get(b"a") in (b"p", b"T") and b"i" in k and b"c" in k:
@@ -104,6 +113,10 @@ def run(n, home):
             sent.append({"key": name, "t_ms": round(now * 1000)})
         if quit_at is None and now >= a.quit_at:
             final = [dict(p) for p in live.values()]
+            rss = lambda pids: sum(int(x) for x in os.popen(f"ps -o rss= -p {','.join(pids)} 2>/dev/null").read().split()) if pids else 0
+            helpers = os.popen(f"pgrep -f '{home}/Library/Caches/stage/'").read().split()
+            memory = {"stage_rss_mb": round(rss([str(pid)]) / 1024, 1), "helper_rss_mb": round(rss(helpers) / 1024, 1),
+                      "terminal_images": len(held), "terminal_image_mb": round(sum(held.values()) / 2**20, 1)}
             os.write(fd, b"q")
             quit_at = now
         if quit_at is not None and now > quit_at + 0.5:
@@ -136,7 +149,7 @@ def run(n, home):
               "all_one_to_one": all(p["one_to_one"] for p in placements),
               # The proof for geometry: what is on screen at the end, not what was ever sent.
               "on_screen_at_end": [{k: p[k] for k in ("id", "row", "col", "cells", "src", "one_to_one")} for p in final],
-              "keys": after_keys, "placements": placements, "evidence": ev}
+              "memory_at_quit": memory, "keys": after_keys, "placements": placements, "evidence": ev}
     with open(f"{ev}/result.json", "w") as f:
         json.dump(result, f, indent=1)
     print(json.dumps({k: v for k, v in result.items() if k != "placements"}))

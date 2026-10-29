@@ -157,6 +157,14 @@ pub enum Mode {
     Delete { what: String, request: StageRequest },
 }
 
+/// The diagram whose zoomed raster was asked for ahead of `z`, for which target,
+/// and its size once it's ready.
+struct ZoomAhead {
+    key: VisualKey,
+    target: Target,
+    size: Option<(u32, u32)>,
+}
+
 pub struct Loaded {
     pub post: Option<Post>,
     pub render: Option<PostRender>,
@@ -232,9 +240,7 @@ pub struct App {
     /// A focused diagram's feed-size pixels: the gallery puts them back when focus
     /// closes, and the layout must match them in that same frame.
     unzoomed: Option<(VisualKey, VisualState)>,
-    /// The diagram whose zoomed raster was asked for ahead of `z`, for which
-    /// target, and its size once it's ready.
-    zoom_ahead: Option<(VisualKey, Target, Option<(u32, u32)>)>,
+    zoom_ahead: Option<ZoomAhead>,
     feed: Option<(FeedKey, Feed)>,
     /// A post to bring to the top on the next layout (a sidebar pick, a follow).
     jump: Option<PostId>,
@@ -462,8 +468,8 @@ impl App {
                 fx
             }
             Msg::ZoomReady { key, w, h } => {
-                if let Some((_, _, size)) = self.zoom_ahead.as_mut().filter(|(ahead, ..)| *ahead == key) {
-                    *size = Some((w, h));
+                if let Some(ahead) = self.zoom_ahead.as_mut().filter(|ahead| ahead.key == key) {
+                    ahead.size = Some((w, h));
                 }
                 vec![]
             }
@@ -816,8 +822,8 @@ impl App {
             .and_then(|key| Some((key.clone(), self.visuals.get(&key)?.clone())));
         // Its zoomed raster was made ahead: lay it out at that size from the first frame.
         let target = self.zoom_target();
-        if let Some((ahead, _, Some((w, h)))) = self.zoom_ahead.take().filter(|(ahead, at, _)| Some(ahead) == key.as_ref() && *at == target) {
-            self.visuals.insert(ahead, VisualState::Ready { w, h, max_scale: 1.0 });
+        if let Some(ZoomAhead { key, size: Some((w, h)), .. }) = self.zoom_ahead.take().filter(|ahead| Some(&ahead.key) == key.as_ref() && ahead.target == target) {
+            self.visuals.insert(key, VisualState::Ready { w, h, max_scale: 1.0 });
             self.visual_gen += 1;
         }
         self.focused_card = Some((id, card));
@@ -884,10 +890,10 @@ impl App {
         let ready = matches!(self.visual_source(&key), Some(VisualSource::Mermaid(_)))
             && matches!(self.visuals.get(&key), Some(VisualState::Ready { .. }));
         let target = self.zoom_target();
-        if !ready || self.zoom_ahead.as_ref().is_some_and(|(ahead, at, _)| *ahead == key && *at == target) {
+        if !ready || self.zoom_ahead.as_ref().is_some_and(|ahead| ahead.key == key && ahead.target == target) {
             return None;
         }
-        self.zoom_ahead = Some((key.clone(), target, None));
+        self.zoom_ahead = Some(ZoomAhead { key: key.clone(), target, size: None });
         Some(Effect::PrefetchZoom { key, target })
     }
 

@@ -1,9 +1,9 @@
 # Card focus (`z`, `Esc`)
 
 `z` shows the card under the cursor alone, full width, without the sidebar; `z` or `Esc`
-returns to the feed where it was. A focused Mermaid diagram is zoomed: re-rasterized to fill
-the pane width at device pixels (vector, so crisp at any size), shown 1:1 at its feed size
-until that lands. Leaving focus puts the feed-size pixels back in the same frame. An HTML
+returns to the feed where it was. A focused Mermaid diagram is zoomed: re-rasterized as large
+as the pane allows in both directions (nothing to scroll) at device pixels, made ahead while
+the cursor rests on it so `z` shows it in its first frame. Leaving focus puts the feed-size pixels back in the same frame. An HTML
 card waits for a full-width frame.
 
 ## Sub-features
@@ -33,8 +33,8 @@ Zoom (the last post's diagram is under the cursor at open):
 drive.py --session <fixture> --mode warm --runs 4 --keys 'z@1.0,z@1.8' --quit-at 2.8
 ```
 
-Proof, from `target/verify/warm-N/result.json` `placements`: after the first `z`, an image at
-the full content width (115 cells at 120x40) with `one_to_one: true` within ~50 ms; after the
+Proof, from `target/verify/warm-N/result.json` `placements`: after the first `z`, one image
+whose `src` is the whole raster (no crop) with `one_to_one: true` within ~30 ms; after the
 second `z`, the original image id back at its feed size within ~30 ms, and no placement in
 between with `one_to_one: false`.
 

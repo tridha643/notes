@@ -39,16 +39,18 @@ pub enum Gfx {
     Raster { key: VisualKey, made_for: RasterTarget, done: Result<(String, u32, u32), String> },
 }
 
-/// What a Mermaid raster depends on: the card width and the cell size, both in px,
-/// and whether it's zoomed (focused: fills the width instead of stopping at 2x).
-pub type RasterTarget = (u32, (u16, u16), bool);
+/// What a Mermaid raster depends on: the width and height it must fit, the cell
+/// size (all px), and whether it's zoomed (focused: as large as fits the pane,
+/// instead of stopping at 2x the diagram's own size).
+pub type RasterTarget = (u32, u32, (u16, u16), bool);
 
 /// CSS px → device px for helper renders (Retina).
 const SCALE: f64 = 2.0;
 /// Limit very large diagrams without shrinking ordinary tall ones to the viewport.
 const MAX_MERMAID_HEIGHT_PX: u32 = 4096;
-/// A zoomed (focused) diagram fills the width, so it may be taller.
-const MAX_ZOOMED_HEIGHT_PX: u32 = 8192;
+/// Diagram pixels the terminal holds for stage. Past this, the diagrams shown least
+/// recently (and not on screen) are dropped; they rasterize again from their SVG if seen.
+const DIAGRAM_BUDGET_BYTES: u64 = 128 << 20;
 
 struct Img {
     id: u32,
@@ -63,6 +65,8 @@ struct Img {
     /// The image file these pixels came from (PNG sent as a file, or decoded by
     /// the helper), to send again after a clear.
     file: Option<PathBuf>,
+    /// The `place` call that last showed it, to drop the least recent first.
+    shown_at: u64,
 }
 
 /// The focused diagram's feed-size pixels while its zoomed raster is shown, so
@@ -114,6 +118,8 @@ pub struct Gallery {
     ready_zoom: Option<(VisualKey, (String, u32, u32))>,
     /// Images to delete at the next `place` (which has the terminal).
     dead: Vec<u32>,
+    /// Counts `place` calls, for `Img::shown_at`.
+    frame: u64,
     cache: PathBuf,
     /// The session folder; assets are read straight from its `assets/` (notesd only writes it).
     stage: PathBuf,
@@ -146,7 +152,25 @@ fn fonts() -> Arc<resvg::usvg::fontdb::Database> {
 /// on a transparent background so glass shows through. The canvas is padded
 /// (diagram centered) to whole `cell` px, so kitty shows it 1:1 instead of
 /// stretching it to the cells it rounds up to.
-pub fn rasterize(svg: &str, width_px: u32, height_px: u32, (cw, ch): (u16, u16), max_scale: f32) -> Result<(Vec<u8>, u32, u32), String> {
+pub fn rasterize(svg: &str, width_px: u32, height_px: u32, cell: (u16, u16), max_scale: f32) -> Result<(Vec<u8>, u32, u32), String> {
+    let (tree, at, pw, ph) = fit_svg(svg, width_px, height_px, cell, max_scale)?;
+    let mut px = vec![0; (pw * ph * 4) as usize];
+    draw(&tree, at, &mut px, (pw, ph))?;
+    Ok((px, pw, ph))
+}
+
+/// `rasterize` straight into a new shared-memory object for the terminal, so no
+/// diagram-sized buffer is ever allocated (or kept by malloc) in stage itself.
+fn rasterize_shm(svg: &str, width_px: u32, height_px: u32, cell: (u16, u16), max_scale: f32) -> Result<(String, u32, u32), String> {
+    let (tree, at, pw, ph) = fit_svg(svg, width_px, height_px, cell, max_scale)?;
+    let mut drawn = Ok(());
+    let shm = kitty::shm_fill((pw * ph * 4) as usize, |px| drawn = draw(&tree, at, px, (pw, ph))).map_err(|e| format!("shared memory: {e}"))?;
+    drawn.inspect_err(|_| kitty::unlink(&shm))?;
+    Ok((shm, pw, ph))
+}
+
+/// The parsed diagram, where it's drawn, and the canvas: whole cells, diagram centered.
+fn fit_svg(svg: &str, width_px: u32, height_px: u32, (cw, ch): (u16, u16), max_scale: f32) -> Result<(resvg::usvg::Tree, resvg::tiny_skia::Transform, u32, u32), String> {
     let opt = resvg::usvg::Options { fontdb: fonts(), ..Default::default() };
     let tree = resvg::usvg::Tree::from_str(svg, &opt).map_err(|e| format!("svg: {e}"))?;
     let size = tree.size();
@@ -157,15 +181,23 @@ pub fn rasterize(svg: &str, width_px: u32, height_px: u32, (cw, ch): (u16, u16),
     );
     let (cw, ch) = (cw.max(1) as u32, ch.max(1) as u32);
     let (pw, ph) = (w.div_ceil(cw) * cw, h.div_ceil(ch) * ch);
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(pw, ph).ok_or("empty diagram")?;
     let at = resvg::tiny_skia::Transform::from_scale(scale, scale).post_translate(((pw - w) / 2) as f32, ((ph - h) / 2) as f32);
-    resvg::render(&tree, at, &mut pixmap.as_mut());
+    Ok((tree, at, pw, ph))
+}
+
+/// Draw onto `px` (zeroed: transparent, so glass shows through) as straight RGBA.
+fn draw(tree: &resvg::usvg::Tree, at: resvg::tiny_skia::Transform, px: &mut [u8], (w, h): (u32, u32)) -> Result<(), String> {
+    resvg::render(tree, at, &mut resvg::tiny_skia::PixmapMut::from_bytes(px, w, h).ok_or("empty diagram")?);
     // tiny-skia is premultiplied; kitty wants straight RGBA.
-    let rgba = pixmap.pixels().iter().flat_map(|p| {
-        let c = p.demultiply();
-        [c.red(), c.green(), c.blue(), c.alpha()]
-    });
-    Ok((rgba.collect(), pw, ph))
+    for p in px.as_chunks_mut::<4>().0 {
+        let a = p[3] as u32;
+        if a != 0 && a != 255 {
+            for c in &mut p[..3] {
+                *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// One `STAGE_TRACE` line, when tracing.
@@ -213,6 +245,7 @@ impl Gallery {
             prefetch: None,
             ready_zoom: None,
             dead: Vec::new(),
+            frame: 0,
             cache,
             stage,
             trace: std::env::var_os("STAGE_TRACE").and_then(|p| std::fs::File::create(p).ok()),
@@ -429,7 +462,11 @@ impl Gallery {
     }
 
     fn raster_target(&self, key: &VisualKey) -> RasterTarget {
-        (self.target.width_px, self.target.cell_px, self.focused.as_ref() == Some(key))
+        match self.focused.as_ref() == Some(key) {
+            // The whole diagram in the pane: no scrolling a zoomed one.
+            true => (self.target.width_px, self.target.max_height_px, self.target.cell_px, true),
+            false => (self.target.width_px, MAX_MERMAID_HEIGHT_PX, self.target.cell_px, false),
+        }
     }
 
     /// A request about an existing page (its id is the page id, not a new one).
@@ -449,7 +486,7 @@ impl Gallery {
             return;
         }
         let Some(svg) = self.svgs.get(key).cloned() else { return };
-        if made_for.2 && self.zoom.as_ref().is_none_or(|zoom| &zoom.key != key) {
+        if made_for.3 && self.zoom.as_ref().is_none_or(|zoom| &zoom.key != key) {
             self.zoom = Some(Unzoomed { key: key.clone(), made_for: self.rastered.get(key).copied(), img: None });
         }
         self.rastered.insert(key.clone(), made_for);
@@ -458,7 +495,7 @@ impl Gallery {
 
     /// Make the zoomed raster for `key` at `target` ahead of `z` (one at a time).
     pub fn prefetch_zoom(&mut self, key: VisualKey, target: Target) {
-        let made_for = (target.width_px, target.cell_px, true);
+        let made_for = (target.width_px, target.max_height_px, target.cell_px, true);
         if self.focused.is_some() || self.prefetch.as_ref().is_some_and(|ahead| ahead.key == key && ahead.made_for == made_for) {
             return;
         }
@@ -471,19 +508,13 @@ impl Gallery {
     }
 
     fn spawn_raster(&self, key: VisualKey, svg: String, made_for: RasterTarget) {
-        let (tx, (width, cell, zoom)) = (self.tx.clone(), made_for);
+        let (tx, (width, height, cell, zoom)) = (self.tx.clone(), made_for);
         thread::spawn(move || {
             let t0 = std::time::Instant::now();
-            let raster = match zoom {
-                true => rasterize(&svg, width, MAX_ZOOMED_HEIGHT_PX, cell, f32::INFINITY),
-                false => rasterize(&svg, width, MAX_MERMAID_HEIGHT_PX, cell, SCALE as f32),
-            };
+            let done = rasterize_shm(&svg, width, height, cell, if zoom { f32::INFINITY } else { SCALE as f32 });
             if std::env::var_os("STAGE_HELPER_TRACE").is_some() {
                 eprintln!("resvg {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0);
             }
-            let done = raster.and_then(|(px, w, h)| {
-                kitty::shm_write(&px).map(|shm| (shm, w, h)).map_err(|e| format!("shared memory: {e}"))
-            });
             let _ = tx.send(Msg::Gfx(Gfx::Raster { key, made_for, done }));
         });
     }
@@ -501,7 +532,7 @@ impl Gallery {
         let img = self.images.entry(key.clone()).or_insert_with(|| {
             let id = *next_id;
             *next_id += 1;
-            Img { id, w, h, placed: None, previous: None, page: None, paused: false, file: None }
+            Img { id, w, h, placed: None, previous: None, page: None, paused: false, file: None, shown_at: 0 }
         });
         img.file = Some(path.to_owned());
         let _ = out.write_all(&kitty::transmit_png(img.id, path));
@@ -520,7 +551,7 @@ impl Gallery {
         let img = self.images.entry(key.clone()).or_insert_with(|| {
             let id = *next_id;
             *next_id += 1;
-            Img { id, w, h, placed: None, previous: None, page, paused: false, file: None }
+            Img { id, w, h, placed: None, previous: None, page, paused: false, file: None, shown_at: 0 }
         });
         if file.is_some() {
             img.file = file;
@@ -593,7 +624,7 @@ impl Gallery {
             Gfx::Raster { key, made_for, done } => match done {
                 Ok((shm, w, h)) => {
                     // A zoomed raster gets its own image; the feed-size one waits for focus to close.
-                    if let Some(zoom) = self.zoom.as_mut().filter(|zoom| made_for.2 && zoom.key == key && zoom.img.is_none()) {
+                    if let Some(zoom) = self.zoom.as_mut().filter(|zoom| made_for.3 && zoom.key == key && zoom.img.is_none()) {
                         zoom.img = self.images.remove(&key);
                     }
                     self.show(out, key, &shm, (w, h), None, None).into_iter().collect()
@@ -666,6 +697,9 @@ impl Gallery {
         let mut resume = Vec::new();
         for (key, img) in self.images.iter_mut() {
             let shown = on_screen.iter().find(|o| &o.key == key);
+            if shown.is_some() {
+                img.shown_at = self.frame;
+            }
             let wanted = shown.map(|o| {
                 crop(&Place { col: o.col, row: o.row, cols: o.cols, rows: o.rows, src: (0, o.top as u32, 0, o.total as u32) }, (img.w, img.h))
             });
@@ -715,11 +749,40 @@ impl Gallery {
         for id in self.dead.drain(..) {
             let _ = out.write_all(&kitty::delete(id));
         }
+        self.keep_diagrams_within_budget(out);
+        self.frame += 1;
         for page in pause {
             let _ = self.send(json!({"op": "html-pause", "id": page}));
         }
         for page in resume {
             let _ = self.send(json!({"op": "html-resume", "id": page}));
+        }
+    }
+
+    /// Drop the least recently shown diagrams that aren't on screen while the terminal
+    /// holds more diagram pixels than `DIAGRAM_BUDGET_BYTES`. No allocation unless over.
+    fn keep_diagrams_within_budget(&mut self, out: &mut impl Write) {
+        let bytes = |img: &Img| img.w as u64 * img.h as u64 * 4;
+        let mut held: u64 = self.images.iter().filter(|(key, _)| self.svgs.contains_key(*key)).map(|(_, img)| bytes(img)).sum();
+        if held <= DIAGRAM_BUDGET_BYTES {
+            return;
+        }
+        let mut idle: Vec<(u64, VisualKey)> = self.images.iter()
+            .filter(|(key, img)| self.svgs.contains_key(*key) && img.placed.is_none())
+            .map(|(key, img)| (img.shown_at, key.clone()))
+            .collect();
+        idle.sort_unstable();
+        for (_, key) in idle {
+            if held <= DIAGRAM_BUDGET_BYTES {
+                break;
+            }
+            let img = self.images.remove(&key).expect("listed above");
+            held -= bytes(&img);
+            for id in [Some(img.id), img.previous].into_iter().flatten() {
+                let _ = out.write_all(&kitty::delete(id));
+            }
+            self.rastered.remove(&key);
+            note(&mut self.trace, format_args!("evict {} ({} KB)", img.id, bytes(&img) / 1024));
         }
     }
 
@@ -850,7 +913,7 @@ mod tests {
         gallery.handle(&mut transmitted, frame(2, 800));
         let new_id = gallery.images[&key].id;
         assert_ne!(new_id, old_id);
-        assert!(!String::from_utf8_lossy(&transmitted).contains(&format!("a=d,d=i,i={old_id}")));
+        assert!(!String::from_utf8_lossy(&transmitted).contains(&format!("a=d,d=I,i={old_id}")));
         let mut still_old = Vec::new();
         gallery.place(&mut still_old, std::slice::from_ref(&old));
         assert!(still_old.is_empty(), "the old sidebar layout keeps the old pixels");
@@ -858,7 +921,7 @@ mod tests {
         let mut switched = Vec::new();
         gallery.place(&mut switched, &[OnScreen { col: 0, cols: 95, px: (800, 200), ..old }]);
         let output = String::from_utf8_lossy(&switched);
-        assert!(output.contains(&format!("a=d,d=i,i={old_id}")));
+        assert!(output.contains(&format!("a=d,d=I,i={old_id}")));
         assert!(output.contains(&format!("a=p,i={new_id}")));
     }
 
@@ -870,7 +933,7 @@ mod tests {
         let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), Target { width_px: 950, max_height_px: 400, cell_px: (10, 20) });
         let key: VisualKey = ("diagram".into(), 1, 0);
         let shms: Vec<String> = [(950, 400), (690, 300)].iter().map(|(w, h)| kitty::shm_write(&vec![0; w * h * 4]).unwrap()).collect();
-        let raster = |shm: &str, w, h| Gfx::Raster { key: key.clone(), made_for: (950, (10, 20), false), done: Ok((shm.to_owned(), w, h)) };
+        let raster = |shm: &str, w, h| Gfx::Raster { key: key.clone(), made_for: (950, MAX_MERMAID_HEIGHT_PX, (10, 20), false), done: Ok((shm.to_owned(), w, h)) };
         gallery.handle(&mut Vec::new(), raster(&shms[0], 950, 400));
         let at = OnScreen { key: key.clone(), col: 29, row: 7, cols: 69, top: 0, rows: 20, total: 20, px: (950, 400) };
         gallery.place(&mut Vec::new(), std::slice::from_ref(&at));
@@ -882,7 +945,7 @@ mod tests {
         assert!(out.is_empty(), "the layout still sizes the card for the wide pixels");
         gallery.place(&mut out, &[OnScreen { rows: 15, total: 15, px: (690, 300), ..at }]);
         let s = String::from_utf8_lossy(&out);
-        assert!(s.contains(&format!("a=d,d=i,i={wide_id}")) && s.contains(&format!("a=p,i={narrow_id},p=1,x=0,y=0,w=690,h=300,c=69,r=15")), "{s}");
+        assert!(s.contains(&format!("a=d,d=I,i={wide_id}")) && s.contains(&format!("a=p,i={narrow_id},p=1,x=0,y=0,w=690,h=300,c=69,r=15")), "{s}");
         shms.iter().for_each(|shm| kitty::unlink(shm)); // no terminal here to consume them
     }
 
@@ -918,7 +981,7 @@ mod tests {
         gallery.retarget(Target { width_px: 200, ..normal }, Some(&second));
         gallery.place(&mut Vec::new(), &shown(&[&second]));
         let (key, made_for, done) = next_raster(&rx);
-        assert_eq!((key, made_for), (second.clone(), (200, (1, 1), true)));
+        assert_eq!((key, made_for), (second.clone(), (200, 100, (1, 1), true)));
         unlink(done);
         assert!(rx.try_recv().is_err(), "nothing but the focused card renders during focus");
 
@@ -940,8 +1003,9 @@ mod tests {
     }
 
     #[test]
-    fn a_focused_diagram_fills_the_width_at_full_resolution() {
-        // Vector: zooming re-rasterizes instead of stopping at 2x the diagram's own size.
+    fn a_focused_diagram_fills_the_pane_at_full_resolution() {
+        // Vector: zooming re-rasterizes as large as the pane allows (width and height, so
+        // nothing to scroll) instead of stopping at 2x the diagram's own size.
         let (tx, rx) = std::sync::mpsc::channel();
         let target = Target { width_px: 1000, max_height_px: 400, cell_px: (1, 1) };
         let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), target);
@@ -957,7 +1021,7 @@ mod tests {
         let (_, _, done) = next_raster(&rx);
         let (shm, w, h) = done.unwrap();
         kitty::unlink(&shm);
-        assert_eq!((w, h), (1000, 500), "focused: the whole width");
+        assert_eq!((w, h), (800, 400), "focused: as large as fits the 1000x400 pane");
     }
 
     #[test]
@@ -979,15 +1043,15 @@ mod tests {
         gallery.handle(&mut Vec::new(), Gfx::Raster { key: key_, made_for, done });
         let zoomed_id = gallery.images[&key].id;
         let mut out = Vec::new();
-        gallery.place(&mut out, &[at((1000, 500))]);
+        gallery.place(&mut out, &[at((800, 400))]);
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains(&format!("a=p,i={zoomed_id},")) && s.contains(&format!("a=d,d=i,i={feed_id},p=1")), "zoomed shown, feed pixels hidden but kept: {s}");
-        assert!(!s.contains(&format!("a=d,d=i,i={feed_id},q=2")));
+        assert!(!s.contains(&format!("a=d,d=I,i={feed_id},q=2")));
         gallery.retarget(target, None);
         let mut out = Vec::new();
         gallery.place(&mut out, &[at((200, 100))]);
         let s = String::from_utf8_lossy(&out);
-        assert!(s.contains(&format!("a=p,i={feed_id},")) && s.contains(&format!("a=d,d=i,i={zoomed_id},q=2")), "{s}");
+        assert!(s.contains(&format!("a=p,i={feed_id},")) && s.contains(&format!("a=d,d=I,i={zoomed_id},q=2")), "{s}");
         assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "the feed pixels are still right: no raster");
     }
 
@@ -1001,14 +1065,39 @@ mod tests {
         gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
         gallery.prefetch_zoom(key.clone(), focus);
         let (key_, made_for, done) = next_raster(&rx);
-        assert_eq!(made_for, (1000, (1, 1), true));
-        assert!(matches!(gallery.handle(&mut Vec::new(), Gfx::Raster { key: key_, made_for, done }).as_slice(), [Msg::ZoomReady { w: 1000, h: 500, .. }]));
+        assert_eq!(made_for, (1000, 400, (1, 1), true));
+        assert!(matches!(gallery.handle(&mut Vec::new(), Gfx::Raster { key: key_, made_for, done }).as_slice(), [Msg::ZoomReady { w: 800, h: 400, .. }]));
         gallery.retarget(focus, Some(&key));
         let mut out = Vec::new();
-        gallery.place(&mut out, &[OnScreen { key: key.clone(), col: 0, row: 0, cols: 1000, top: 0, rows: 500, total: 500, px: (1000, 500) }]);
+        gallery.place(&mut out, &[OnScreen { key: key.clone(), col: 0, row: 0, cols: 800, top: 0, rows: 400, total: 400, px: (800, 400) }]);
         let s = String::from_utf8_lossy(&out);
-        assert!(s.contains("s=1000,v=500") && s.contains("a=p,") && s.contains("w=1000,h=500"), "{s}");
+        assert!(s.contains("s=800,v=400") && s.contains("a=p,") && s.contains("w=800,h=400"), "{s}");
         assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "focus starts no raster: it was made ahead");
+    }
+
+    #[test]
+    fn diagrams_past_the_budget_are_dropped_least_recent_first_and_come_back() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let target = Target { width_px: 4096, max_height_px: 400, cell_px: (1, 1) };
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), target);
+        // 16 MB each: nine of them are past the 128 MB budget.
+        let keys: Vec<VisualKey> = (0..9).map(|i| (format!("d{i}").into(), 1, 0)).collect();
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="2048" height="512"/>"#;
+        let mut out = Vec::new();
+        for key in &keys {
+            gallery.svgs.insert(key.clone(), svg.into());
+            gallery.place(&mut out, &shown(&[key]));
+            let (key_, made_for, done) = next_raster(&rx);
+            gallery.handle(&mut Vec::new(), Gfx::Raster { key: key_, made_for, done });
+            gallery.place(&mut out, &shown(&[key]));
+        }
+        let first = String::from_utf8_lossy(&out);
+        assert!(!gallery.images.contains_key(&keys[0]) && gallery.images.contains_key(&keys[1]), "only the least recent one goes");
+        assert!(first.contains("a=d,d=I,"), "and its pixels are freed in the terminal: {first}");
+        gallery.place(&mut Vec::new(), &shown(&[&keys[0]]));
+        let (key, _, done) = next_raster(&rx);
+        assert_eq!(key, keys[0], "seen again, it rasterizes again");
+        kitty::unlink(&done.unwrap().0);
     }
 
     #[test]
@@ -1049,7 +1138,7 @@ mod tests {
         // …and the next draw asks again instead of waiting forever for pixels already thrown away.
         gallery.place(&mut Vec::new(), &shown(&[&key]));
         let again = next_raster(&rx);
-        assert_eq!(again.1, (100, (1, 1), false));
+        assert_eq!(again.1, (100, MAX_MERMAID_HEIGHT_PX, (1, 1), false));
         kitty::unlink(&again.2.unwrap().0);
     }
 

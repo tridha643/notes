@@ -22,7 +22,11 @@ drive.py --session <fixture> --mode warm --runs 6 --quit-at 2.0   # drop run 0 (
 ```
 
 Proof: `first_placement_ms` per run (state the load), `rasters` ≤ on-screen visuals + 2, and
-every entry of `on_screen_at_end` has `one_to_one: true`.
+every entry of `on_screen_at_end` has `one_to_one: true`. `memory_at_quit` gives stage's and
+the helper's RSS and the image bytes the terminal still holds (freed only by `d=I`/`d=A`).
+
+Memory reference (warm, after paging the fixture, a z round trip and three session switches):
+stage 9 MB RSS, helper 83–90 MB, terminal 10 images / 16 MB.
 
 Reference (release, 120x40 at 10x20 px, M-series, load < 5, 2026-10-28): warm 50–64 ms;
 cold 109–153 ms with the helper that answers Mermaid off its main thread.
