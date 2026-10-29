@@ -153,8 +153,10 @@ final class Page: NSObject, WKNavigationDelegate {
     private let web: WKWebView
 
     private var loaded = false, paused = false, snapping = false
-    /// Suppress snapshots while layout briefly uses a 1pt measurement viewport.
-    private var measuring = false, layoutVersion = 0
+    /// No snapshots while layout briefly uses a 1pt measurement viewport.
+    private var measuring = false
+    /// Bumped by each layout, so callbacks and snapshots from an older one are dropped.
+    private var layoutVersion = 0
     private var frame = 0
     private var inFlight: Int?
     /// A capture came due while a frame was unacked or a snapshot was running.
@@ -263,8 +265,7 @@ final class Page: NSObject, WKNavigationDelegate {
 
     private func capture() {
         guard loaded, !paused else { return }
-        if measuring { due = true; return }
-        if inFlight != nil || snapping {
+        if measuring || inFlight != nil || snapping {
             due = true
             return
         }

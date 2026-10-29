@@ -137,7 +137,7 @@ pub enum Effect {
     /// Print and exit 2 (unknown `--session`).
     Fatal(String),
     /// Make pixels for a visual card.
-    NeedVisual { key: VisualKey, source: VisualSource, target: Target },
+    NeedVisual { key: VisualKey, source: VisualSource },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -327,35 +327,36 @@ impl App {
         let (scroll, Some((_, feed))) = (self.scroll, &self.feed) else { return vec![] };
         let hits = &feed.hits;
         let end = (scroll + page).min(hits.len());
-        let at = |i: usize| self.visual_key(hits[i]);
-        let mut want: Vec<VisualKey> = Vec::new();
-        for key in (scroll..end).filter_map(at) {
-            if !want.contains(&key) {
-                want.push(key);
-            }
-        }
+        // A card's lines are contiguous, so each (post, card) is looked up once per run.
+        let visuals = |lines: &mut dyn Iterator<Item = usize>| -> Vec<VisualKey> {
+            let mut last = None;
+            lines
+                .filter_map(|i| match hits[i] { (p, Hit::Card(c)) => Some((p, c)), _ => None })
+                .filter(|card| last.replace(*card) != Some(*card))
+                .filter_map(|card| self.visual_key(card))
+                .collect()
+        };
+        let mut want = visuals(&mut (scroll..end));
         let rendering = want.iter().any(|k| matches!(self.visuals.get(k), None | Some(VisualState::Pending)));
         if !rendering {
-            want.extend((end..(end + page).min(hits.len())).find_map(at));
-            want.extend((scroll.saturating_sub(page)..scroll.min(hits.len())).rev().find_map(at));
+            want.extend(visuals(&mut (end..(end + page).min(hits.len()))).into_iter().next());
+            want.extend(visuals(&mut (scroll.saturating_sub(page)..scroll.min(hits.len())).rev()).into_iter().next());
         }
-        let target = self.target();
         let mut fx = Vec::new();
         for key in want {
             if self.visuals.contains_key(&key) {
                 continue;
             }
             if let Some(source) = self.visual_source(&key) {
-                fx.push(Effect::NeedVisual { key: key.clone(), source: source.clone(), target });
+                fx.push(Effect::NeedVisual { key: key.clone(), source: source.clone() });
                 self.visuals.insert(key, VisualState::Pending);
             }
         }
         fx
     }
 
-    /// The visual card a feed line belongs to, if it belongs to one.
-    fn visual_key(&self, (p, hit): (usize, Hit)) -> Option<VisualKey> {
-        let Hit::Card(c) = hit else { return None };
+    /// Post `p`'s card `c`, if it's a visual card.
+    fn visual_key(&self, (p, c): (usize, usize)) -> Option<VisualKey> {
         let id = &self.posts.get(p)?.id;
         let key = (id.clone(), self.version_of(id)?, c);
         self.visual_source(&key).map(|_| key)
@@ -381,12 +382,7 @@ impl App {
             Msg::Resize(w, h) => {
                 self.size = (w, h);
                 let mut fx = vec![Effect::Redraw];
-                // A card's text width: the feed column less its border and padding.
-                let cols = ui::geometry_for(self).main.width.saturating_sub(5);
-                if cols != self.card_cols {
-                    self.card_cols = cols;
-                    fx.push(Effect::Request(StageRequest::CardCols(cols)));
-                }
+                fx.extend(self.report_card_width());
                 fx
             }
             Msg::CellPx(px) => {
@@ -609,8 +605,7 @@ impl App {
                 // Hold about the room a diagram or page usually takes.
                 Some(VisualState::Pending) | None => Fit::Pending { rows: (page / 3).clamp(3, 12) },
             };
-            let empty = Vec::new();
-            let comments = if selected.is_some() { &empty } else { &comments };
+            let comments: &[Comment] = if selected.is_some() { &[] } else { &comments };
             view.laid = Some((key, cards::layout(cards, comments, width, &view.folds, &fit, selected)));
         }
         view.laid.as_ref().map(|(_, l)| l)
@@ -841,6 +836,7 @@ impl App {
         self.report_card_width()
     }
 
+    /// A card's text width (the feed column less its border and padding), sent to notesd on change.
     fn report_card_width(&mut self) -> Vec<Effect> {
         let cols = ui::geometry_for(self).main.width.saturating_sub(5);
         if cols == self.card_cols { return vec![]; }

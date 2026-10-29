@@ -214,8 +214,7 @@ impl Gallery {
     /// Connect to the shared helper, launching it (detached, so it outlives this
     /// stage and the next one starts warm) if nobody answers.
     fn connect(&self) -> Result<UnixStream, String> {
-        // A new socket per helper behavior change keeps existing stages on their
-        // helper while this build starts its own (v3: mermaid skips WebKit startup).
+        // Versioned so a stage never talks to a helper from an older protocol behavior.
         let sock = self.cache.join("helper-v3.sock");
         if let Ok(stream) = UnixStream::connect(&sock) {
             return Ok(stream);
@@ -273,10 +272,10 @@ impl Gallery {
         (self.target.width_px as f64 / SCALE, self.target.max_height_px as f64 / SCALE)
     }
 
-    fn resize_pages(&mut self, focused: Option<&VisualKey>) {
+    fn resize_pages(&mut self) {
         let (width, max_height) = self.html_size();
         let pages: Vec<_> = self.pages.iter()
-            .filter(|(_, key)| focused.is_none_or(|selected| selected == *key))
+            .filter(|(_, key)| self.focused.as_ref().is_none_or(|selected| selected == *key))
             .map(|(id, _)| *id)
             .collect();
         for page in pages {
@@ -285,8 +284,8 @@ impl Gallery {
     }
 
     /// Start making a visual's pixels. Failures come back as messages for the app.
-    pub fn need(&mut self, out: &mut impl Write, key: VisualKey, source: VisualSource, target: Target) -> Vec<Msg> {
-        self.target = target;
+    /// Asked right after a draw, so `self.target` is the current one.
+    pub fn need(&mut self, out: &mut impl Write, key: VisualKey, source: VisualSource) -> Vec<Msg> {
         let kind = match &source {
             VisualSource::Mermaid(_) => "mermaid",
             VisualSource::Asset(_) => "image",
@@ -295,7 +294,7 @@ impl Gallery {
         self.asked.insert(key.clone(), (std::time::Instant::now(), kind));
         let result = match &source {
             VisualSource::Mermaid(src) => self
-                .ask(json!({"op": "mermaid", "source": src, "max_width": target.width_px as f64 / SCALE, "font_size": 14}))
+                .ask(json!({"op": "mermaid", "source": src, "max_width": self.target.width_px as f64 / SCALE, "font_size": 14}))
                 .map(|req| {
                     self.pending.insert(req, Pending::Mermaid(key.clone()));
                 }),
@@ -381,7 +380,7 @@ impl Gallery {
             self.raster_epoch += 1;
             self.raster_target();
         }
-        self.resize_pages(focused);
+        self.resize_pages();
     }
 
     /// A request about an existing page (its id is the page id, not a new one).
@@ -636,7 +635,7 @@ impl Gallery {
         }
         self.raster_target();
         // Only the focused page needs the new size while it fills the pane.
-        self.resize_pages(focused);
+        self.resize_pages();
     }
 
     /// Remove every image (on quit).

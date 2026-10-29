@@ -236,8 +236,8 @@ fn main() -> ExitCode {
                     restore();
                     return ExitCode::SUCCESS;
                 }
-                Effect::NeedVisual { key, source, target } => {
-                    for m in gallery.need(term.backend_mut(), key, source, target) {
+                Effect::NeedVisual { key, source } => {
+                    for m in gallery.need(term.backend_mut(), key, source) {
                         later.extend(pump(&mut app, &mut client, m));
                     }
                 }
