@@ -132,6 +132,59 @@ private func page(_ html: String) throws -> String {
         #expect(h.next(0.5) == nil)
     }
 
+    @Test func recycledPagesHaveFreshDocumentsAndCorrectFirstPixels() throws {
+        let h = try Helper()
+        let path = try page("")
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        for n in 0..<16 {
+            let width = 160 + (n % 3) * 40
+            let height = 60 + (n % 4) * 20
+            try """
+            <body style='margin:0'><div style='height:\(height)px'></div>
+            <script>
+            document.body.style.background = window.oldPage || sessionStorage.getItem('oldPage') ? 'red' : 'lime';
+            window.oldPage = true; sessionStorage.setItem('oldPage', 'yes');
+            </script></body>
+            """.write(toFile: path, atomically: true, encoding: .utf8)
+            let id = 100 + n
+            try h.send(["op": "html-open", "id": id, "path": path, "width": width, "max_height": 300, "scale": 1, "fps": 60])
+            let first = try #require(h.next())
+            #expect(first["id"] as? Int == id && first["frame"] as? Int == 1, "\(first)")
+            #expect(first["w"] as? Int == width && first["h"] as? Int == height, "a blank-navigation callback must not capture the wrong document: \(first)")
+            let w = try #require(first["w"] as? Int), hgt = try #require(first["h"] as? Int)
+            let px = try takeShm(try #require(first["shm"] as? String), w * hgt * 4)
+            #expect(Array(px.prefix(4)) == [0, 255, 0, 255], "recycling must reset globals AND session storage and capture the new page")
+            try h.send(["op": "html-close", "id": id])
+        }
+    }
+
+    @Test func recyclingDoesNotClearALivePagesStorage() throws {
+        let path = try page("""
+        <body style='margin:0;background:lime'><div style='height:80px'></div><script>
+        sessionStorage.setItem('live', 'yes');
+        addEventListener('resize', () => document.body.style.background =
+          sessionStorage.getItem('live') === 'yes' ? 'lime' : 'red');
+        </script></body>
+        """)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let h = try Helper()
+        for id in [1, 2] {
+            try h.send(["op": "html-open", "id": id, "path": path, "width": 160, "max_height": 100, "scale": 1, "fps": 60])
+            let first = try #require(h.next())
+            #expect(first["id"] as? Int == id)
+            shm_unlink(try #require(first["shm"] as? String))
+        }
+        try h.send(["op": "html-close", "id": 2])
+        Thread.sleep(forTimeInterval: 0.15)
+        try h.send(["op": "html-ack", "id": 1, "frame": 1])
+        try h.send(["op": "html-resize", "id": 1, "width": 200, "max_height": 100, "scale": 1])
+        let next = try #require(h.next())
+        #expect(next["id"] as? Int == 1 && next["w"] as? Int == 200)
+        let w = try #require(next["w"] as? Int), height = try #require(next["h"] as? Int)
+        let px = try takeShm(try #require(next["shm"] as? String), w * height * 4)
+        #expect(Array(px.prefix(4)) == [0, 255, 0, 255], "recycling a different view must preserve the live page's storage")
+    }
+
     @Test func animatingPageStreamsFramesWhileAcked() throws {
         let path = try page("""
         <style>body{margin:0;background:#1e1e2e}.b{width:40px;height:40px;background:#a6e3a1;animation:m .5s linear infinite alternate}
@@ -209,6 +262,79 @@ private func page(_ html: String) throws -> String {
         #expect(try update(v1.replacingOccurrences(of: "one", with: "two").replacingOccurrences(of: "#fff", with: "#f00")) == true)
         #expect(try update(v1.replacingOccurrences(of: "let x = 1", with: "let x = 2")) == false, "a script change reloads")
         try h.send(["op": "html-close", "id": 9])
+    }
+
+    @Test func anUpdateCanRecoverAfterNavigationFailure() throws {
+        let h = try Helper()
+        let missing = NSTemporaryDirectory() + "missing-stage-page-\(UUID().uuidString).html"
+        try h.send(["op": "html-open", "id": 23, "path": missing, "width": 200, "max_height": 200, "scale": 1, "fps": 60])
+        let failure = try #require(h.next())
+        #expect(failure["ok"] as? Bool == false)
+        let path = try page("<body style='margin:0;background:lime'><div style='height:80px'></div></body>")
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        try h.send(["op": "html-update", "id": 23, "path": path])
+        let patched = try #require(h.next())
+        #expect(patched["patched"] as? Bool == false)
+        let frame = try #require(h.next())
+        #expect(frame["w"] as? Int == 200 && frame["h"] as? Int == 80)
+        shm_unlink(try #require(frame["shm"] as? String))
+        try h.send(["op": "html-close", "id": 23])
+    }
+
+    @Test func pauseResumePreservesUnackedFrameBackpressure() throws {
+        let path = try page("<body style='margin:0;background:lime'><div style='height:80px'></div></body>")
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let h = try Helper()
+        try h.send(["op": "html-open", "id": 21, "path": path, "width": 200, "max_height": 200, "scale": 1, "fps": 60])
+        let first = try #require(h.next())
+        shm_unlink(try #require(first["shm"] as? String))
+        for _ in 0..<10 {
+            try h.send(["op": "html-pause", "id": 21])
+            try h.send(["op": "html-resume", "id": 21])
+        }
+        #expect(h.next(0.2) == nil, "resume must not bypass the outstanding frame's ack")
+        try h.send(["op": "html-ack", "id": 21, "frame": try #require(first["frame"] as? Int)])
+        let next = try #require(h.next())
+        #expect(next["frame"] as? Int == 2)
+        shm_unlink(try #require(next["shm"] as? String))
+        try h.send(["op": "html-close", "id": 21])
+    }
+
+    @Test func burstUpdatesEndAtTheLatestDocumentAndPixels() throws {
+        let h = try Helper()
+        let html = { (n: Int) in
+            let color = n == 20 ? "#12ab34" : "#89b4fa"
+            return "<body style='margin:0'><div id='box' style='height:\(60 + n * 3)px;background:\(color)'></div><script>window.revision = \(n / 3)</script></body>"
+        }
+        var paths: [String] = []
+        defer { for path in paths { try? FileManager.default.removeItem(atPath: path) } }
+        paths.append(try page(html(0)))
+        try h.send(["op": "html-open", "id": 22, "path": paths[0], "width": 200, "max_height": 300, "scale": 1, "fps": 60])
+        let first = try #require(h.next())
+        shm_unlink(try #require(first["shm"] as? String))
+        try h.send(["op": "html-ack", "id": 22, "frame": try #require(first["frame"] as? Int)])
+        for n in 1...20 {
+            paths.append(try page(html(n)))
+            try h.send(["op": "html-update", "id": 22, "path": paths.last!])
+        }
+        var replies = 0, gotLatest = false
+        let deadline = Date(timeIntervalSinceNow: 5)
+        while Date() < deadline, let reply = h.next(1) {
+            if reply["patched"] != nil { replies += 1 }
+            if let shm = reply["shm"] as? String {
+                let w = try #require(reply["w"] as? Int), height = try #require(reply["h"] as? Int)
+                let px = try takeShm(shm, w * height * 4)
+                if replies == 20 {
+                    #expect((w, height) == (200, 120))
+                    #expect(Array(px.prefix(4)) == [0x12, 0xab, 0x34, 255], "the final revision must win across interleaved patches and reloads")
+                    gotLatest = true
+                    break
+                }
+                try h.send(["op": "html-ack", "id": 22, "frame": try #require(reply["frame"] as? Int)])
+            }
+        }
+        #expect(replies == 20 && gotLatest)
+        try h.send(["op": "html-close", "id": 22])
     }
 
     @Test func unknownOpsAndBadRequestsError() throws {

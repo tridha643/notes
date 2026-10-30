@@ -96,6 +96,12 @@ fn rollback_restores_files_and_memory() {
     publish(&s, None, "Committed", "c");
     s.commit();
     assert_eq!(post_list(&s, &PostListArgs::default()).unwrap().len(), 2);
+    let left: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.unwrap().file_name().into_string().ok())
+        .filter(|n| n.starts_with('.'))
+        .collect();
+    assert!(left.is_empty(), "no journal or temp files left behind: {left:?}");
 }
 
 #[test]

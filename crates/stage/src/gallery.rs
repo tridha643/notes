@@ -16,7 +16,7 @@ use std::{
     os::unix::{net::UnixStream, process::CommandExt},
     path::PathBuf,
     process::{Command, Stdio},
-    sync::{mpsc::Sender, Arc, Mutex, OnceLock},
+    sync::{mpsc::Sender, Arc, Condvar, Mutex, OnceLock},
     thread,
 };
 
@@ -34,9 +34,33 @@ use crate::{
 pub enum Gfx {
     /// One JSON line from stage-helper.
     Helper(String),
+    /// Helper reader delivery with cleanup if the receiver disappears.
+    HelperOwned(HelperLine),
     HelperExited,
+    /// Owned worker completion; dropping an unread message releases its pixels.
+    RasterDone(RasterDone),
     /// A mermaid diagram rasterized into shared memory for `made_for` (or why it couldn't be).
     Raster { key: VisualKey, made_for: RasterTarget, done: Result<(String, u32, u32), String> },
+}
+
+impl Gfx {
+    /// Buffer name for consumers without a terminal (benchmarks must unlink after handling).
+    pub fn shm_name(&self) -> Option<String> {
+        match self {
+            Self::Raster { done: Ok((name, ..)), .. } => Some(name.clone()),
+            Self::RasterDone(result) => result.done.as_ref().and_then(|r| r.as_ref().ok()).map(|r| r.0.clone()),
+            Self::Helper(line) => helper_shm(line),
+            Self::HelperOwned(line) => line.0.as_deref().and_then(helper_shm),
+            _ => None,
+        }
+    }
+}
+fn helper_shm(line: &str) -> Option<String> {
+    match serde_json::from_str::<HelperReply>(line) {
+        Ok(HelperReply::Frame(f)) => Some(f.shm),
+        Ok(HelperReply::Image(i)) => Some(i.shm),
+        _ => None,
+    }
 }
 
 /// What a Mermaid raster depends on: the width and height it must fit, the cell
@@ -50,6 +74,152 @@ const MAX_MERMAID_HEIGHT_PX: u32 = 4096;
 /// Diagram pixels the terminal holds for stage. Past this, the diagrams shown least
 /// recently (and not on screen) are dropped; they rasterize again from their SVG if seen.
 const DIAGRAM_BUDGET_BYTES: u64 = 128 << 20;
+
+/// Worker replies own shm until Gallery hands it to the terminal.
+#[derive(Debug)]
+pub struct RasterDone {
+    key: VisualKey,
+    generation: u64,
+    made_for: RasterTarget,
+    done: Option<Result<(String, u32, u32), String>>,
+}
+impl Drop for RasterDone {
+    fn drop(&mut self) {
+        if let Some(Ok((shm, ..))) = &self.done { kitty::unlink(shm); }
+    }
+}
+
+#[derive(Debug)]
+pub struct HelperLine(Option<String>);
+impl Drop for HelperLine {
+    fn drop(&mut self) {
+        if let Some(line) = &self.0 { unlink_helper(line); }
+    }
+}
+
+fn unlink_helper(line: &str) {
+    match serde_json::from_str::<HelperReply>(line) {
+        Ok(HelperReply::Frame(f)) => kitty::unlink(&f.shm),
+        Ok(HelperReply::Image(i)) => kitty::unlink(&i.shm),
+        _ => {}
+    }
+}
+
+struct RasterJob {
+    key: VisualKey,
+    svg: String,
+    target: RasterTarget,
+    generation: u64,
+}
+#[derive(Default)]
+struct RasterQueue {
+    pending: HashMap<VisualKey, RasterJob>,
+    latest: HashMap<VisualKey, u64>,
+    delivered: HashMap<VisualKey, String>,
+    sequence: u64,
+    stopped: bool,
+}
+impl RasterQueue {
+    fn pop(&mut self) -> Option<RasterJob> {
+        // Focused jobs first, FIFO within each class. Distinct jobs are never overwritten.
+        let key = self.pending.values().min_by_key(|j| (j.target.3.is_none(), j.generation))?.key.clone();
+        self.pending.remove(&key)
+    }
+    fn current(&self, key: &VisualKey, generation: u64) -> bool {
+        !self.stopped && self.latest.get(key) == Some(&generation)
+    }
+}
+struct RasterWorkers {
+    shared: Arc<(Mutex<RasterQueue>, Condvar)>,
+    tx: Sender<Msg>,
+    started: OnceLock<()>,
+}
+impl RasterWorkers {
+    fn new(tx: Sender<Msg>) -> Self {
+        Self { shared: Arc::default(), tx, started: OnceLock::new() }
+    }
+    fn start(&self) {
+        self.started.get_or_init(|| {
+            let count = thread::available_parallelism().map_or(1, usize::from).min(8);
+            let cache = Arc::new(Mutex::new(None));
+            for _ in 0..count {
+                let (shared, tx, cache) = (self.shared.clone(), self.tx.clone(), cache.clone());
+                thread::spawn(move || loop {
+                    let job = {
+                        let (lock, wake) = &*shared;
+                        let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if queue.stopped { return; }
+                            if let Some(job) = queue.pop() { break job; }
+                            queue = wake.wait(queue).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+                    let current = || shared.0.lock().unwrap_or_else(|e| e.into_inner()).current(&job.key, job.generation);
+                    if !current() { continue; }
+                    let (w, h, cell, zoom) = job.target;
+                    let done = cached_parse(&cache, &job.svg).and_then(|tree| {
+                        if !current() { return Err("superseded".into()); }
+                        match zoom {
+                            Some(view) => fit_view(tree, w, h, cell, view),
+                            None => fit_tree(tree, w, h, cell, SCALE as f32),
+                        }.and_then(|fitted| {
+                            if !current() { return Err("superseded".into()); }
+                            draw_shm(fitted)
+                        })
+                    });
+                    let result = RasterDone { key: job.key, generation: job.generation, made_for: job.target, done: Some(done) };
+                    // Recheck after rasterization too. Drop reclaims obsolete or undeliverable pixels.
+                    let mut queue = shared.0.lock().unwrap_or_else(|e| e.into_inner());
+                    if queue.current(&result.key, result.generation) {
+                        if let Some(Ok((shm, ..))) = &result.done {
+                            queue.delivered.insert(result.key.clone(), shm.clone());
+                        }
+                        let _ = tx.send(Msg::Gfx(Gfx::RasterDone(result)));
+                    }
+                });
+            }
+        });
+    }
+    fn submit(&self, key: VisualKey, svg: String, target: RasterTarget) {
+        self.start();
+        let mut queue = self.shared.0.lock().unwrap_or_else(|e| e.into_inner());
+        // Bound queued, running and delivered-but-unhandled distinct keys together.
+        // Saturation is explicit, not a silently missing visual or a blocked UI thread.
+        if queue.stopped || (!queue.latest.contains_key(&key) && queue.latest.len() >= 256) {
+            let _ = self.tx.send(Msg::VisualFailed { key, reason: "raster queue saturated (256 distinct visuals)".into() });
+            return;
+        }
+        // A queued completion for this key is now obsolete. Reclaim its pixels
+        // immediately, even if the UI has not drained its notification yet.
+        if let Some(shm) = queue.delivered.remove(&key) { kitty::unlink(&shm); }
+        queue.sequence += 1;
+        let generation = queue.sequence;
+        queue.latest.insert(key.clone(), generation);
+        queue.pending.insert(key.clone(), RasterJob { key, svg, target, generation });
+        self.shared.1.notify_one();
+    }
+    fn outstanding(&self, key: &VisualKey) -> bool {
+        self.shared.0.lock().unwrap_or_else(|e| e.into_inner()).latest.contains_key(key)
+    }
+    fn consume(&self, key: &VisualKey, generation: u64) -> bool {
+        let mut queue = self.shared.0.lock().unwrap_or_else(|e| e.into_inner());
+        if !queue.current(key, generation) { return false; }
+        queue.latest.remove(key);
+        queue.delivered.remove(key); // ownership passes to Gallery/terminal
+        true
+    }
+    fn stop(&self) {
+        let mut queue = self.shared.0.lock().unwrap_or_else(|e| e.into_inner());
+        queue.stopped = true;
+        queue.pending.clear();
+        queue.latest.clear();
+        for (_, shm) in queue.delivered.drain() { kitty::unlink(&shm); }
+        self.shared.1.notify_all();
+    }
+}
+impl Drop for RasterWorkers {
+    fn drop(&mut self) { self.stop(); }
+}
 
 struct Img {
     id: u32,
@@ -110,8 +280,9 @@ pub struct Gallery {
     focused: Option<VisualKey>,
     /// The focused diagram's zoom and pan.
     view: ZoomView,
-    /// The focused diagram, parsed once, so zooming and panning only draw.
-    parsed: Arc<Mutex<Option<(VisualKey, Parsed)>>>,
+    /// One parsed SVG shared by feed, resize and zoom jobs. Key by source, not
+    /// post id: identical diagrams can reuse text shaping across post versions.
+    workers: RasterWorkers,
     /// The target each diagram's latest raster job was started for. Diagrams are
     /// rasterized for the current target only when on screen (or focused).
     rastered: HashMap<VisualKey, RasterTarget>,
@@ -170,6 +341,25 @@ fn parse(svg: &str) -> Result<Parsed, String> {
     resvg::usvg::Tree::from_str(svg, &opt).map(Arc::new).map_err(|e| format!("svg: {e}"))
 }
 
+/// Keep only the most recent source/tree: bounded retention even in a long feed.
+/// Parse outside the lock; concurrent misses may shape twice but install one exact-source tree.
+fn cached_parse(cache: &Mutex<Option<(String, Parsed)>>, svg: &str) -> Result<Parsed, String> {
+    {
+        let cached = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, tree)) = cached.as_ref().filter(|(source, _)| source == svg) {
+            return Ok(tree.clone());
+        }
+    }
+    // Distinct sources parse in parallel; never hold the shared lock while shaping.
+    let tree = parse(svg)?;
+    let mut cached = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, installed)) = cached.as_ref().filter(|(source, _)| source == svg) {
+        return Ok(installed.clone());
+    }
+    *cached = Some((svg.to_owned(), tree.clone()));
+    Ok(tree)
+}
+
 /// A fitted diagram drawn straight into a new shared-memory object for the terminal,
 /// so no diagram-sized buffer is ever allocated (or kept by malloc) in stage itself.
 fn draw_shm((tree, at, pw, ph): (Parsed, resvg::tiny_skia::Transform, u32, u32)) -> Result<(String, u32, u32), String> {
@@ -181,7 +371,10 @@ fn draw_shm((tree, at, pw, ph): (Parsed, resvg::tiny_skia::Transform, u32, u32))
 
 /// The parsed diagram, where it's drawn, and the canvas: whole cells, diagram centered.
 fn fit_svg(svg: &str, width_px: u32, height_px: u32, (cw, ch): (u16, u16), max_scale: f32) -> Result<(Parsed, resvg::tiny_skia::Transform, u32, u32), String> {
-    let tree = parse(svg)?;
+    fit_tree(parse(svg)?, width_px, height_px, (cw, ch), max_scale)
+}
+
+fn fit_tree(tree: Parsed, width_px: u32, height_px: u32, (cw, ch): (u16, u16), max_scale: f32) -> Result<(Parsed, resvg::tiny_skia::Transform, u32, u32), String> {
     let size = tree.size();
     let scale = (width_px as f32 / size.width()).min(height_px as f32 / size.height()).min(max_scale);
     let (w, h) = (
@@ -257,7 +450,7 @@ fn helper_path() -> PathBuf {
 impl Gallery {
     pub fn new(tx: Sender<Msg>, client: StageClient, cache: PathBuf, stage: PathBuf, target: Target) -> Gallery {
         Gallery {
-            tx,
+            tx: tx.clone(),
             client,
             helper: None,
             next_req: 1,
@@ -269,7 +462,7 @@ impl Gallery {
             target,
             focused: None,
             view: ZoomView::default(),
-            parsed: Arc::default(),
+            workers: RasterWorkers::new(tx.clone()),
             rastered: HashMap::new(),
             zoom: None,
             prefetch: None,
@@ -345,7 +538,7 @@ impl Gallery {
             let tx = self.tx.clone();
             thread::spawn(move || {
                 for line in BufReader::new(reader).lines().map_while(Result::ok) {
-                    if tx.send(Msg::Gfx(Gfx::Helper(line))).is_err() {
+                    if tx.send(Msg::Gfx(Gfx::HelperOwned(HelperLine(Some(line))))).is_err() {
                         return;
                     }
                 }
@@ -474,13 +667,6 @@ impl Gallery {
             return;
         }
         self.target = target;
-        if focused != self.focused.as_ref() {
-            // Keep the zoom made ahead's parse for the card being focused; drop any other.
-            let mut parsed = self.parsed.lock().unwrap_or_else(|e| e.into_inner());
-            if parsed.as_ref().is_some_and(|(key, _)| Some(key) != focused) {
-                *parsed = None;
-            }
-        }
         self.focused = focused.cloned();
         if let Some(ahead) = self.prefetch.take_if(|ahead| focused == Some(&ahead.key)) {
             let (width, height, cell, _) = self.raster_target(&ahead.key);
@@ -489,6 +675,7 @@ impl Gallery {
                 // on, since the app laid the card out at its size; `place` then asks for the view.
                 self.zoom = Some(Unzoomed { key: ahead.key.clone(), made_for: self.rastered.get(&ahead.key).copied(), img: None });
                 self.rastered.insert(ahead.key.clone(), ahead.made_for);
+                if let Some((_, _, (shm, ..))) = self.ready_zoom.take() { kitty::unlink(&shm); }
                 self.ready_zoom = ahead.done.map(|done| (ahead.key, ahead.made_for, done));
             } else if let Some((shm, ..)) = ahead.done {
                 kitty::unlink(&shm);
@@ -531,9 +718,14 @@ impl Gallery {
         if self.rastered.get(key) == Some(&made_for) {
             return;
         }
+        // A zoom prefetch supersedes unfinished feed work for the same key.
+        // Let it finish before asking for feed pixels again, rather than canceling it.
+        if self.focused.is_none() && self.prefetch.as_ref().is_some_and(|p| &p.key == key && p.done.is_none()) {
+            return;
+        }
         let Some(svg) = self.svgs.get(key).cloned() else { return };
         if made_for.3.is_some() && self.zoom.as_ref().is_none_or(|zoom| &zoom.key != key) {
-            self.zoom = Some(Unzoomed { key: key.clone(), made_for: self.rastered.get(key).copied(), img: None });
+            self.zoom = Some(Unzoomed { key: key.clone(), made_for: self.rastered.get(key).copied().filter(|_| !self.workers.outstanding(key)), img: None });
         }
         self.rastered.insert(key.clone(), made_for);
         self.spawn_raster(key.clone(), svg, made_for);
@@ -567,32 +759,16 @@ impl Gallery {
         if let Some((shm, ..)) = self.prefetch.take().and_then(|ahead| ahead.done) {
             kitty::unlink(&shm);
         }
+        if self.workers.outstanding(&key) {
+            self.rastered.remove(&key); // the previous job is about to be superseded
+        }
         self.prefetch = Some(Prefetch { key: key.clone(), made_for, done: None });
         self.spawn_raster(key, svg, made_for);
         None
     }
 
     fn spawn_raster(&self, key: VisualKey, svg: String, made_for: RasterTarget) {
-        let (tx, parsed, (width, height, cell, zoom)) = (self.tx.clone(), self.parsed.clone(), made_for);
-        thread::spawn(move || {
-            let t0 = std::time::Instant::now();
-            let done = match zoom {
-                Some(view) => {
-                    let mut cached = parsed.lock().unwrap_or_else(|e| e.into_inner());
-                    let tree = match cached.as_ref().filter(|(k, _)| *k == key) {
-                        Some((_, tree)) => Ok(tree.clone()),
-                        None => parse(&svg).inspect(|tree| *cached = Some((key.clone(), tree.clone()))),
-                    };
-                    drop(cached);
-                    tree.and_then(|tree| fit_view(tree, width, height, cell, view)).and_then(draw_shm)
-                }
-                None => fit_svg(&svg, width, height, cell, SCALE as f32).and_then(draw_shm),
-            };
-            if std::env::var_os("STAGE_HELPER_TRACE").is_some() {
-                eprintln!("resvg {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0);
-            }
-            let _ = tx.send(Msg::Gfx(Gfx::Raster { key, made_for, done }));
-        });
+        self.workers.submit(key, svg, made_for);
     }
 
     /// Trace a visual's first pixels: how long since it was asked for.
@@ -649,10 +825,14 @@ impl Gallery {
         // transmit; the next `place` positions it.
         // `placed` already holds the pixel rect (see `place`); don't crop it twice.
         let place = img.placed.filter(|_| !resized && img.previous.is_none());
-        let _ = out.write_all(b"\x1b[?2026h");
-        let _ = out.write_all(&kitty::transmit(img.id, shm, (w, h), place.as_ref()));
-        let _ = out.write_all(b"\x1b[?2026l");
-        let _ = out.flush();
+        let sent = out.write_all(b"\x1b[?2026h")
+            .and_then(|()| out.write_all(&kitty::transmit(img.id, shm, (w, h), place.as_ref())))
+            .and_then(|()| out.write_all(b"\x1b[?2026l"))
+            .and_then(|()| out.flush());
+        if let Err(error) = sent {
+            kitty::unlink(shm);
+            return Some(Msg::VisualFailed { key, reason: format!("graphics output: {error}") });
+        }
         if place.is_none() && img.previous.is_none() {
             img.placed = None;
         }
@@ -661,7 +841,16 @@ impl Gallery {
 
     /// Handle a graphics event; returns messages for the app.
     pub fn handle(&mut self, out: &mut impl Write, gfx: Gfx) -> Vec<Msg> {
+        let gfx = match gfx {
+            Gfx::HelperOwned(mut line) => Gfx::Helper(line.0.take().expect("owned helper line")),
+            Gfx::RasterDone(mut result) => {
+                if result.generation != 0 && !self.workers.consume(&result.key, result.generation) { return vec![]; }
+                Gfx::Raster { key: result.key.clone(), made_for: result.made_for, done: result.done.take().expect("owned completion") }
+            }
+            other => other,
+        };
         match gfx {
+            Gfx::RasterDone(_) | Gfx::HelperOwned(_) => unreachable!(),
             Gfx::HelperExited => {
                 self.helper = None;
                 let mut msgs: Vec<Msg> = self
@@ -721,7 +910,7 @@ impl Gallery {
                 let Ok(reply) = serde_json::from_str::<HelperReply>(&line) else { return vec![] };
                 match reply {
                     HelperReply::Frame(Frame { id, frame, shm, w, h }) => {
-                        let Some(key) = self.pages.get(&id).cloned() else { return vec![] };
+                        let Some(key) = self.pages.get(&id).cloned() else { kitty::unlink(&shm); return vec![] };
                         // A frame captured before a focus/resize can arrive after the
                         // target changes. Never show it at an intermediate width.
                         if w != self.target.width_px {
@@ -751,7 +940,7 @@ impl Gallery {
                     }
                     HelperReply::Image(Image { id, shm, w, h, .. }) => match self.pending.remove(&id) {
                         Some(Pending::Image(key, path)) => self.show(out, key, &shm, (w, h), None, Some(path)).into_iter().collect(),
-                        _ => vec![],
+                        _ => { kitty::unlink(&shm); vec![] },
                     },
                     HelperReply::Patched(_) | HelperReply::Done(_) => vec![],
                 }
@@ -770,7 +959,9 @@ impl Gallery {
             } else {
                 // The app doesn't know its size yet: hand it over like a raster just made
                 // (for what it was made for: if the view changed since, it's dropped).
-                let _ = self.tx.send(Msg::Gfx(Gfx::Raster { key, made_for, done: Ok((shm, w, h)) }));
+                let _ = self.tx.send(Msg::Gfx(Gfx::RasterDone(RasterDone {
+                    generation: 0, key, made_for, done: Some(Ok((shm, w, h))),
+                })));
             }
         }
         // Diagrams on screen (only the focused one while focused) at the current target.
@@ -922,6 +1113,11 @@ impl Drop for Gallery {
     /// Hang up on the helper (its reader thread holds a clone of the socket, so
     /// dropping ours alone wouldn't); it closes this stage's pages.
     fn drop(&mut self) {
+        self.workers.stop();
+        for (shm, ..) in self.prefetch.take().and_then(|p| p.done).into_iter()
+            .chain(self.ready_zoom.take().map(|(_, _, done)| done)) {
+            kitty::unlink(&shm);
+        }
         if let Some(h) = &self.helper {
             let _ = h.stream.shutdown(std::net::Shutdown::Both);
         }
@@ -940,6 +1136,184 @@ fn crop(p: &Place, (w, h): (u32, u32)) -> Place {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_key(name: &str) -> VisualKey { (name.into(), 1, 0) }
+    fn test_target(zoom: bool) -> RasterTarget {
+        (100, 100, (1, 1), zoom.then_some(ZoomView::default()))
+    }
+
+    #[test]
+    fn queue_coalesces_latest_without_losing_distinct_jobs_and_prioritizes_focus() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let workers = RasterWorkers::new(tx);
+        workers.started.set(()).unwrap(); // deterministic: leave jobs queued, no threads
+        workers.submit(test_key("a"), "old".into(), test_target(false));
+        workers.submit(test_key("b"), "distinct".into(), test_target(false));
+        workers.submit(test_key("a"), "latest".into(), test_target(false));
+        workers.submit(test_key("focus"), "focus".into(), test_target(true));
+        let mut queue = workers.shared.0.lock().unwrap();
+        assert_eq!(queue.pending.len(), 3);
+        assert_eq!(queue.pop().unwrap().key, test_key("focus"));
+        assert_eq!(queue.pop().unwrap().key, test_key("b"));
+        assert_eq!(queue.pop().unwrap().svg, "latest");
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn workers_complete_all_distinct_keys_and_only_the_queued_latest_revision() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut workers = RasterWorkers::new(tx);
+        workers.started.set(()).unwrap();
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>"#;
+        for n in 0..32 {
+            workers.submit(test_key("changing"), svg.into(), (10 + n, 100, (1, 1), None));
+        }
+        for name in ["a", "b", "c"] {
+            workers.submit(test_key(name), svg.into(), test_target(false));
+        }
+        workers.started.take();
+        workers.start();
+        let mut keys = Vec::new();
+        for _ in 0..4 {
+            let Msg::Gfx(Gfx::RasterDone(result)) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() else { panic!("missing worker completion") };
+            assert!(result.done.as_ref().unwrap().is_ok());
+            assert!(workers.consume(&result.key, result.generation));
+            if result.key == test_key("changing") { assert_eq!(result.made_for.0, 41); }
+            keys.push(result.key.clone());
+            // Owned result unlinks on scope exit, just like an unread/dropped reply.
+        }
+        keys.sort();
+        assert_eq!(keys, ["a", "b", "c", "changing"].map(test_key));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn generations_reject_aba_and_stop_clears_pending_jobs() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let workers = RasterWorkers::new(tx);
+        workers.started.set(()).unwrap();
+        let key = test_key("a");
+        for width in [100, 200, 100] {
+            workers.submit(key.clone(), "svg".into(), (width, 100, (1, 1), None));
+        }
+        assert!(!workers.consume(&key, 1));
+        assert!(!workers.consume(&key, 2));
+        assert!(workers.consume(&key, 3));
+        workers.submit(key, "svg".into(), test_target(false));
+        workers.stop();
+        let queue = workers.shared.0.lock().unwrap();
+        assert!(queue.pending.is_empty() && queue.latest.is_empty() && queue.stopped);
+    }
+
+    #[test]
+    fn saturation_is_bounded_and_reports_every_rejected_key() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let workers = RasterWorkers::new(tx);
+        workers.started.set(()).unwrap();
+        for n in 0..260 {
+            workers.submit(test_key(&n.to_string()), "svg".into(), test_target(false));
+        }
+        assert_eq!(workers.shared.0.lock().unwrap().pending.len(), 256);
+        let rejected: Vec<_> = rx.try_iter().collect();
+        assert_eq!(rejected.len(), 4);
+        assert!(rejected.iter().all(|m| matches!(m, Msg::VisualFailed { reason, .. } if reason.contains("saturated"))));
+    }
+
+    #[test]
+    fn owned_raster_and_helper_messages_unlink_on_failed_send_and_receiver_drop() {
+        let make = || kitty::shm_fill(4, |px| px.copy_from_slice(&[255, 0, 0, 255])).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let shm = make();
+        tx.send(Msg::Gfx(Gfx::RasterDone(RasterDone { key: test_key("a"), generation: 1,
+            made_for: test_target(false), done: Some(Ok((shm.clone(), 1, 1))) }))).unwrap();
+        drop(rx);
+        assert!(kitty::shm_read(&shm, 4).is_err());
+        let shm = make();
+        let line = serde_json::to_string(&HelperReply::Frame(Frame { id: 999, frame: 1, shm: shm.clone(), w: 1, h: 1 })).unwrap();
+        drop(tx.send(Msg::Gfx(Gfx::HelperOwned(HelperLine(Some(line))))));
+        assert!(kitty::shm_read(&shm, 4).is_err());
+    }
+
+    #[test]
+    fn superseding_and_stopping_reclaim_delivered_pixels_before_notifications_are_drained() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let workers = RasterWorkers::new(tx);
+        workers.started.set(()).unwrap();
+        let key = test_key("a");
+        workers.submit(key.clone(), "svg".into(), test_target(false));
+        let shm = kitty::shm_fill(4, |_| {}).unwrap();
+        workers.shared.0.lock().unwrap().delivered.insert(key.clone(), shm.clone());
+        workers.submit(key.clone(), "new svg".into(), test_target(false));
+        assert!(kitty::shm_read(&shm, 4).is_err());
+        let shm = kitty::shm_fill(4, |_| {}).unwrap();
+        workers.shared.0.lock().unwrap().delivered.insert(key, shm.clone());
+        workers.stop();
+        assert!(kitty::shm_read(&shm, 4).is_err());
+    }
+
+    #[test]
+    fn zoom_prefetch_does_not_leave_a_canceled_feed_marked_as_ready() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let target = Target { width_px: 100, max_height_px: 100, cell_px: (1, 1), html_height_px: 100 };
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), target);
+        gallery.workers.started.set(()).unwrap();
+        let key = test_key("a");
+        gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>"#.into());
+        gallery.raster(&key); // unfinished feed job
+        gallery.prefetch_zoom(key.clone(), target); // supersedes it
+        assert!(!gallery.rastered.contains_key(&key));
+        gallery.raster(&key); // feed draw must not cancel the pending zoom
+        assert_eq!(gallery.workers.shared.0.lock().unwrap().sequence, 2);
+        let shm = kitty::shm_fill(4, |_| {}).unwrap();
+        let made_for = gallery.prefetch.as_ref().unwrap().made_for;
+        gallery.handle(&mut Vec::new(), Gfx::RasterDone(RasterDone { key: key.clone(), generation: 2, made_for, done: Some(Ok((shm, 1, 1))) }));
+        gallery.raster(&key); // zoom completed: feed now gets its own latest job
+        assert_eq!(gallery.workers.shared.0.lock().unwrap().sequence, 3);
+        gallery.retarget(target, Some(&key));
+        gallery.raster(&key);
+        gallery.retarget(target, None);
+        gallery.raster(&key);
+        assert!(gallery.workers.outstanding(&key));
+        assert_eq!(gallery.rastered[&key].3, None);
+    }
+
+    #[test]
+    fn delivered_old_generation_cannot_win_after_same_target_returns() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let target = Target { width_px: 100, max_height_px: 100, cell_px: (1, 1), html_height_px: 100 };
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(), target);
+        gallery.workers.started.set(()).unwrap();
+        let key = test_key("a");
+        let at = (100, MAX_MERMAID_HEIGHT_PX, (1, 1), None);
+        for width in [100, 200, 100] {
+            gallery.workers.submit(key.clone(), "svg".into(), (width, at.1, at.2, None));
+        }
+        let shm = kitty::shm_fill(4, |_| {}).unwrap();
+        let stale = Gfx::RasterDone(RasterDone { key: key.clone(), generation: 1, made_for: at, done: Some(Ok((shm.clone(), 1, 1))) });
+        assert!(gallery.handle(&mut Vec::new(), stale).is_empty());
+        assert!(gallery.images.is_empty());
+        assert!(kitty::shm_read(&shm, 4).is_err());
+        let shm = kitty::shm_fill(4, |_| {}).unwrap();
+        let latest = Gfx::RasterDone(RasterDone { key: key.clone(), generation: 3, made_for: at, done: Some(Ok((shm.clone(), 1, 1))) });
+        assert_eq!(gallery.handle(&mut Vec::new(), latest).len(), 1);
+        assert!(gallery.images.contains_key(&key));
+        kitty::unlink(&shm); // simulated terminal consumes the accepted result
+    }
+
+    #[test]
+    fn unknown_helper_buffers_and_gallery_prefetch_are_reclaimed() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(),
+            Target { width_px: 100, max_height_px: 100, cell_px: (1, 1), html_height_px: 100 });
+        let shm = kitty::shm_fill(4, |_| {}).unwrap();
+        let line = serde_json::to_string(&HelperReply::Frame(Frame { id: 999, frame: 1, shm: shm.clone(), w: 1, h: 1 })).unwrap();
+        assert!(gallery.handle(&mut Vec::new(), Gfx::Helper(line)).is_empty());
+        assert!(kitty::shm_read(&shm, 4).is_err());
+        let shm = kitty::shm_fill(4, |_| {}).unwrap();
+        gallery.prefetch = Some(Prefetch { key: test_key("a"), made_for: test_target(true), done: Some((shm.clone(), 1, 1)) });
+        drop(gallery);
+        assert!(kitty::shm_read(&shm, 4).is_err());
+    }
 
     #[test]
     fn crop_maps_cut_rows_to_pixels() {
@@ -1040,9 +1414,16 @@ mod tests {
         keys.iter().map(|k| OnScreen { key: (*k).clone(), col: 0, row: 0, cols: 10, top: 0, rows: 5, total: 5, px: (0, 0) }).collect()
     }
 
-    fn next_raster(rx: &std::sync::mpsc::Receiver<Msg>) -> (VisualKey, RasterTarget, Result<(String, u32, u32), String>) {
-        let Msg::Gfx(Gfx::Raster { key, made_for, done }) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap() else { panic!("no raster") };
-        (key, made_for, done)
+    fn next_raster(rx: &std::sync::mpsc::Receiver<Msg>, gallery: &Gallery) -> (VisualKey, RasterTarget, Result<(String, u32, u32), String>) {
+        let msg = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        match msg {
+            Msg::Gfx(Gfx::RasterDone(mut result)) => {
+                assert!(gallery.workers.consume(&result.key, result.generation));
+                (result.key.clone(), result.made_for, result.done.take().unwrap())
+            }
+            Msg::Gfx(Gfx::Raster { key, made_for, done }) => (key, made_for, done),
+            _ => panic!("no raster"),
+        }
     }
 
     #[test]
@@ -1057,7 +1438,7 @@ mod tests {
         }
         let unlink = |done: Result<(String, u32, u32), String>| kitty::unlink(&done.unwrap().0);
         gallery.place(&mut Vec::new(), &shown(&[&first, &second]));
-        let mut keys = [next_raster(&rx), next_raster(&rx)].map(|(key, _, done)| { unlink(done); key });
+        let mut keys = [next_raster(&rx, &gallery), next_raster(&rx, &gallery)].map(|(key, _, done)| { unlink(done); key });
         keys.sort();
         assert_eq!(keys, [first.clone(), second.clone()]);
         // Drawn again at the same target: nothing new.
@@ -1066,7 +1447,7 @@ mod tests {
 
         gallery.retarget(Target { width_px: 200, ..normal }, Some(&second));
         gallery.place(&mut Vec::new(), &shown(&[&second]));
-        let (key, made_for, done) = next_raster(&rx);
+        let (key, made_for, done) = next_raster(&rx, &gallery);
         assert_eq!((key, made_for), (second.clone(), (200, 100, (1, 1), Some(ZoomView::default()))));
         unlink(done);
         assert!(rx.try_recv().is_err(), "nothing but the focused card renders during focus");
@@ -1075,6 +1456,46 @@ mod tests {
         gallery.retarget(normal, None);
         gallery.place(&mut Vec::new(), &shown(&[&first, &second]));
         assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "an off-screen or already-current diagram never rasterizes");
+    }
+
+    #[test]
+    fn parsed_svg_cache_reuses_exact_sources_and_evicts_on_change() {
+        let cache = Mutex::new(None);
+        let red = r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="red"/></svg>"#;
+        let blue = red.replace("red", "blue");
+        let first = cached_parse(&cache, red).unwrap();
+        assert!(Arc::ptr_eq(&first, &cached_parse(&cache, red).unwrap()));
+        let changed = cached_parse(&cache, &blue).unwrap();
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert!(cached_parse(&cache, "not SVG").is_err());
+        assert!(Arc::ptr_eq(&changed, &cached_parse(&cache, &blue).unwrap()), "a failed parse doesn't poison the cache");
+        assert!(!Arc::ptr_eq(&first, &cached_parse(&cache, red).unwrap()), "only one source is retained");
+    }
+
+    #[test]
+    fn cached_tree_renders_identical_pixels_at_multiple_sizes() {
+        let cache = Mutex::new(None);
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="red"/><text x="5" y="25" font-family="Helvetica">test</text></svg>"#;
+        let tree = cached_parse(&cache, svg).unwrap();
+        for width in [80, 150, 300] {
+            let expected = rasterize(svg, width, 1000, (10, 20), 2.0).unwrap();
+            let (tree, at, w, h) = fit_tree(tree.clone(), width, 1000, (10, 20), 2.0).unwrap();
+            let mut px = vec![0; (w * h * 4) as usize];
+            draw(&tree, at, &mut px, (w, h)).unwrap();
+            assert_eq!((px, w, h), expected);
+        }
+    }
+
+    #[test]
+    fn concurrent_raster_jobs_share_the_installed_tree() {
+        let cache = Arc::new(Mutex::new(None));
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#;
+        let jobs: Vec<_> = (0..8).map(|_| {
+            let cache = cache.clone();
+            thread::spawn(move || cached_parse(&cache, svg).unwrap())
+        }).collect();
+        let trees: Vec<_> = jobs.into_iter().map(|job| job.join().unwrap()).collect();
+        assert!(trees.iter().all(|tree| Arc::ptr_eq(tree, &trees[0])));
     }
 
     #[test]
@@ -1098,13 +1519,13 @@ mod tests {
         let key: VisualKey = ("small".into(), 1, 0);
         gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
         gallery.place(&mut Vec::new(), &shown(&[&key]));
-        let (_, _, done) = next_raster(&rx);
+        let (_, _, done) = next_raster(&rx, &gallery);
         let (shm, w, h) = done.unwrap();
         kitty::unlink(&shm);
         assert_eq!((w, h), (200, 100), "in the feed: native size (2x CSS px)");
         gallery.retarget(target, Some(&key));
         gallery.place(&mut Vec::new(), &shown(&[&key]));
-        let (_, _, done) = next_raster(&rx);
+        let (_, _, done) = next_raster(&rx, &gallery);
         let (shm, w, h) = done.unwrap();
         kitty::unlink(&shm);
         assert_eq!((w, h), (800, 400), "focused: as large as fits the 1000x400 pane");
@@ -1119,13 +1540,13 @@ mod tests {
         gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
         let at = |px| OnScreen { key: key.clone(), col: 0, row: 0, cols: 10, top: 0, rows: 5, total: 5, px };
         gallery.place(&mut Vec::new(), &[at((0, 0))]);
-        let (key_, made_for, done) = next_raster(&rx);
+        let (key_, made_for, done) = next_raster(&rx, &gallery);
         gallery.handle(&mut Vec::new(), Gfx::Raster { key: key_, made_for, done });
         gallery.place(&mut Vec::new(), &[at((200, 100))]);
         let feed_id = gallery.images[&key].id;
         gallery.retarget(target, Some(&key));
         gallery.place(&mut Vec::new(), &[at((200, 100))]);
-        let (key_, made_for, done) = next_raster(&rx);
+        let (key_, made_for, done) = next_raster(&rx, &gallery);
         gallery.handle(&mut Vec::new(), Gfx::Raster { key: key_, made_for, done });
         let zoomed_id = gallery.images[&key].id;
         let mut out = Vec::new();
@@ -1150,7 +1571,7 @@ mod tests {
         let key: VisualKey = ("chart".into(), 1, 0);
         gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
         assert!(gallery.prefetch_zoom(key.clone(), focus).is_none());
-        let (key_, made_for, done) = next_raster(&rx);
+        let (key_, made_for, done) = next_raster(&rx, &gallery);
         assert_eq!(made_for, (1000, 400, (1, 1), Some(ZoomView::default())));
         assert!(matches!(gallery.handle(&mut Vec::new(), Gfx::Raster { key: key_, made_for, done }).as_slice(), [Msg::ZoomReady { w: 800, h: 400, .. }]));
         gallery.retarget(focus, Some(&key));
@@ -1173,7 +1594,7 @@ mod tests {
         for key in &keys {
             gallery.svgs.insert(key.clone(), svg.into());
             gallery.place(&mut out, &shown(&[key]));
-            let (key_, made_for, done) = next_raster(&rx);
+            let (key_, made_for, done) = next_raster(&rx, &gallery);
             gallery.handle(&mut Vec::new(), Gfx::Raster { key: key_, made_for, done });
             gallery.place(&mut out, &shown(&[key]));
         }
@@ -1181,7 +1602,7 @@ mod tests {
         assert!(!gallery.images.contains_key(&keys[0]) && gallery.images.contains_key(&keys[1]), "only the least recent one goes");
         assert!(first.contains("a=d,d=I,"), "and its pixels are freed in the terminal: {first}");
         gallery.place(&mut Vec::new(), &shown(&[&keys[0]]));
-        let (key, _, done) = next_raster(&rx);
+        let (key, _, done) = next_raster(&rx, &gallery);
         assert_eq!(key, keys[0], "seen again, it rasterizes again");
         kitty::unlink(&done.unwrap().0);
     }
@@ -1197,7 +1618,7 @@ mod tests {
         let key: VisualKey = ("chart".into(), 1, 0);
         gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
         assert!(gallery.prefetch_zoom(key.clone(), focus).is_none());
-        let (key_, made_for, done) = next_raster(&rx);
+        let (key_, made_for, done) = next_raster(&rx, &gallery);
         gallery.handle(&mut Vec::new(), Gfx::Raster { key: key_, made_for, done });
         assert!(matches!(gallery.prefetch_zoom(key.clone(), focus), Some(Msg::ZoomReady { w: 800, h: 400, .. })));
         assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "and doesn't rasterize it again");
@@ -1232,10 +1653,10 @@ mod tests {
         let key: VisualKey = ("diagram".into(), 1, 0);
         gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
         gallery.place(&mut Vec::new(), &shown(&[&key]));
-        let old = next_raster(&rx);
+        let old = next_raster(&rx, &gallery);
         gallery.retarget(at(180), None);
         gallery.place(&mut Vec::new(), &shown(&[&key]));
-        let latest = next_raster(&rx);
+        let latest = next_raster(&rx, &gallery);
         let (shm, w, h) = latest.2.unwrap();
         assert_eq!((w, h), (180, 90));
         assert_eq!(gallery.handle(&mut Vec::new(), Gfx::Raster { key: key.clone(), made_for: latest.1, done: Ok((shm.clone(), w, h)) }).len(), 1);
@@ -1254,14 +1675,14 @@ mod tests {
         let key: VisualKey = ("diagram".into(), 1, 0);
         gallery.svgs.insert(key.clone(), r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#.into());
         gallery.place(&mut Vec::new(), &shown(&[&key]));
-        let first = next_raster(&rx);
+        let first = next_raster(&rx, &gallery);
         // It lands while the width is briefly different (a focus round trip), so it's dropped…
         gallery.retarget(at(200), None);
         gallery.handle(&mut Vec::new(), Gfx::Raster { key: key.clone(), made_for: first.1, done: first.2 });
         gallery.retarget(at(100), None);
         // …and the next draw asks again instead of waiting forever for pixels already thrown away.
         gallery.place(&mut Vec::new(), &shown(&[&key]));
-        let again = next_raster(&rx);
+        let again = next_raster(&rx, &gallery);
         assert_eq!(again.1, (100, MAX_MERMAID_HEIGHT_PX, (1, 1), None));
         kitty::unlink(&again.2.unwrap().0);
     }

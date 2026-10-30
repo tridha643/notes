@@ -188,6 +188,9 @@ fn main() {
         }
         assert!(spawned.elapsed() < Duration::from_secs(10), "stage never drew");
     };
+    // Act like a terminal: end capability probing with DA1. Otherwise the
+    // two-second probe swallows the scenario's first keys as terminal replies.
+    pty.master.write_all(b"\x1b[?1;2c").unwrap();
     pty.read_burst(Duration::from_millis(300)); // bootstrap settles
 
     let mut rows: Vec<(&str, usize, f64)> = Vec::new();
@@ -262,6 +265,9 @@ fn main() {
         failed.push(format!("input p95 {p95:.1} ms > {INPUT_P95_MS}"));
     }
     drop(stage);
+    drop(_notesd);
+    // Only this benchmark's isolated shared helper; do not leave it for its idle timeout.
+    let _ = Command::new("pkill").arg("-f").arg(dir.to_string_lossy().as_ref()).status();
     let _ = fs::remove_dir_all(&dir);
     if !failed.is_empty() {
         eprintln!("FAILED: {}", failed.join("; "));

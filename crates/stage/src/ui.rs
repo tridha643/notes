@@ -309,19 +309,25 @@ fn prompt(label: &str, input: &str, keys: &[(&str, &str)]) -> Vec<Span<'static>>
 
 /// `15:50` for today, else `Oct 18`, in local time.
 pub fn when(secs: i64) -> String {
-    let t = secs as libc::time_t;
-    let now = unsafe { libc::time(std::ptr::null_mut()) };
-    let (mut tm, mut today): (libc::tm, libc::tm) = unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
-    unsafe {
-        libc::localtime_r(&t, &mut tm);
-        libc::localtime_r(&now, &mut today);
-    }
-    if (tm.tm_year, tm.tm_yday) == (today.tm_year, today.tm_yday) {
+    let tm = local(secs as libc::time_t);
+    if (tm.tm_year, tm.tm_yday) == today() {
         format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
     } else {
         const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
         format!("{} {}", MONTHS[tm.tm_mon.clamp(0, 11) as usize], tm.tm_mday)
     }
+}
+
+/// Today's local (year, day of year): `when` writes times for today, dates before.
+pub fn today() -> (i32, i32) {
+    let tm = local(unsafe { libc::time(std::ptr::null_mut()) });
+    (tm.tm_year, tm.tm_yday)
+}
+
+fn local(t: libc::time_t) -> libc::tm {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    tm
 }
 
 fn sidebar(f: &mut Frame, app: &App, area: Rect) {

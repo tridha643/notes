@@ -107,12 +107,19 @@ private final class Weak: NSObject, WKScriptMessageHandler {
 /// web process is already up when a page opens, instead of starting on that open.
 @MainActor
 enum Spare {
-    private static var next: (WKWebView, NSWindow)?
+    // Reuse closed pages as well as the proactively warmed spare. Keep this
+    // bounded: a burst must not leave an unbounded pool of WebKit views/windows.
+    private static var ready: [(WKWebView, NSWindow)] = []
+    private static var resetting = 0
+    private static let capacity = 32
 
     /// WebKit only paints (and runs animations) for a view in a window: a borderless,
     /// fully transparent one that ignores the mouse.
     static func make(width: Double, height: Double) -> (WKWebView, NSWindow) {
         let config = WKWebViewConfiguration()
+        // Each reusable view owns its data: clearing a closed page must not erase
+        // session storage/cookies belonging to another live page.
+        config.websiteDataStore = .nonPersistent()
         // Offscreen pages would otherwise be throttled like a background tab.
         config.preferences.inactiveSchedulingPolicy = .none
         let web = WKWebView(frame: NSRect(x: 0, y: 0, width: width, height: height), configuration: config)
@@ -128,18 +135,43 @@ enum Spare {
     }
 
     static func prepare() {
-        guard next == nil else { return }
+        guard ready.isEmpty && resetting == 0 else { return }
+        let started = DispatchTime.now().uptimeNanoseconds
         let spare = make(width: 400, height: 300)
         spare.0.loadHTMLString("", baseURL: nil)
-        next = spare
+        ready.append(spare)
+        traceMark("spare prepared", since: started)
     }
 
     /// The prepared view (or a fresh one); the next spare is built once this turn ends.
     static func take(width: Double, height: Double) -> (WKWebView, NSWindow) {
-        let spare = next ?? make(width: width, height: height)
-        next = nil
+        let spare = ready.popLast() ?? make(width: width, height: height)
         DispatchQueue.main.async { prepare() }
         return spare
+    }
+
+    static func recycle(_ web: WKWebView, _ window: NSWindow) {
+        web.navigationDelegate = nil
+        web.stopLoading()
+        web.configuration.userContentController.removeAllUserScripts()
+        guard ready.count + resetting < capacity else {
+            window.orderOut(nil)
+            window.close()
+            return
+        }
+        web.pageZoom = 1
+        // A navigation destroys the old document, including user timers and globals.
+        // Merely pausing captures would let scripts keep running in the pool.
+        web.loadHTMLString("", baseURL: nil)
+        resetting += 1
+        // Blank navigation resets globals, but NOT sessionStorage. Do not lend
+        // the view out until its private store has finished clearing all origins.
+        web.configuration.websiteDataStore.removeData(
+            ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast
+        ) {
+            resetting -= 1
+            ready.append((web, window))
+        }
     }
 }
 
@@ -152,7 +184,9 @@ final class Page: NSObject, WKNavigationDelegate {
     private let window: NSWindow
     private let web: WKWebView
 
-    private var loaded = false, paused = false, snapping = false
+    private var loaded = false, paused = false, snapping = false, closed = false
+    /// A recycled view may still deliver callbacks from its blank navigation.
+    private var navigation: WKNavigation?
     /// No snapshots while layout briefly uses a 1pt measurement viewport.
     private var measuring = false
     /// Bumped by each layout, so callbacks and snapshots from an older one are dropped.
@@ -171,6 +205,10 @@ final class Page: NSObject, WKNavigationDelegate {
     private let client: Client
     /// The authored html of the shown revision (what the next update diffs against).
     private var source: String
+    /// Only one patch/navigation transition runs at once; diffs always use the
+    /// last committed authored source, never a revision still being applied.
+    private var updating = false
+    private var pendingUpdates: [(path: String, source: String)] = []
 
     init(id: Int, client: Client, path: String, width: Double, maxHeight: Double, scale: Double, fps: Double) {
         self.id = id
@@ -183,28 +221,43 @@ final class Page: NSObject, WKNavigationDelegate {
         source = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
         (web, window) = Spare.take(width: width, height: maxHeight)
         super.init()
+        traceMark("html took spare", since: opened)
         // Scripts added now apply from the next navigation on: this page's load.
         let content = web.configuration.userContentController
         content.addUserScript(WKUserScript(source: pageScript, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         content.add(Weak(self), name: "stage")
         web.navigationDelegate = self
         setSize(width, maxHeight)
+        traceMark("html configured", since: opened)
         let url = URL(fileURLWithPath: path)
-        web.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
+        navigation = web.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
+        traceMark("html navigation queued", since: opened)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard navigation != nil, navigation === self.navigation else { return }
         traceMark("html loaded", since: opened)
         loaded = true
-        layout()
+        updating = false
+        if pendingUpdates.isEmpty { layout() } else { applyNextUpdate() }
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        client.fail(id, "html: \(error.localizedDescription)")
+        guard navigation != nil, navigation === self.navigation else { return }
+        navigationFailed(error)
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        guard navigation != nil, navigation === self.navigation else { return }
+        navigationFailed(error)
+    }
+
+    private func navigationFailed(_ error: Error) {
+        navigation = nil
+        loaded = false
+        updating = false
         client.fail(id, "html: \(error.localizedDescription)")
+        applyNextUpdate()
     }
 
     /// Size the viewport to the content (capped at maxHeight), wait for a paint, capture.
@@ -265,7 +318,7 @@ final class Page: NSObject, WKNavigationDelegate {
 
     private func capture() {
         guard loaded, !paused else { return }
-        if measuring || inFlight != nil || snapping {
+        if updating || measuring || inFlight != nil || snapping {
             due = true
             return
         }
@@ -321,7 +374,7 @@ final class Page: NSObject, WKNavigationDelegate {
     }
 
     private func startTimer() {
-        guard timer == nil, loaded, !paused else { return }
+        guard timer == nil, loaded, !paused, !updating else { return }
         let t = DispatchSource.makeTimerSource(queue: .main)
         t.schedule(deadline: .now(), repeating: 1 / fps, leeway: .milliseconds(2))
         t.setEventHandler { [weak self] in
@@ -352,7 +405,7 @@ final class Page: NSObject, WKNavigationDelegate {
     func resume() {
         paused = false
         lastHash = nil  // a fresh frame even if nothing changed
-        inFlight = nil
+        // Keep ownership of an outstanding frame: its ack releases backpressure.
         capture()
         checkAnimating()
     }
@@ -369,34 +422,61 @@ final class Page: NSObject, WKNavigationDelegate {
     /// frame stays on screen meanwhile, so the card never blanks.
     func update(path: String) {
         let after = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
-        let before = source
-        source = after
-        let reload = { [weak self] in
-            guard let self else { return }
-            self.loaded = false
-            self.stopTimer()
-            let url = URL(fileURLWithPath: path)
-            self.web.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
-        }
+        pendingUpdates.append((path, after))
+        applyNextUpdate()
+    }
+
+    private func applyNextUpdate() {
+        guard !closed, !updating, !pendingUpdates.isEmpty else { return }
+        // Wait for an active navigation, but allow a new revision to recover a
+        // failed load instead of leaving its queue stuck forever.
+        guard loaded || navigation == nil else { return }
+        let change = pendingUpdates.removeFirst()
+        updating = true
+        // A snapshot or layout from the preceding revision must never be emitted
+        // under the new revision, even while a fallback navigation is loading.
+        layoutVersion += 1
+        mutation?.cancel()
+        stopTimer()
         guard loaded else {
             client.send(.patched(id: id, patched: false))
-            return reload()
+            return reload(change)
         }
         let t0 = DispatchTime.now().uptimeNanoseconds
-        web.callAsyncJavaScript(patchScript, arguments: ["before": before, "after": after], in: nil, in: .page) { [weak self] result in
-            guard let self else { return }
+        web.callAsyncJavaScript(patchScript, arguments: ["before": source, "after": change.source], in: nil, in: .page) { [weak self] result in
+            guard let self, !self.closed else { return }
             let outcome = (try? result.get()) as? String ?? "patch-failed"
             traceMark("html update \(outcome)", since: t0)
             self.client.send(.patched(id: self.id, patched: outcome == "ok"))
-            if outcome == "ok" { self.layout() } else { reload() }
+            self.source = change.source
+            if outcome == "ok" {
+                self.updating = false
+                if self.pendingUpdates.isEmpty { self.layout() } else { self.applyNextUpdate() }
+            } else {
+                self.reload(change)
+                // didFinish commits this navigation before processing the next patch.
+            }
         }
     }
 
+    private func reload(_ change: (path: String, source: String)) {
+        loaded = false
+        source = change.source
+        let url = URL(fileURLWithPath: change.path)
+        navigation = web.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
+    }
+
     func close() {
+        guard !closed else { return }
+        closed = true
+        navigation = nil
+        loaded = false
+        paused = true
+        layoutVersion += 1
+        pendingUpdates.removeAll()
         stopTimer()
         mutation?.cancel()
         web.configuration.userContentController.removeScriptMessageHandler(forName: "stage")
-        window.orderOut(nil)
-        window.close()
+        Spare.recycle(web, window)
     }
 }

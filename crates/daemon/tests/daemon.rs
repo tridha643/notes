@@ -779,6 +779,25 @@ fn sessions_live_in_the_desktop_folder_and_doctor_reports_it() {
 }
 
 #[test]
+fn stage_reads_answer_the_same_alone_and_in_a_batch() {
+    let d = Notesd::new();
+    let code = json!({ "kind": "code", "language": "rust", "code": "fn main() {}\n" });
+    let post = d.ok("post-new", json!({ "title": "T", "parts": [md("hi"), code] }));
+    let (id, session) = (&post["post"]["id"], &post["post"]["session"]);
+    let reads = [
+        ("post-list", json!({ "session": session })),
+        ("post-show", json!({ "id": id })),
+        ("post-render", json!({ "id": id })),
+    ];
+    let ops: Vec<Value> = reads.iter().map(|(verb, args)| json!({ "verb": verb, "args": args })).collect();
+    let batched = d.ok("batch", json!({ "ops": ops }));
+    for (i, (verb, args)) in reads.iter().enumerate() {
+        assert_eq!(d.ok(verb, args.clone()), batched[i]["result"], "{verb}");
+    }
+    assert_eq!(d.ok("post-render", json!({ "id": id }))["parts"][1]["kind"], "code");
+}
+
+#[test]
 fn atomic_batch_rolls_back_session_files() {
     let d = Notesd::new();
     d.ok("post-new", json!({ "title": "Kept", "parts": [md("a")] }));

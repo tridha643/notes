@@ -1,6 +1,8 @@
 //! Read-only view of the pre-JSON SQLite tables, used once by migrate_json.rs to
 //! move every session into the folder. Nothing writes these tables any more.
 
+use std::sync::Arc;
+
 use notes_proto::posts::*;
 use rusqlite::{params, Connection};
 
@@ -68,7 +70,7 @@ pub(crate) fn export_sessions(db: &Connection) -> Result<Vec<SessionFile>> {
     Ok(sessions)
 }
 
-fn export_posts(db: &Connection, session: &str) -> Result<Vec<PostRec>> {
+fn export_posts(db: &Connection, session: &str) -> Result<Vec<Arc<PostRec>>> {
     let mut stmt = db
         .prepare("SELECT id, title, parts, version, created_at, updated_at FROM posts WHERE session = ?1 ORDER BY rowid")
         .db()?;
@@ -90,7 +92,7 @@ fn export_posts(db: &Connection, session: &str) -> Result<Vec<PostRec>> {
                 Ok(VersionRec { version, title, at, parts: parts(&json)? })
             })
             .collect::<Result<_>>()?;
-        posts.push(PostRec {
+        posts.push(Arc::new(PostRec {
             id: PostId(id),
             title,
             version,
@@ -98,7 +100,7 @@ fn export_posts(db: &Connection, session: &str) -> Result<Vec<PostRec>> {
             updated_at,
             parts: parts(&json)?,
             history,
-        });
+        }));
     }
     Ok(posts)
 }

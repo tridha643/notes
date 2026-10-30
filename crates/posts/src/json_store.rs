@@ -13,6 +13,7 @@ use std::{
     io::{self, Write},
     os::{fd::AsRawFd, unix::fs::MetadataExt},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use notes_proto::{posts::*, ErrorCode, Event};
@@ -46,8 +47,9 @@ pub struct SessionFile {
     /// The agent's feedback cursor: comment seqs it has already seen.
     #[serde(default)]
     pub agent_seq: u64,
+    /// Shared, so copying a session to change one post doesn't copy every post.
     #[serde(default)]
-    pub posts: Vec<PostRec>,
+    pub posts: Vec<Arc<PostRec>>,
     #[serde(default)]
     pub comments: Vec<Comment>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -96,6 +98,11 @@ pub struct AssetMeta {
 /// (inode, size, mtime s, mtime ns): a file changed outside notesd when this does.
 type Stamp = (u64, u64, i64, i64);
 
+/// Each post's JSON as the session file holds it (indented under `posts`), so a save
+/// serializes only the posts that changed. Keyed by the post's `Arc` address: an edit
+/// copies the post into a new `Arc`, and holding the old one keeps its address unused.
+type PostJson = HashMap<usize, (Arc<PostRec>, Box<[u8]>)>;
+
 pub(crate) struct Entry {
     /// File name inside the folder; fixed at creation (a rename keeps it).
     pub file: String,
@@ -103,6 +110,16 @@ pub(crate) struct Entry {
     /// Creation order, the tie-break for equal timestamps.
     pub ord: u64,
     pub data: SessionFile,
+    post_json: PostJson,
+}
+
+/// What a journaled path held before the unit touched it.
+enum Old {
+    Missing,
+    /// A hard link to the old file, so journaling doesn't read it.
+    Link(PathBuf),
+    /// The old bytes, where the folder can't hard-link.
+    Bytes(Vec<u8>),
 }
 
 #[derive(Default)]
@@ -111,8 +128,11 @@ pub(crate) struct Stage {
     pub index: StageIndex,
     /// Files that didn't parse (or repeat a session id): `file: reason`. Never rewritten.
     pub skipped: Vec<String>,
-    journal: Option<Vec<(PathBuf, Option<Vec<u8>>)>>,
+    journal: Option<Vec<(PathBuf, Old)>>,
     next_ord: u64,
+    /// Reused for every session file write: a fresh multi-MB buffer per save left
+    /// hundreds of MB of freed blocks resident in the allocator.
+    buf: Vec<u8>,
 }
 
 /// SQLite (settings, render cache) plus the session folder.
@@ -149,6 +169,51 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// `data` as `to_vec_pretty` writes it plus a newline, into `bytes` (cleared first),
+/// reusing `cache` for unchanged posts.
+fn session_bytes(data: &mut SessionFile, mut cache: PostJson, bytes: &mut Vec<u8>) -> PostJson {
+    const EMPTY: &[u8] = b"\n  \"posts\": []";
+    let posts = std::mem::take(&mut data.posts);
+    bytes.clear();
+    serde_json::to_writer_pretty(&mut *bytes, &*data).expect("session serializes");
+    let mut fresh = PostJson::with_capacity(posts.len());
+    if !posts.is_empty() {
+        // Strings escape newlines and quotes, so this can only be the top-level key.
+        let close = bytes
+            .windows(EMPTY.len())
+            .position(|w| w == EMPTY)
+            .expect("posts is a top-level key")
+            + EMPTY.len()
+            - 1;
+        let tail = bytes.split_off(close);
+        for (i, post) in posts.iter().enumerate() {
+            let key = Arc::as_ptr(post) as usize;
+            let json = match cache.remove(&key) {
+                Some((_, json)) => json,
+                None => {
+                    let json = serde_json::to_vec_pretty(&**post).expect("post serializes");
+                    let mut out = Vec::with_capacity(json.len() + json.len() / 8);
+                    for &b in &json {
+                        out.push(b);
+                        if b == b'\n' {
+                            out.extend_from_slice(b"    ");
+                        }
+                    }
+                    out.into_boxed_slice()
+                }
+            };
+            bytes.extend_from_slice(if i == 0 { b"\n    " } else { b",\n    " });
+            bytes.extend_from_slice(&json);
+            fresh.insert(key, (post.clone(), json));
+        }
+        bytes.extend_from_slice(b"\n  ");
+        bytes.extend_from_slice(&tail);
+    }
+    data.posts = posts;
+    bytes.push(b'\n');
+    fresh
 }
 
 fn stamp(path: &Path) -> io::Result<Stamp> {
@@ -252,17 +317,18 @@ impl Stage {
         self.index.add_session(&data);
         self.next_ord += 1;
         let ord = self.next_ord;
-        self.sessions.insert(data.id.clone(), Entry { file, stamp, ord, data });
+        self.sessions.insert(data.id.clone(), Entry { file, stamp, ord, data, post_json: PostJson::new() });
     }
 
     /// Insert a new session or swap in a session's new contents, keeping its `ord`.
-    fn replace(&mut self, file: String, stamp: Stamp, data: SessionFile) {
+    fn replace(&mut self, file: String, stamp: Stamp, data: SessionFile, post_json: PostJson) {
         match self.sessions.get_mut(&data.id) {
             Some(entry) => {
                 self.index.remove_session(&entry.data);
                 self.index.add_session(&data);
                 entry.stamp = stamp;
                 entry.data = data;
+                entry.post_json = post_json;
             }
             None => self.insert(file, stamp, data),
         }
@@ -295,10 +361,17 @@ impl Stage {
         if journal.iter().any(|(p, _)| p == path) {
             return Ok(());
         }
-        let old = match fs::read(path) {
-            Ok(bytes) => Some(bytes),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(io_error("read", path, e)),
+        let name = path.file_name().expect("stage paths have a name").to_string_lossy();
+        let link = path.with_file_name(format!(".{name}.journal{TMP_SUFFIX}"));
+        let _ = fs::remove_file(&link); // left by a crash
+        let old = match fs::hard_link(path, &link) {
+            Ok(()) => Old::Link(link),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Old::Missing,
+            Err(_) => match fs::read(path) {
+                Ok(bytes) => Old::Bytes(bytes),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Old::Missing,
+                Err(e) => return Err(io_error("read", path, e)),
+            },
         };
         journal.push((path.to_owned(), old));
         Ok(())
@@ -348,7 +421,11 @@ impl Store {
 
     /// The unit committed: keep the files.
     pub fn commit(&self) {
-        self.stage_mut().journal = None;
+        for (_, old) in self.stage_mut().journal.take().unwrap_or_default() {
+            if let Old::Link(link) = old {
+                let _ = fs::remove_file(link);
+            }
+        }
     }
 
     /// The unit failed: put every journaled file back and reload the folder.
@@ -356,8 +433,11 @@ impl Store {
         let journal = self.stage_mut().journal.take().unwrap_or_default();
         for (path, old) in journal.into_iter().rev() {
             let result = match old {
-                Some(bytes) => atomic_write(&path, &bytes),
-                None => fs::remove_file(&path).or_else(|e| {
+                Old::Link(link) => fs::rename(&link, &path).and_then(|()| {
+                    fsync(&File::open(path.parent().expect("stage paths have a parent"))?)
+                }),
+                Old::Bytes(bytes) => atomic_write(&path, &bytes),
+                Old::Missing => fs::remove_file(&path).or_else(|e| {
                     if e.kind() == io::ErrorKind::NotFound { Ok(()) } else { Err(e) }
                 }),
             };
@@ -382,18 +462,23 @@ impl Store {
     }
 
     /// Write one session's file (creating it on first write) and remember its stamp.
-    pub(crate) fn save(&self, data: SessionFile) -> Result<()> {
+    pub(crate) fn save(&self, mut data: SessionFile) -> Result<()> {
         let mut stage = self.stage_mut();
-        let file = match stage.sessions.get(&data.id) {
-            Some(e) => e.file.clone(),
-            None => file_name(data.created_at, data.title.as_deref().unwrap_or(&data.agent), &data.id),
+        let (file, cache) = match stage.sessions.get_mut(&data.id) {
+            Some(e) => (e.file.clone(), std::mem::take(&mut e.post_json)),
+            None => (
+                file_name(data.created_at, data.title.as_deref().unwrap_or(&data.agent), &data.id),
+                PostJson::new(),
+            ),
         };
         let path = self.root.join(&file);
-        let mut bytes = serde_json::to_vec_pretty(&data).expect("session serializes");
-        bytes.push(b'\n');
-        stage.write(&path, &bytes)?;
+        let mut buf = std::mem::take(&mut stage.buf);
+        let post_json = session_bytes(&mut data, cache, &mut buf);
+        let written = stage.write(&path, &buf);
+        stage.buf = buf;
+        written?;
         let stamp = stamp(&path).map_err(|e| io_error("stat", &path, e))?;
-        stage.replace(file, stamp, data);
+        stage.replace(file, stamp, data, post_json);
         Ok(())
     }
 
@@ -452,7 +537,7 @@ impl Store {
         stage.write(&path, &bytes)?;
         stage.delete(trashed)?;
         let stamp = stamp(&path).map_err(|e| io_error("stat", &path, e))?;
-        stage.replace(file, stamp, data);
+        stage.replace(file, stamp, data, PostJson::new());
         Ok(())
     }
 
@@ -515,7 +600,7 @@ impl Store {
                 }
                 Some(now) if now != *old => match Stage::read_file(&self.root.join(file)) {
                     Ok((data, now)) if data.id == *id => {
-                        stage.replace(file.clone(), now, data);
+                        stage.replace(file.clone(), now, data, PostJson::new());
                         events.push(crate::store::event("session-updated", id, Some(id), None));
                     }
                     // Hand-edited into something we can't read: keep serving memory, and
@@ -551,5 +636,65 @@ impl Store {
             "migration": *self.migration.borrow(),
             "error": *self.problem.borrow(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn post(i: u64, parts: Vec<Part>) -> Arc<PostRec> {
+        Arc::new(PostRec {
+            id: format!("post{i}").into(),
+            title: format!("title \"{i}\"\n  \"posts\": []"),
+            version: 1,
+            created_at: 1,
+            updated_at: 2,
+            parts,
+            history: Vec::new(),
+        })
+    }
+
+    fn pretty(data: &SessionFile) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec_pretty(data).unwrap();
+        bytes.push(b'\n');
+        bytes
+    }
+
+    #[test]
+    fn spliced_bytes_match_whole_file_serialization() {
+        let mut data = SessionFile {
+            schema: SCHEMA,
+            id: "s1".into(),
+            agent: "a".into(),
+            title: Some("t".into()),
+            cwd: None,
+            owner: Some("o".into()),
+            created_at: 1,
+            last_active_at: 2,
+            agent_seq: 0,
+            posts: Vec::new(),
+            comments: Vec::new(),
+            trace: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        let cache = session_bytes(&mut data, PostJson::new(), &mut bytes);
+        assert_eq!(bytes, pretty(&data), "empty session");
+        data.posts = vec![
+            post(1, vec![Part::Markdown { markdown: "# a\n\nb".into(), id: None }]),
+            post(2, vec![Part::Json { data: serde_json::json!({"x": [1, {"y": []}], "z": {}}), id: Some("p".into()) }]),
+            post(3, Vec::new()),
+        ];
+        let cache = session_bytes(&mut data, cache, &mut bytes);
+        assert_eq!(bytes, pretty(&data), "fresh posts");
+        assert_eq!(cache.len(), 3);
+        let p = Arc::make_mut(&mut data.posts[1]);
+        p.history.push(VersionRec { version: 1, title: "old".into(), at: 1, parts: p.parts.clone() });
+        p.version = 2;
+        data.posts.remove(0);
+        data.posts.push(post(4, vec![Part::Markdown { markdown: "c".into(), id: None }]));
+        let cache = session_bytes(&mut data, cache, &mut bytes);
+        assert_eq!(bytes, pretty(&data), "one edited, one removed, one added, one cached");
+        assert_eq!(cache.len(), 3);
     }
 }

@@ -2,9 +2,15 @@
 # measured p50 (2026-10-25, M-series, a busy machine). Lower a line when you
 # make that path faster; raise one only with a reason in the commit. Run it on a
 # quiet machine: a parallel build or test run can push restart html past its line.
-restart mermaid 60
+# Re-measured 2026-10-30: repeated mermaid ~5 ms, unique ~8 ms,
+# Retained-page HTML ~26 ms; restart HTML with recycled views ~5 ms.
+# Leave headroom for process scheduling, not 5x regressions.
+restart mermaid 20
 restart image 2
-restart html 180
-warm mermaid 40
+restart html 15
+warm mermaid 10
 warm image 2
-warm html 160
+warm html 60
+unique mermaid 20
+unique image 2
+unique html 60
