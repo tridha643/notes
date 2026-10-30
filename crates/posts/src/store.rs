@@ -5,6 +5,7 @@
 use std::{
     cmp::Reverse,
     fs,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -86,21 +87,33 @@ fn load(s: &Store, id: &str) -> Result<SessionFile> {
         .ok_or_else(|| session_missing(id))
 }
 
-/// The session holding `post`, and the post's index in it.
-fn load_post(s: &Store, post: &str) -> Result<(SessionFile, usize)> {
-    let session = s
-        .stage()
+/// `f` on a session in place, for verbs that only read it.
+fn read<T>(s: &Store, id: &str, f: impl FnOnce(&SessionFile) -> T) -> Result<T> {
+    let stage = s.stage();
+    let entry = stage.sessions.get(id).ok_or_else(|| session_missing(id))?;
+    Ok(f(&entry.data))
+}
+
+/// `f` on the session holding `post` and the post's index in it, in place.
+fn read_post<T>(s: &Store, post: &str, f: impl FnOnce(&SessionFile, usize) -> T) -> Result<T> {
+    let stage = s.stage();
+    let file = stage
         .index
         .post_session(post)
-        .cloned()
+        .and_then(|id| stage.sessions.get(id))
+        .map(|e| &e.data)
         .ok_or_else(|| post_missing(post))?;
-    let file = load(s, &session)?;
     let at = file
         .posts
         .iter()
         .position(|p| p.id == post)
         .ok_or_else(|| post_missing(post))?;
-    Ok((file, at))
+    Ok(f(file, at))
+}
+
+/// The session holding `post`, and the post's index in it.
+fn load_post(s: &Store, post: &str) -> Result<(SessionFile, usize)> {
+    read_post(s, post, |file, at| (file.clone(), at))
 }
 
 // ---- Sessions ------------------------------------------------------------------
@@ -118,7 +131,7 @@ fn session_of(f: &SessionFile) -> Session {
 }
 
 pub fn session_get(s: &Store, id: &str) -> Result<Session> {
-    Ok(session_of(&load(s, id)?))
+    read(s, id, session_of)
 }
 
 fn create_session(
@@ -420,7 +433,7 @@ pub fn post_new(
         feedback: Vec::new(),
     };
     events.push(event("post-created", &post.id, Some(&file.id), Some(1)));
-    file.posts.push(post);
+    file.posts.push(Arc::new(post));
     file.last_active_at = at;
     let feedback = collect_feedback(&mut file);
     s.save(file)?;
@@ -436,7 +449,7 @@ fn write_version(
     parts: Option<Vec<Part>>,
 ) -> Result<Written<PostWriteResult>> {
     let time = now();
-    let p = &mut file.posts[at];
+    let p = Arc::make_mut(&mut file.posts[at]);
     p.history.push(VersionRec {
         version: p.version,
         title: p.title.clone(),
@@ -542,7 +555,7 @@ pub fn post_part(s: &Store, args: &PostPartArgs) -> Result<Written<PostWriteResu
 /// a session reads as the order its cards were made.
 pub fn post_list(s: &Store, args: &PostListArgs) -> Result<Vec<PostSummary>> {
     if let Some(id) = &args.session {
-        load(s, id)?;
+        read(s, id, |_| ())?;
     }
     let stage = s.stage();
     let mut posts: Vec<(i64, u64, PostSummary)> = stage
@@ -563,7 +576,10 @@ pub fn post_list(s: &Store, args: &PostListArgs) -> Result<Vec<PostSummary>> {
 
 /// The current version, or any older one.
 pub fn post_show(s: &Store, args: &PostShowArgs) -> Result<Post> {
-    let (file, at) = load_post(s, &args.id)?;
+    read_post(s, &args.id, |file, at| show(file, at, args))?
+}
+
+fn show(file: &SessionFile, at: usize, args: &PostShowArgs) -> Result<Post> {
     let p = &file.posts[at];
     let (title, parts, version, updated_at) = match args.version {
         None => (&p.title, &p.parts, p.version, p.updated_at),
@@ -869,7 +885,7 @@ pub fn asset_put(s: &Store, args: &AssetPutArgs) -> Result<AssetInfo> {
         return Err(usage(format!("asset exceeds {MAX_ASSET_BYTES} bytes")));
     }
     if let Some(id) = &args.session {
-        load(s, id)?;
+        read(s, id, |_| ())?;
     }
     let id = hex(&Sha256::digest(&data));
     if let Some(meta) = asset_meta(s, &id) {
@@ -932,7 +948,7 @@ pub fn trace_set(s: &Store, args: &TraceSetArgs) -> Result<Written<usize>> {
 }
 
 pub fn trace_list(s: &Store, session: &str) -> Result<Vec<TraceStep>> {
-    Ok(load(s, session)?.trace)
+    read(s, session, |f| f.trace.clone())
 }
 
 // ---- Settings ------------------------------------------------------------------

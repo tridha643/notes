@@ -31,6 +31,8 @@ pub struct Feed {
     pub slots: Vec<(VisualKey, Slot)>,
     /// First line of each post, by index into `App::posts`.
     pub starts: Vec<usize>,
+    /// The local day the headers' times were written on (`ui::today`).
+    day: (i32, i32),
 }
 
 /// Everything the feed reads: per post (id, version, fold generation, built),
@@ -615,8 +617,12 @@ impl App {
     // ---- Posts ------------------------------------------------------------------
 
     fn version_of(&self, id: &PostId) -> Option<u64> {
-        let latest = self.posts.iter().find(|p| &p.id == id).map(|p| p.version)?;
-        Some(self.views.get(id).and_then(|v| v.pinned).unwrap_or(latest))
+        self.posts.iter().find(|p| &p.id == id).map(|p| self.listed_version(p))
+    }
+
+    /// The version shown for a listed post: the pinned one, else its latest.
+    fn listed_version(&self, p: &PostSummary) -> u64 {
+        self.views.get(&p.id).and_then(|v| v.pinned).unwrap_or(p.version)
     }
 
     fn show(&mut self, id: PostId) -> Vec<Effect> {
@@ -723,11 +729,11 @@ impl App {
         let posts: Vec<(PostId, u64, u64, bool)> = self
             .posts
             .iter()
-            .filter_map(|p| {
-                let v = self.version_of(&p.id)?;
+            .map(|p| {
+                let v = self.listed_version(p);
                 let fold_gen = self.views.get(&p.id).map_or(0, |v| v.fold_gen);
                 let built = self.loaded.get(&(p.id.clone(), v)).is_some_and(|l| l.cards.is_some());
-                Some((p.id.clone(), v, fold_gen, built))
+                (p.id.clone(), v, fold_gen, built)
             })
             .collect();
         let key: FeedKey = (posts.clone(), width, page, self.cell_px, self.comments_gen, self.visual_gen, self.focused_card.clone());
@@ -737,8 +743,15 @@ impl App {
                 let (post, _) = *f.hits.get(self.cursor)?;
                 Some((self.posts.get(post)?.id.clone(), self.cursor - f.starts[post], self.cursor.saturating_sub(self.scroll)))
             });
-            let mut feed = Feed::default();
-            for (i, (id, version, _, _)) in posts.iter().enumerate() {
+            // Posts only appended (a burst while following): lay out just the new ones
+            // instead of copying every post's lines again. Headers show the date, so not
+            // across midnight.
+            let today = ui::today();
+            let (from, mut feed) = match self.feed.take() {
+                Some((k, f)) if f.day == today && k.0.len() < posts.len() && posts.starts_with(&k.0) && (k.1, k.2, k.3, k.4, k.5, &k.6) == (key.1, key.2, key.3, key.4, key.5, &key.6) => (k.0.len(), f),
+                _ => (0, Feed { day: today, ..Feed::default() }),
+            };
+            for (i, (id, version, _, _)) in posts.iter().enumerate().skip(from) {
                 feed.starts.push(feed.lines.len());
                 if self.focused_card.as_ref().is_some_and(|(post, _)| post != id) {
                     continue;
@@ -1433,7 +1446,16 @@ impl App {
             }
             "post-created" | "post-updated" | "post-deleted" if mine => {
                 let id = PostId::from(e.id.clone().unwrap_or_default());
-                fx.push(Effect::Request(StageRequest::PostList(self.open.clone().unwrap())));
+                // Events trail the post list: in a burst, one reply already holds the
+                // posts of the hundreds of events queued behind it, so list only for news.
+                let listed = self.posts.iter().find(|p| p.id == id).map(|p| p.version);
+                let known = match e.kind.as_str() {
+                    "post-deleted" => listed.is_none(),
+                    _ => listed.is_some_and(|v| v >= e.version.unwrap_or(1)),
+                };
+                if !known {
+                    fx.push(Effect::Request(StageRequest::PostList(self.open.clone().unwrap())));
+                }
                 if e.kind == "post-updated" {
                     if let Some(v) = e.version {
                         let pinned = self.views.get(&id).and_then(|v| v.pinned).is_some();
@@ -1543,10 +1565,9 @@ impl App {
                     self.shown.clone().or(last)
                 };
                 // The feed shows every post, so load them all.
-                for p in self.posts.clone() {
-                    if let Some(v) = self.version_of(&p.id) {
-                        fx.extend(self.load(p.id.clone(), v));
-                    }
+                let versions: Vec<_> = self.posts.iter().map(|p| (p.id.clone(), self.listed_version(p))).collect();
+                for (id, v) in versions {
+                    fx.extend(self.load(id, v));
                 }
                 if let Some(id) = target {
                     fx.extend(self.show(id));
@@ -2383,6 +2404,50 @@ mod tests {
         app.loaded.insert(("b".into(), 3), Loaded { post: Some(diagram(3)), render: Some(render(3)), cards });
         app.visuals.insert(("b".into(), 3, 0), VisualState::Pending);
         assert_eq!(app.feed().lines.len(), shown);
+    }
+
+    #[test]
+    fn a_burst_of_events_lists_posts_only_for_changes_the_list_lacks() {
+        let mut db = fake();
+        let mut app = booted(&db);
+        let mut lists = 0;
+        let mut send = |app: &mut App, msg, db: &Fake| {
+            let fx = app.update(msg);
+            lists += requests(&fx).iter().filter(|r| matches!(r, StageRequest::PostList(_))).count();
+            serve(app, fx, db);
+        };
+        // Three posts land before stage hears of any: the first event's list shows them all.
+        for id in ["c", "d", "e"] {
+            db.posts.push(summary(id, "s1", 1));
+        }
+        for id in ["c", "d", "e"] {
+            send(&mut app, post_event("post-created", id, 1), &db);
+        }
+        assert_eq!((order(&app), app.shown.as_deref()), (vec!["a", "b", "c", "d", "e"], Some("e")));
+        // A version or a deletion the list hasn't seen is listed.
+        db.posts.iter_mut().find(|p| p.id == "c").unwrap().version = 2;
+        send(&mut app, post_event("post-updated", "c", 2), &db);
+        db.posts.retain(|p| p.id != "d");
+        send(&mut app, post_event("post-deleted", "d", 1), &db);
+        send(&mut app, post_event("post-deleted", "d", 1), &db);
+        assert_eq!((order(&app), app.version_of(&"c".into())), (vec!["a", "b", "c", "e"], Some(2)));
+        assert_eq!(lists, 3);
+    }
+
+    #[test]
+    fn a_feed_grown_by_new_posts_matches_one_laid_out_from_scratch() {
+        let mut db = tall();
+        let mut app = booted(&db);
+        app.feed();
+        for id in ["e", "f"] {
+            db.posts.push(summary(id, "s1", 1));
+            send(&mut app, post_event("post-created", id, 1), &db);
+            app.feed();
+        }
+        let grown = std::mem::take(&mut app.feed).unwrap().1;
+        let fresh = app.feed();
+        assert_eq!((&grown.lines, &grown.hits, &grown.starts, &grown.slots), (&fresh.lines, &fresh.hits, &fresh.starts, &fresh.slots));
+        assert_eq!((app.shown.as_deref(), app.cursor), (Some("f"), grown.starts[5]));
     }
 
     #[test]

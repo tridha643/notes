@@ -118,6 +118,24 @@ fn call(d: &Daemon, verb: &Verb, author: &str, cwd: Option<&str>) -> R<Value> {
     }
 }
 
+/// The read verbs stage calls on every change, answered with JSON text written from their
+/// types (outside the lock where it can be) instead of the `Value` tree `call` builds.
+/// The response line is the same.
+fn call_json(d: &Daemon, verb: &Verb, author: &str) -> Option<R<String>> {
+    use notes_posts as p;
+    fn text(v: impl serde::Serialize) -> String {
+        serde_json::to_string(&v).expect("results serialize")
+    }
+    Some(match verb {
+        Verb::PostList(a) => d.unit(author, |tx| p::post_list(tx.store, a).map_err(Fail)).map(text),
+        Verb::PostShow(a) => d.unit(author, |tx| p::post_show(tx.store, a).map_err(Fail)).map(text),
+        Verb::PostRender(a) => {
+            d.unit(author, |tx| p::post_render_json(tx.store, &d.render, a).map_err(Fail))
+        }
+        _ => return None,
+    })
+}
+
 fn batch(d: &Daemon, b: &BatchArgs, author: &str, cwd: Option<&str>) -> Vec<BatchOutcome> {
     let ok = |result| BatchOutcome::Ok { ok: True, result };
     let err = |Fail(error)| BatchOutcome::Err { ok: False, error };
@@ -282,13 +300,24 @@ fn serve(d: Arc<Daemon>, stream: UnixStream) {
                     .filter(|a| !a.trim().is_empty())
                     .unwrap_or("human");
                 let cwd = req.cwd.as_deref().and_then(|c| c.to_str());
-                match call(&d, &req.verb, author, cwd) {
-                    Ok(result) => Response::Ok {
-                        id: req.id,
-                        ok: True,
-                        result,
+                match call_json(&d, &req.verb, author) {
+                    // What `to_line` writes for `Response::Ok`, with the result spliced in.
+                    Some(Ok(json)) => {
+                        let reply = format!("{{\"id\":{},\"ok\":true,\"result\":{json}}}\n", req.id);
+                        if out.write_all(reply.as_bytes()).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    Some(Err(Fail(e))) => Response::err(req.id, e),
+                    None => match call(&d, &req.verb, author, cwd) {
+                        Ok(result) => Response::Ok {
+                            id: req.id,
+                            ok: True,
+                            result,
+                        },
+                        Err(Fail(e)) => Response::err(req.id, e),
                     },
-                    Err(Fail(e)) => Response::err(req.id, e),
                 }
             }
         };

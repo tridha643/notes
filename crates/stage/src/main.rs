@@ -2,8 +2,8 @@
 //!
 //! Three blocking sources feed one channel: crossterm's reader (keys, mouse,
 //! SIGWINCH resizes), the notesd watch stream, and nothing else. The loop
-//! blocks on the channel, drains everything pending, then draws once, so an
-//! idle stage never wakes and a 240-key paste is one frame.
+//! blocks on the channel, drains what's pending (for up to 4 ms), then draws once,
+//! so an idle stage never wakes and a 240-key paste is one frame.
 
 use std::{
     io::{self, Write},
@@ -39,6 +39,10 @@ fn restore() {
     let _ = execute!(out, DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen, Show);
     let _ = disable_raw_mode();
 }
+
+/// The most one turn spends taking further messages before it paints, so a steady
+/// stream of events can't hold a frame back.
+const TURN: Duration = Duration::from_millis(4);
 
 /// How long after the last scroll live pages start moving again.
 const SCROLL_SETTLE: Duration = Duration::from_millis(150);
@@ -312,7 +316,8 @@ fn main() -> ExitCode {
         };
         let t = std::time::Instant::now();
         let mut n = 0;
-        for msg in std::iter::once(msg).chain(std::iter::from_fn(|| rx.try_recv().ok())) {
+        // The clock is read before each `try_recv`, so a message past the bound stays queued.
+        for msg in std::iter::once(msg).chain(std::iter::from_fn(|| (t.elapsed() < TURN).then(|| rx.try_recv().ok()).flatten())) {
             n += 1;
             if is_scroll(&msg) {
                 scrolled_at = Some(std::time::Instant::now());
@@ -331,16 +336,6 @@ fn main() -> ExitCode {
         if let Some(f) = loop_trace.as_mut() {
             let _ = writeln!(f, "update {n} msgs {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn osc52_base64() {
-        assert_eq!(super::base64_lite::encode(b"hi!"), "aGkh");
-        assert_eq!(super::base64_lite::encode(b"hi"), "aGk=");
-        assert_eq!(super::base64_lite::encode(b"h"), "aA==");
     }
 }
 
@@ -376,4 +371,14 @@ fn exit_on_hangup() {
 fn cell_px() -> Option<(u16, u16)> {
     let s = crossterm::terminal::window_size().ok()?;
     (s.width > 0 && s.height > 0 && s.columns > 0 && s.rows > 0).then(|| (s.width / s.columns, s.height / s.rows))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn osc52_base64() {
+        assert_eq!(super::base64_lite::encode(b"hi!"), "aGkh");
+        assert_eq!(super::base64_lite::encode(b"hi"), "aGk=");
+        assert_eq!(super::base64_lite::encode(b"h"), "aA==");
+    }
 }

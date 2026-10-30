@@ -20,6 +20,7 @@ use stage::{
     cards::VisualSource,
     client::StageClient,
     gallery::Gallery,
+    kitty,
 };
 
 struct Proc(Child);
@@ -40,10 +41,14 @@ fn pct(v: &mut [f64], p: f64) -> f64 {
 }
 
 /// One round: ask for all three kinds at once (as stage does on open), wait for each.
-fn round(g: &mut Gallery, rx: &mpsc::Receiver<Msg>, n: u64, asset: &str, fx: &Path) -> HashMap<&'static str, f64> {
-    let target = Target { width_px: 66 * 14, max_height_px: 18 * 30 };
+fn round(g: &mut Gallery, rx: &mpsc::Receiver<Msg>, n: u64, asset: &str, fx: &Path, unique: bool) -> HashMap<&'static str, f64> {
+    let mut diagram = std::fs::read_to_string(fx.join("flow.mmd")).unwrap();
+    if unique {
+        // Different rendered labels force a parse miss, not merely a new post id.
+        diagram = diagram.replace("notes post", &format!("notes post {n}"));
+    }
     let kinds: [(&str, VisualSource); 3] = [
-        ("mermaid", VisualSource::Mermaid(std::fs::read_to_string(fx.join("flow.mmd")).unwrap())),
+        ("mermaid", VisualSource::Mermaid(diagram)),
         ("image", VisualSource::Asset(asset.into())),
         ("html", VisualSource::Html(std::fs::read_to_string(fx.join("anim.html")).unwrap())),
     ];
@@ -54,7 +59,7 @@ fn round(g: &mut Gallery, rx: &mpsc::Receiver<Msg>, n: u64, asset: &str, fx: &Pa
         let key: VisualKey = (format!("bench-{kind}-{n}").into(), n, i);
         asked.insert(key.clone(), (kind, Instant::now()));
         let mut sink = Vec::new();
-        for m in g.need(&mut sink, key.clone(), source, target) {
+        for m in g.need(&mut sink, key.clone(), source) {
             match m {
                 Msg::VisualReady { .. } => {
                     done_now.insert(kind, asked[&key].1.elapsed().as_secs_f64() * 1000.0);
@@ -68,6 +73,8 @@ fn round(g: &mut Gallery, rx: &mpsc::Receiver<Msg>, n: u64, asset: &str, fx: &Pa
     while done.len() < 3 {
         let msg = rx.recv_timeout(Duration::from_secs(20)).expect("a visual within 20 s");
         let Msg::Gfx(gfx) = msg else { continue };
+        // No terminal consumes t=s here, so release the buffers after transmission.
+        let shm = gfx.shm_name();
         for m in g.handle(&mut sink, gfx) {
             match m {
                 Msg::VisualReady { key, .. } => {
@@ -79,6 +86,7 @@ fn round(g: &mut Gallery, rx: &mpsc::Receiver<Msg>, n: u64, asset: &str, fx: &Pa
                 _ => {}
             }
         }
+        if let Some(shm) = shm { kitty::unlink(&shm); }
         sink.clear();
     }
     // Nothing is on screen in the bench: pages pause, as off-screen pages do in stage.
@@ -92,7 +100,7 @@ fn main() {
         eprintln!("SKIP: build notesd first");
         return;
     };
-    let helper = root().join("apps/Notes/.build/out/Products/Release/stage-helper");
+    let helper = std::env::var_os("STAGE_HELPER").map(PathBuf::from).unwrap_or_else(|| root().join("apps/Notes/.build/release/stage-helper"));
     if !helper.exists() {
         eprintln!("SKIP: build stage-helper first (swift build -c release --product stage-helper)");
         return;
@@ -127,37 +135,43 @@ fn main() {
     let asset = serde_json::from_str::<serde_json::Value>(&line).unwrap()["result"]["id"].as_str().unwrap().to_owned();
 
     let mut results: HashMap<(&str, &str), Vec<f64>> = HashMap::new();
+    let target = Target { width_px: 924, max_height_px: 540, html_height_px: 540, cell_px: (14, 30) };
     let cold_runs = 5;
     for n in 0..cold_runs {
         let (tx, rx) = mpsc::channel();
         // A cache folder of its own: no helper is listening there yet, so this is a true cold start.
-        let mut g = Gallery::new(tx, StageClient::new(sock.clone()), dir.join(format!("cold-{n}")), dir.join("home/Desktop/Stage"), Target { width_px: 924, max_height_px: 540 });
+        let mut g = Gallery::new(tx, StageClient::new(sock.clone()), dir.join(format!("cold-{n}")), dir.join("home/Desktop/Stage"), target);
         // As stage does after its first frame; the requests follow at once (worst case).
         g.warm();
-        for (kind, ms) in round(&mut g, &rx, n, &asset, &fx) {
+        for (kind, ms) in round(&mut g, &rx, n, &asset, &fx, false) {
             results.entry(("cold", kind)).or_default().push(ms);
         }
     }
     let (tx, rx) = mpsc::channel();
-    let mut g = Gallery::new(tx, StageClient::new(sock.clone()), dir.join("cache"), dir.join("home/Desktop/Stage"), Target { width_px: 924, max_height_px: 540 });
-    round(&mut g, &rx, 100, &asset, &fx);
+    let mut g = Gallery::new(tx, StageClient::new(sock.clone()), dir.join("cache"), dir.join("home/Desktop/Stage"), target);
+    round(&mut g, &rx, 100, &asset, &fx, false);
     for n in 0..10 {
-        for (kind, ms) in round(&mut g, &rx, 200 + n, &asset, &fx) {
+        for (kind, ms) in round(&mut g, &rx, 200 + n, &asset, &fx, false) {
             results.entry(("warm", kind)).or_default().push(ms);
+        }
+    }
+    for n in 0..10 {
+        for (kind, ms) in round(&mut g, &rx, 400 + n, &asset, &fx, true) {
+            results.entry(("unique", kind)).or_default().push(ms);
         }
     }
     // A stage that starts while the shared helper is already up (every start but the first).
     for n in 0..5 {
         let (tx, rx) = mpsc::channel();
-        let mut g = Gallery::new(tx, StageClient::new(sock.clone()), dir.join("cache"), dir.join("home/Desktop/Stage"), Target { width_px: 924, max_height_px: 540 });
+        let mut g = Gallery::new(tx, StageClient::new(sock.clone()), dir.join("cache"), dir.join("home/Desktop/Stage"), target);
         g.warm();
-        for (kind, ms) in round(&mut g, &rx, 300 + n, &asset, &fx) {
+        for (kind, ms) in round(&mut g, &rx, 300 + n, &asset, &fx, false) {
             results.entry(("restart", kind)).or_default().push(ms);
         }
     }
     println!("visual request → transmitted (ms)        p50      p95");
     let mut p50 = HashMap::new();
-    for state in ["cold", "restart", "warm"] {
+    for state in ["cold", "restart", "warm", "unique"] {
         for kind in ["mermaid", "image", "html"] {
             let v = results.get_mut(&(state, kind)).unwrap();
             let (mid, high) = (pct(v, 0.5), pct(v, 0.95));
@@ -165,6 +179,8 @@ fn main() {
             p50.insert(format!("{state} {kind}"), mid);
         }
     }
+    drop(g);
+    drop(_notesd);
     let _ = Command::new("pkill").arg("-f").arg(dir.to_string_lossy().as_ref()).status();
     let _ = std::fs::remove_dir_all(&dir);
     // Ratchet: a run over any p50 ceiling in budget.txt fails, so a later change

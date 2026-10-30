@@ -5,7 +5,7 @@
 # to the socket; paint times come from stage's STAGE_LATENCY_LOG.
 set -eu
 cd "$(dirname "$0")/.."
-. "$HOME/.cargo/env"
+[ ! -f "$HOME/.cargo/env" ] || . "$HOME/.cargo/env"
 cargo build -q --release -p notesd -p stage
 dir=$(mktemp -d /tmp/stl.XXXXXX)
 trap 'kill $stage_pid $notesd_pid 2>/dev/null; rm -rf "$dir"' EXIT
