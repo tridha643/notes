@@ -17,6 +17,26 @@ cursor, else the shown post · `D` delete the selected session (deletes wait for
 older version · `o` open html in the browser · `:` commands (`open copy versions rerender
 help`) · `q` quit. The sidebar lists sessions only; a session's posts are in the feed.
 
+## Phone and narrow panes
+
+Below 60 columns, the feed stays full-width. Tap `≡` (or press `s`) for a
+full-width session picker; tap a session or press Enter to open it, and Escape
+or `s` to return without losing your place. Search results remain visible even
+when the sidebar is hidden. The compact bottom controls are tappable: up/down
+page with one line of overlap, find, reply, and focus (as space permits).
+
+Wheel events move one line in narrow panes or feeds shorter than 20 rows,
+including when a phone keyboard reduces the viewport. Scrolling back within
+the newest post pauses auto-follow until you reach the bottom again. Stage
+handles the wheel events Rex sends; native swipe recognition and inertia remain
+Rex's responsibility. Mouse drags still select/copy text.
+
+Wide markdown tables stack into labelled fields when columns would become
+unreadable. Long inputs keep their insertion point visible. HTML and newly
+rendered diagrams scale typography relative to high-density terminal rows
+rather than assuming every client uses a 2x display; the agent's reported CSS
+viewport uses the same scale. This does not remove HTML's viewport-height cap.
+
 ## Structure
 
 The code splits IO from decisions, so nearly everything is testable without a terminal:

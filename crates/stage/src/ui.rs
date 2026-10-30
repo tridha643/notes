@@ -150,6 +150,18 @@ pub fn geometry_for(app: &App) -> Geometry {
     g
 }
 
+/// A picker replaces (rather than squeezes) the feed on a phone. Search must
+/// also remain visible when the desktop sidebar was explicitly hidden.
+pub fn session_area(app: &App) -> Option<Rect> {
+    let g = geometry_for(app);
+    (app.session_picker || (matches!(app.mode, Mode::Search { .. }) && g.sidebar.width == 0))
+        .then(|| Rect::new(0, g.main.y, app.size.0, g.main.height))
+}
+
+pub fn search_offset(selected: usize, height: u16) -> usize {
+    (selected + 1).saturating_sub(height.saturating_sub(1) as usize)
+}
+
 /// First sidebar row on screen, so the selection stays visible.
 pub fn sidebar_offset(app: &App, height: u16) -> usize {
     (app.sel + 1).saturating_sub(height as usize)
@@ -208,16 +220,16 @@ fn bar(spans: Vec<Span<'static>>, width: u16, bg: Color) -> Paragraph<'static> {
     Paragraph::new(Line::from(spans)).style(Style::new().bg(bg))
 }
 
-fn clip(s: &str, max: usize) -> String {
-    if s.width() <= max {
-        return s.to_owned();
-    }
+pub fn clip(s: &str, max: usize) -> String {
+    if max == 0 { return String::new(); }
+    if s.width() <= max { return s.to_owned(); }
     let mut out = String::new();
+    let mut used = 0;
     for c in s.chars() {
-        if out.width() + 1 >= max {
-            break;
-        }
+        let width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + width > max - 1 { break; }
         out.push(c);
+        used += width;
     }
     out.push('…');
     out
@@ -240,18 +252,35 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Some(b) => head.push(Span::styled(format!(" · {b}"), Style::new().fg(PEACH).add_modifier(Modifier::BOLD))),
         None => head.push(Span::styled(" · live", dim())),
     }
+    if app.size.0 < SIDEBAR_MIN_WIDTH {
+        let name = if app.session_picker { "Sessions".to_owned() }
+            else if matches!(app.mode, Mode::Search { .. }) { "Search sessions".to_owned() }
+            else { open.map(|s| crate::sanitize::sanitize(s.title.as_deref().unwrap_or(&s.agent)).into_owned()).unwrap_or_else(|| "stage".into()) };
+        let status = app.banner.as_ref().map(|s| format!(" · {}", clip(s, app.size.0 as usize / 2))).unwrap_or_default();
+        head = vec![
+            Span::styled(" ≡ ", bold().fg(BLUE)),
+            Span::styled(clip(&name, (app.size.0 as usize).saturating_sub(3 + status.width())), bold().fg(TEAL)),
+            Span::styled(status, Style::new().fg(PEACH)),
+        ];
+    }
     f.render_widget(bar(head, g.header.width, BAR), g.header);
 
-    if g.sidebar.width > 0 {
-        sidebar(f, app, g.sidebar);
-        let sep = Rect::new(g.sidebar.x + g.sidebar.width, g.sidebar.y, 1, g.sidebar.height);
-        f.render_widget(Paragraph::new(vec![Line::styled("│", border()); sep.height as usize]), sep);
+    if let Some(area) = session_area(app) {
+        app.on_screen.clear();
+        sidebar(f, app, area);
+    } else {
+        if g.sidebar.width > 0 {
+            sidebar(f, app, g.sidebar);
+            let sep = Rect::new(g.sidebar.x + g.sidebar.width, g.sidebar.y, 1, g.sidebar.height);
+            f.render_widget(Paragraph::new(vec![Line::styled("│", border()); sep.height as usize]), sep);
+        }
+        main(f, app, g.main);
     }
-    main(f, app, g.main);
 
     let keys = match &app.mode {
         Mode::Nav => match &app.toast {
             Some(t) => vec![Span::styled(format!(" {t}"), Style::new().fg(YELLOW))],
+            None if app.size.0 < SIDEBAR_MIN_WIDTH => chips(compact_keys(app)),
             None => chips(&[
                 ("j/k", "post"),
                 ("J/K", "session"),
@@ -267,15 +296,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 ("q", "quit"),
             ]),
         },
-        Mode::Search { query, .. } => prompt("search", query, &[("enter", "open"), ("esc", "cancel")]),
+        Mode::Search { query, .. } => prompt("search", query, &[("enter", "open"), ("esc", "cancel")], g.keybar.width),
         Mode::Comment { input } => {
             let on = app.shown_post().map(|p| crate::sanitize::sanitize(&p.title).into_owned()).unwrap_or_default();
-            prompt(&format!("comment on “{}”", clip(&on, 30)), input, &[("enter", "send"), ("esc", "cancel")])
+            let label = if app.size.0 < SIDEBAR_MIN_WIDTH { "reply".into() } else { format!("comment on “{}”", clip(&on, 30)) };
+            prompt(&label, input, &[("enter", "send"), ("esc", "cancel")], g.keybar.width)
         }
-        Mode::Command { input } => prompt(":", input, &[("enter", "run"), ("esc", "cancel")]),
-        Mode::Rename { input, .. } => prompt("rename session", input, &[("enter", "save"), ("esc", "cancel")]),
+        Mode::Command { input } => prompt(":", input, &[("enter", "run"), ("esc", "cancel")], g.keybar.width),
+        Mode::Rename { input, .. } => prompt("rename", input, &[("enter", "save"), ("esc", "cancel")], g.keybar.width),
         Mode::Delete { what, .. } => {
-            let mut spans = vec![Span::styled(format!(" delete {}? ", clip(what, 50)), bold().fg(RED))];
+            let mut spans = vec![Span::styled(format!(" delete {}? ", clip(what, (g.keybar.width as usize).saturating_sub(37))), bold().fg(RED))];
             spans.extend(chips(&[("y", "delete"), ("any key", "cancel")]).into_iter().skip(1));
             spans
         }
@@ -296,14 +326,65 @@ fn chips(keys: &[(&str, &str)]) -> Vec<Span<'static>> {
     spans
 }
 
-/// An input line in the keybar: a labelled chip, the text, a cursor, then its keys.
-fn prompt(label: &str, input: &str, keys: &[(&str, &str)]) -> Vec<Span<'static>> {
+/// Compact controls are both keyboard hints and tappable targets. Use the same
+/// fitted list for drawing and hit-testing, so no invisible action is clickable.
+fn compact_keys(app: &App) -> &'static [(&'static str, &'static str)] {
+    let keys: &[(&str, &str)] = if app.session_picker {
+        &[("↑", "up"), ("↓", "down"), ("⏎", "open"), ("/", "find"), ("s", "back")]
+    } else {
+        &[("↑", "up"), ("↓", "down"), ("/", "find"), ("c", "reply"), ("z", "focus")]
+    };
+    let mut used = 1;
+    let count = keys.iter().enumerate().take_while(|(i, (key, label))| {
+        used += key.width() + 1 + label.width() + if *i == 0 { 0 } else { 3 };
+        used <= app.size.0 as usize
+    }).count();
+    &keys[..count]
+}
+
+pub fn compact_action(app: &App, col: u16) -> Option<crossterm::event::KeyCode> {
+    use crossterm::event::KeyCode;
+    if app.size.0 >= SIDEBAR_MIN_WIDTH || app.toast.is_some() { return None; }
+    let mut start = 1;
+    for (key, label) in compact_keys(app) {
+        let end = start + key.width() + 1 + label.width();
+        if (start..end).contains(&(col as usize)) {
+            return Some(match *key {
+                "↑" if !app.session_picker => KeyCode::PageUp,
+                "↓" if !app.session_picker => KeyCode::PageDown,
+                "↑" => KeyCode::Up,
+                "↓" => KeyCode::Down,
+                "⏎" => KeyCode::Enter,
+                _ => KeyCode::Char(key.chars().next()?),
+            });
+        }
+        start = end + 3;
+    }
+    None
+}
+
+/// Keep the insertion point visible by showing the tail of long input. Hints
+/// yield to input on narrow screens instead of pushing the cursor off-screen.
+fn prompt(label: &str, input: &str, keys: &[(&str, &str)], width: u16) -> Vec<Span<'static>> {
+    let width = width as usize;
+    let label = clip(label, width.saturating_sub(4).min(width / 2));
+    let room = width.saturating_sub(label.width() + 3);
+    let mut tail = String::new();
+    let mut used = 0;
+    for c in input.chars().rev() {
+        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + cw > room { break; }
+        tail.push(c);
+        used += cw;
+    }
     let mut spans = vec![
         Span::styled(format!(" {label} "), bold().fg(BLUE)),
-        Span::styled(input.to_owned(), Style::new().fg(TEXT)),
-        Span::styled("▏   ", Style::new().fg(BLUE)),
+        Span::styled(tail.chars().rev().collect::<String>(), Style::new().fg(TEXT)),
+        Span::styled("▏", Style::new().fg(BLUE)),
     ];
-    spans.extend(chips(keys).into_iter().skip(1));
+    let hints = chips(keys);
+    let hints_width: usize = hints.iter().map(|s| s.content.width()).sum();
+    if label.width() + used + 3 + hints_width <= width { spans.extend(hints); }
     spans
 }
 
@@ -335,13 +416,12 @@ fn sidebar(f: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::new();
     if let Mode::Search { hits, sel, query } = &app.mode {
         lines.push(Line::styled(format!(" {} matches", hits.len()), bold().fg(TEXT)));
-        for (i, hit) in hits.iter().enumerate() {
-            let title = hit.session.title.as_deref().unwrap_or(&hit.session.id);
+        let offset = search_offset(*sel, area.height);
+        for (i, hit) in hits.iter().enumerate().skip(offset).take(area.height.saturating_sub(1) as usize) {
+            let title = crate::sanitize::sanitize(hit.session.title.as_deref().unwrap_or(&hit.session.id));
+            let text = hit.text.as_ref().map(|t| format!(" · {}", crate::sanitize::sanitize(t))).unwrap_or_default();
             let style = if i == *sel { Style::new().bg(SELECTED) } else { Style::new() };
-            lines.push(Line::styled(format!(" {:<w$}", clip(title, w - 2), w = w - 1), style.add_modifier(Modifier::BOLD)));
-            if let Some(text) = &hit.text {
-                lines.push(Line::styled(format!("   {:<w$}", clip(&crate::sanitize::sanitize(text), w - 4), w = w - 3), style.fg(BORDER)));
-            }
+            lines.push(Line::styled(format!(" {}", clip(&format!("{title}{text}"), w.saturating_sub(1))), style.add_modifier(Modifier::BOLD)));
         }
         if hits.is_empty() && !query.is_empty() {
             lines.push(Line::styled(" no sessions match", dim()));
@@ -409,6 +489,16 @@ fn main(f: &mut Frame, app: &mut App, area: Rect) {
     if total > body.height as usize {
         let last = (scroll + body.height as usize).min(total);
         spans.push(Span::styled(format!("  ↕ {}–{last} / {total}", scroll + 1), dim()));
+    }
+    if area.width < SIDEBAR_MIN_WIDTH {
+        let position = if total > body.height as usize {
+            format!(" ↕ {}–{}/{total}", scroll + 1, (scroll + body.height as usize).min(total))
+        } else { String::new() };
+        let label = if app.focused_card.is_some() { format!("focus · {name}") } else { name };
+        spans = vec![
+            Span::styled(format!(" {}", clip(&label, (area.width as usize).saturating_sub(1 + position.width()))), bold().fg(TEXT)),
+            Span::styled(position, dim()),
+        ];
     }
     f.render_widget(bar(spans, title.width, BAR), title);
     let content = Rect::new(body.x + 1, body.y, body.width.saturating_sub(1), body.height);

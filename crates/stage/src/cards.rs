@@ -587,6 +587,27 @@ fn markdown_lines(src: &str, width: usize) -> Vec<Line<'static>> {
         let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
         let natural: Vec<usize> =
             (0..cols).map(|c| rows.iter().filter_map(|r| r.get(c)).map(Line::width).max().unwrap_or(0).max(1)).collect();
+        // On a phone, a wide grid becomes labelled fields instead of tiny
+        // columns (or a grid wider than its card). Keep every value and style.
+        let readable = natural.iter().map(|w| (*w).clamp(3, 8)).sum::<usize>() + 3 * cols + 1;
+        if readable > width.saturating_sub(prefix.width()) {
+            for (r, cells) in rows.iter().enumerate().skip(1) {
+                if r > 1 { out.push(Line::default()); }
+                for (c, cell) in cells.iter().enumerate() {
+                    let mut spans = vec![Span::raw(prefix.to_owned())];
+                    if let Some(label) = rows.first().and_then(|header| header.get(c)) {
+                        spans.extend(label.spans.clone());
+                        spans.push(Span::styled(": ", ui::dim()));
+                    }
+                    spans.extend(cell.spans.clone());
+                    out.extend(wrap(&Line::from(spans), width));
+                }
+            }
+            if rows.len() == 1 {
+                for cell in &rows[0] { out.extend(wrap(cell, width)); }
+            }
+            return;
+        }
         // Each column costs its width plus "│ " and " "; the last "│" closes the row.
         let room = width.saturating_sub(prefix.width() + 3 * cols + 1);
         let widths = fit_columns(&natural, room);
@@ -729,7 +750,7 @@ pub fn wrap(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
             out.push(vec![Span::raw(" ".repeat(hang))]);
             used = hang;
         }
-        if w <= width {
+        if w <= width.saturating_sub(used) {
             used += word.width();
             out.last_mut().unwrap().push(Span::styled(word, style));
             continue;
@@ -758,7 +779,7 @@ pub fn wrap(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
 }
 
 fn bordered(label: &str, width: usize) -> Line<'static> {
-    let label = format!(" {label} ");
+    let label = format!(" {} ", ui::clip(label, width.saturating_sub(5)));
     let fill = width.saturating_sub(3 + label.width());
     Line::from(vec![
         Span::styled("╭─", ui::border()),
@@ -1135,6 +1156,22 @@ mod tests {
         let CardBody::Pre { lines, .. } = card.body else { panic!() };
         assert_eq!(lines.len(), sanitize::PART_LINES + 1);
         assert!(lines.last().unwrap().to_string().contains("600 more lines"));
+    }
+
+    #[test]
+    fn phone_cards_fit_long_labels_lists_and_wide_tables() {
+        let table = "| Name | Status | Owner | Region | Detail |\n|---|---|---|---|---|\n| Alpha | Ready | Avery | West | Complete |\n| Beta | Pending | Blake | East | Waiting |";
+        for width in [24, 34, 38, 48, 58] {
+            let cards = vec![
+                Card { label: "a/very/long/path/with/a/unicode/界界界/filename.rs".into(), body: CardBody::Markdown(format!("{table}\n\n- abcdefghijklmnopqrstuvwxyz0123456789\n\n  > 界界界界界界界界界界界界界界界界界界")) },
+            ];
+            let laid = layout(&cards, &[], width, &Folds::default(), &|_| Fit::Pending { rows: 1 }, None);
+            for line in &laid.lines { assert!(line.width() <= width as usize, "width {width}: {line:?}"); }
+            let text = laid.lines.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+            for value in ["Alpha", "Ready", "Avery", "West", "Complete", "Beta", "Pending", "Blake", "East", "Waiting"] {
+                assert!(text.contains(value), "lost {value} at {width}: {text}");
+            }
+        }
     }
 
     #[test]

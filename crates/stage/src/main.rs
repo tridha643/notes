@@ -107,6 +107,10 @@ fn main() -> ExitCode {
         eprintln!("stage: needs a terminal");
         return ExitCode::from(1);
     }
+    // crossterm enables all-motion (1003), but Stage only uses clicks, drags
+    // and wheels. Button-motion avoids streaming idle pointer movement across
+    // a remote/mobile connection while preserving selection and touch scrolling.
+    let _ = out.write_all(b"\x1b[?1003l\x1b[?1002h");
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore();
@@ -119,8 +123,6 @@ fn main() -> ExitCode {
     let mut app = App::new(want);
     if let Ok(size) = term.size() {
         app.size = (size.width, size.height);
-        // Through the loop too, so the starting card width reaches notesd.
-        let _ = tx.send(Msg::Resize(size.width, size.height));
     }
     let mut latency = Latency::from_env();
     let mut gallery = Gallery::new(tx.clone(), StageClient::new(sock.clone()), cache_dir(), notes_proto::default_stage_path(), app.target());
@@ -216,6 +218,18 @@ fn main() -> ExitCode {
                 }
             }
         });
+    }
+    // A resize while probing/warming the helper can precede crossterm's
+    // SIGWINCH reader. Never bootstrap from the placeholder size used for the
+    // first frame (Rex initially reports 80x24). Read it again after starting
+    // input, and report this size through the loop, not the stale first one.
+    if let Ok(size) = term.size() {
+        app.size = (size.width, size.height);
+        let _ = tx.send(Msg::Resize(size.width, size.height));
+    }
+    if let Some(px) = cell_px() {
+        app.cell_px = px;
+        let _ = tx.send(Msg::CellPx(px));
     }
     exit_on_hangup();
     drop(tx);
