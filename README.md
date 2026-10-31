@@ -59,6 +59,19 @@ with `notes doctor`. Run it again to upgrade. For the app: `scripts/build-app.sh
 
 Then open a terminal pane and run `stage`.
 
+### Remote hosts without Desktop access
+
+To keep new Stage sessions outside the macOS-protected Desktop folder:
+
+```sh
+NOTES_STAGE_DIR="$HOME/Library/Application Support/Stage/sessions" scripts/install.sh
+```
+
+The installer saves this absolute path in the daemon's LaunchAgent and preserves it on upgrades.
+Stage discovers the directory from the daemon; no shell export is needed for clients. Existing
+Desktop sessions stay untouched and are not imported into the new store. Without an override,
+the default remains `~/Desktop/Stage`.
+
 ## Agent setup
 
 Once the install script has run, agents that read a skills folder (Claude Code, Codex, pi,

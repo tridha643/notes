@@ -399,6 +399,9 @@ fn run() -> Result<(), String> {
         .map(PathBuf::from)
         .unwrap_or_else(|| notes_proto::app_support_dir().join("notes.db"));
     let stage = notes_proto::default_stage_path();
+    if !stage.is_absolute() {
+        return Err("Stage session directory must be absolute; set NOTES_STAGE_DIR to an absolute path".into());
+    }
     let daemon =
         Arc::new(Daemon::open(vault, db_path, socket, stage).map_err(|Fail(e)| e.message)?);
     // Watch before reconciling, so nothing changed in between goes unseen.

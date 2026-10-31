@@ -80,10 +80,14 @@ impl StageClient {
         }
     }
 
+    /// Daemon-owned paths and event cursor; clients need not inherit the daemon's environment.
+    pub fn doctor(&mut self) -> Result<notes_proto::DoctorResult, ErrorBody> {
+        self.call(Verb::Doctor)
+    }
+
     /// The latest committed event seq (from `doctor`), where the watch starts.
     pub fn latest_seq(&mut self) -> Result<u64, ErrorBody> {
-        let doctor: notes_proto::DoctorResult = self.call(Verb::Doctor)?;
-        Ok(doctor.seq.unwrap_or(0))
+        Ok(self.doctor()?.seq.unwrap_or(0))
     }
 
     pub fn session_list(&mut self) -> Result<Vec<Session>, ErrorBody> {

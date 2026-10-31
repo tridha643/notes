@@ -49,6 +49,7 @@ Logs go to `~/Library/Logs/notesd.log`.
 | `NOTES_SOCK` | `~/Library/Application Support/Notes/notesd.sock` |
 | `NOTES_VAULT` | `~/Notes` |
 | `NOTES_DB` | `~/Library/Application Support/Notes/notes.db` |
+| `NOTES_STAGE_DIR` | `~/Desktop/Stage`; set an absolute path for a different session store |
 | `NOTES_RENDER_CACHE` | `off` disables the render cache |
 
 ## Test and bench

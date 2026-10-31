@@ -19,6 +19,12 @@ cargo build --release -p notesd -p notes-cli -p stage
 bin="$HOME/.local/bin"
 support="$HOME/Library/Application Support/Notes"
 plist="$HOME/Library/LaunchAgents/dev.notes.notesd.plist"
+# Preserve a host's session directory on upgrades; an explicit value takes precedence.
+stage_dir="${NOTES_STAGE_DIR:-$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:NOTES_STAGE_DIR' "$plist" 2>/dev/null || true)}"
+case "$stage_dir" in
+  ""|/*) ;;
+  *) echo "NOTES_STAGE_DIR must be an absolute path" >&2; exit 1 ;;
+esac
 mkdir -p "$bin" "$support" "$HOME/Notes" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 install -m 755 target/release/notesd target/release/notes target/release/stage "$bin/"
 # stage-helper (Swift): mermaid via pele, image decoding, live HTML frames for stage.
@@ -49,6 +55,10 @@ cat > "$plist" <<PLIST
 </dict>
 </plist>
 PLIST
+if [ -n "$stage_dir" ]; then
+  plutil -insert EnvironmentVariables -dictionary "$plist"
+  plutil -insert EnvironmentVariables.NOTES_STAGE_DIR -string "$stage_dir" "$plist"
+fi
 launchctl bootout "gui/$(id -u)/dev.notes.notesd" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$plist"
 # launchd needs a moment after bootstrap before the socket answers.

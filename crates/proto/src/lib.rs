@@ -36,10 +36,13 @@ pub fn default_vault_path() -> PathBuf {
         .unwrap_or_else(|| home_dir().join("Notes"))
 }
 
-/// The sideshow session folder: one JSON file per session. Always
-/// `~/Desktop/Stage`; there's deliberately no override.
+/// Stage session directory: `NOTES_STAGE_DIR` (an absolute path), else `~/Desktop/Stage`.
+/// An empty override keeps the default; selecting another directory never migrates sessions.
 pub fn default_stage_path() -> PathBuf {
-    home_dir().join("Desktop/Stage")
+    env::var_os("NOTES_STAGE_DIR")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join("Desktop/Stage"))
 }
 
 /// Directory for the daemon's SQLite database and other private state.
