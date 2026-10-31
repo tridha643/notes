@@ -548,9 +548,8 @@ fn main(f: &mut Frame, app: &mut App, area: Rect) {
             })
         })
         .collect();
-    // ponytail: ratatui's buffer diff redraws only changed cells; a scroll still
-    // rewrites the column (~one screen of bytes). DECSTBM+DECSLRM margin scrolling
-    // needs a custom backend write path; add it if wheel scrolling lags in Rex.
+    // Screen presents this buffer with native row moves when safe, including
+    // a rectangular text region beside the sidebar on Rex.
     f.render_widget(Paragraph::new(lines), content);
     // The pixel size each card was laid out for, so the gallery knows when new pixels fit.
     for o in &mut on_screen {

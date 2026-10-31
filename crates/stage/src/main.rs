@@ -2,8 +2,8 @@
 //!
 //! Three blocking sources feed one channel: crossterm's reader (keys, mouse,
 //! SIGWINCH resizes), the notesd watch stream, and nothing else. The loop
-//! blocks on the channel, coalesces input (4 ms work budget, 8 ms touch-scroll
-//! frames), then draws once. Idle never wakes; output is flushed once per frame.
+//! blocks on the channel, drains queued input within a 4 ms work budget, then
+//! draws once. Idle never wakes; output is flushed once per frame.
 
 use std::{
     io::{self, BufWriter, Write},
@@ -43,10 +43,6 @@ fn restore() {
 /// The most one turn spends taking further messages before it paints, so a steady
 /// stream of events can't hold a frame back.
 const TURN: Duration = Duration::from_millis(4);
-// Coalesce touch-wheel bursts into at most 120 presentations/sec. Only wait
-// while processing scroll input; keys stay immediate and idle has no timer.
-const SCROLL_FRAME: Duration = Duration::from_millis(8);
-
 /// How long after the last scroll live pages start moving again.
 const SCROLL_SETTLE: Duration = Duration::from_millis(150);
 
@@ -341,14 +337,12 @@ fn main() -> ExitCode {
         let mut n = 0;
         let mut scroll_events = 0;
         let scroll_before = app.scroll;
-        let scrolling = is_scroll(&msg);
-        let budget = if scrolling { SCROLL_FRAME } else { TURN };
-        // Touch events often arrive a millisecond apart. A plain try_recv drain
-        // paints each one separately; wait for the rest of this scroll frame,
-        // preserving every delta and reversal rather than adding fake inertia.
+        // Coalesce input already queued, but never wait before painting it.
+        // macOS can coalesce an 8 ms condition-variable timeout into 50+ ms;
+        // that made scrolling and even single navigation keys visibly lag.
         for msg in std::iter::once(msg).chain(std::iter::from_fn(|| {
-            let left = budget.checked_sub(t.elapsed())?;
-            if scrolling { rx.recv_timeout(left).ok() } else { rx.try_recv().ok() }
+            TURN.checked_sub(t.elapsed())?;
+            rx.try_recv().ok()
         })) {
             n += 1;
             if is_scroll(&msg) {

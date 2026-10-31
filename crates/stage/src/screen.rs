@@ -1,7 +1,8 @@
 //! Presentation for full-screen Stage. Keep our own back buffer so a native
 //! terminal scroll can move existing rows, then diff only the exposed/changed
 //! cells. Ratatui's regular diff cannot know that the terminal already scrolled.
-//! No graphics or sidebars are ever moved by the fast path.
+//! No graphics or sidebars are ever moved by the fast path. Rex supports
+//! horizontal margins, so a text feed beside the sidebar can use it too.
 
 use std::io::{self, Write};
 use ratatui::{backend::{Backend, CrosstermBackend}, buffer::Buffer, layout::Rect, Terminal};
@@ -12,7 +13,8 @@ pub struct Screen {
     next: Buffer,
     shifted: Buffer,
     scroll: usize,
-    movable: bool,
+    scroll_region: Option<Rect>,
+    horizontal_margins: bool,
     enabled: bool,
     invalidated: bool,
 }
@@ -24,7 +26,8 @@ impl Default for Screen {
             next: Buffer::empty(Rect::default()),
             shifted: Buffer::empty(Rect::default()),
             scroll: 0,
-            movable: false,
+            scroll_region: None,
+            horizontal_margins: std::env::var("TERM_PROGRAM").is_ok_and(|name| name == "rex"),
             enabled: std::env::var_os("STAGE_NO_SCROLL_REGION").is_none(),
             invalidated: false,
         }
@@ -32,7 +35,23 @@ impl Default for Screen {
 }
 
 /// Shift full rows inside a scroll region, clearing the newly exposed rows.
-fn shift(buffer: &mut Buffer, top: u16, bottom: u16, delta: isize) {
+fn shift(buffer: &mut Buffer, region: Rect, delta: isize) {
+    let (top, bottom) = (region.y, region.bottom());
+    if region.width != buffer.area.width {
+        // Copy in movement order so the source row hasn't been overwritten.
+        for offset in 0..region.height {
+            let y = if delta > 0 { top + offset } else { bottom - 1 - offset };
+            let source = y as isize + delta;
+            for x in region.x..region.right() {
+                if (top as isize..bottom as isize).contains(&source) {
+                    buffer[(x, y)] = buffer[(x, source as u16)].clone();
+                } else {
+                    buffer[(x, y)].reset();
+                }
+            }
+        }
+        return;
+    }
     let width = buffer.area.width as usize;
     let start = top as usize * width;
     let end = bottom as usize * width;
@@ -70,10 +89,14 @@ impl Screen {
             // Terminal::clear's cursor query, which would race the input reader.
             term.backend_mut().clear()?;
         }
-        if cleared {
+        if resized {
             self.previous = Buffer::empty(area);
             self.next = Buffer::empty(area);
             self.shifted = Buffer::empty(area);
+        } else if cleared {
+            self.previous.reset();
+            self.next.reset();
+            self.shifted.reset();
         }
         {
             let mut frame = term.get_frame();
@@ -82,22 +105,30 @@ impl Screen {
         // Exchange reusable buffers instead of copying a full screen per frame.
         std::mem::swap(term.current_buffer_mut(), &mut self.next);
         let g = ui::geometry_for(app);
-        let movable = g.main.x == 0 && g.main.width == area.width
+        let region = Rect::new(g.main.x, g.main.y + 1, g.main.width, g.main.height.saturating_sub(1));
+        let movable = (region.width == area.width || self.horizontal_margins)
+            && region.intersection(area) == region && !region.is_empty()
             && ui::session_area(app).is_none() && app.on_screen.is_empty();
         let delta = app.scroll as isize - self.scroll as isize;
-        let (top, bottom) = (g.main.y + 1, g.main.bottom());
         let mut scrolled = false;
-        if self.enabled && !cleared && self.movable && movable
-            && delta != 0 && delta.unsigned_abs() < bottom.saturating_sub(top) as usize {
+        if self.enabled && !cleared && self.scroll_region == Some(region) && movable
+            && delta != 0 && delta.unsigned_abs() < region.height as usize {
             self.shifted.content.clone_from(&self.previous.content);
-            shift(&mut self.shifted, top, bottom, delta);
+            shift(&mut self.shifted, region, delta);
             let plain = self.previous.diff_iter(&self.next).count();
             let shifted = self.shifted.diff_iter(&self.next).count();
             // A scroll command has overhead. Use it only when it saves at least
             // one row of cells; arbitrary content changes still diff correctly.
-            if shifted + (area.width as usize) < plain {
+            if shifted + (region.width as usize) < plain {
                 let direction = if delta > 0 { 'S' } else { 'T' };
-                write!(term.backend_mut(), "\x1b[0m\x1b[{};{}r\x1b[{}{}\x1b[r", top + 1, bottom, delta.unsigned_abs(), direction)?;
+                let partial_width = region.width != area.width;
+                if partial_width {
+                    write!(term.backend_mut(), "\x1b[?69h\x1b[{};{}s", region.x + 1, region.right())?;
+                }
+                write!(term.backend_mut(), "\x1b[0m\x1b[{};{}r\x1b[{}{}\x1b[r", region.y + 1, region.bottom(), delta.unsigned_abs(), direction)?;
+                if partial_width {
+                    term.backend_mut().write_all(b"\x1b[s\x1b[?69l")?;
+                }
                 term.backend_mut().draw(self.shifted.diff_iter(&self.next))?;
                 scrolled = true;
             }
@@ -106,7 +137,7 @@ impl Screen {
         std::mem::swap(&mut self.previous, &mut self.next);
         self.next.reset();
         self.scroll = app.scroll;
-        self.movable = movable;
+        self.scroll_region = movable.then_some(region);
         self.invalidated = false;
         Ok(cleared)
     }
@@ -160,11 +191,23 @@ mod tests {
     fn region_scroll_preserves_bars_and_clears_exposed_rows() {
         let original = Buffer::with_lines(["header", "title ", "row 01", "row 02", "row 03", "footer"]);
         let mut up = original.clone();
-        shift(&mut up, 2, 5, 1);
+        shift(&mut up, Rect::new(0, 2, 6, 3), 1);
         assert_eq!(up, Buffer::with_lines(["header", "title ", "row 02", "row 03", "      ", "footer"]));
         let mut down = original;
-        shift(&mut down, 2, 5, -2);
+        shift(&mut down, Rect::new(0, 2, 6, 3), -2);
         assert_eq!(down, Buffer::with_lines(["header", "title ", "      ", "      ", "row 01", "footer"]));
+    }
+
+    #[test]
+    fn rectangular_scroll_preserves_sidebar_title_and_footer() {
+        let original = Buffer::with_lines(["HEADER", "A:1111", "B:2222", "C:3333", "FOOTER"]);
+        let region = Rect::new(2, 1, 4, 3);
+        let mut up = original.clone();
+        shift(&mut up, region, 1);
+        assert_eq!(up, Buffer::with_lines(["HEADER", "A:2222", "B:3333", "C:    ", "FOOTER"]));
+        let mut down = original;
+        shift(&mut down, region, -1);
+        assert_eq!(down, Buffer::with_lines(["HEADER", "A:    ", "B:1111", "C:2222", "FOOTER"]));
     }
 
     #[test]
@@ -172,7 +215,7 @@ mod tests {
         let mut before = Buffer::with_lines(["head", "aaaa", "bbbb", "cccc", "dddd", "foot"]);
         before[(1, 2)].set_fg(ratatui::style::Color::Blue);
         let after = Buffer::with_lines(["HEAD", "bbbb", "cccc", "dddd", "eeee", "FOOT"]);
-        shift(&mut before, 1, 5, 1);
+        shift(&mut before, Rect::new(0, 1, 4, 4), 1);
         let changes = before.diff(&after).into_iter().map(|(x,y,c)| (x,y,c.clone())).collect::<Vec<_>>();
         for (x,y,c) in changes { before[(x,y)] = c; }
         assert_eq!(before, after);
