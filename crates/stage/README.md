@@ -26,11 +26,16 @@ when the sidebar is hidden. The compact bottom controls are tappable: up/down
 page with one line of overlap, find, reply, and focus (as space permits).
 
 Wheel events move one line in narrow panes or feeds shorter than 20 rows,
-including when a phone keyboard reduces the viewport. Rapid wheel events are
-coalesced into 8ms frames, with a single buffered terminal flush per frame. On
-full-width text feeds, native scroll regions move existing rows and only changed
-cells are sent; sidebars, resize transitions, and visible graphics use normal
-cell diffs. Set `STAGE_NO_SCROLL_REGION=1` to compare the fallback.
+including when a phone keyboard reduces the viewport. Already-queued wheel events
+are coalesced within a 4ms work budget, without waiting before painting the first
+input. On text feeds, native scroll regions move existing rows and only changed
+cells are sent. Rex's horizontal margins let this work beside a stationary sidebar;
+other terminals use the fast path only on full-width feeds. Resize transitions and
+visible graphics use normal cell diffs. Set `STAGE_NO_SCROLL_REGION=1` to compare
+the fallback.
+Every resize notification invalidates the screen, even when coalesced signals
+report the previous dimensions after a shrink/grow round trip. Stage clears and
+repaints text, then restores Kitty images after that clear.
 Scrolling back within
 the newest post pauses auto-follow until you reach the bottom again. Stage
 handles the wheel events Rex sends; native swipe recognition and inertia remain
@@ -56,7 +61,7 @@ The code splits IO from decisions, so nearly everything is testable without a te
   can't add to or change a post even if it has a bug, and it deletes only after the user
   presses `y`.
 - **[`screen.rs`](src/screen.rs)** presents reusable frame buffers, optionally scrolling a
-  full-width text region before diffing the remaining cells. It owns presentation through
+  text region before diffing the remaining cells (rectangular regions on Rex). It owns presentation through
   ratatui's manual-rendering API; don't mix it with `Terminal::draw`/`flush`.
 - **[`main.rs`](src/main.rs)** handles the terminal and the event loop. crossterm's reader and
   the notesd `watch` stream feed one channel, and the loop blocks on it, drains everything
@@ -92,6 +97,10 @@ of every part and post.
 
 ## Debug and bench
 
+The [Rex scroll latency investigation](../../docs/bench/stage-scroll-latency.md)
+records the Hunk source comparison, matched before/after measurements, and remaining
+GPU/remote-client verification gaps.
+
 | Variable | Effect |
 |---|---|
 | `STAGE_HELPER` | path to a different `stage-helper` |
@@ -101,7 +110,9 @@ of every part and post.
 
 ```sh
 cargo test -p stage
-cargo bench -p stage            # frame and visual budgets: benches/budget.txt
+cargo bench -p stage --bench frames # isolated text input/resize latency and output budgets
+cargo bench -p stage            # includes helper-backed visual budgets: benches/budget.txt
 python3 scripts/stage-scroll-e2e.py REX_SESSION  # live Rex A/B, isolated generated fixtures
+python3 scripts/stage-resize-e2e.py REX_SESSION # background Rex resize recovery, isolated text/PNG
 scripts/stage-latency.sh        # 100 posts, fails if publish→paint p95 ≥ 250 ms
 ```

@@ -157,13 +157,19 @@ def main(session):
             resize(width, height)
             send("g")
             compare(f"resize-{width}-{height}")
-            send("\x1b[<65;20;9M" * 5)
+            # Aim inside the feed, not the sidebar on desktop-width panes.
+            column = width - 10
+            send(f"\x1b[<65;{column};9M" * 5)
             compare(f"resize-scroll-{width}-{height}")
+            send(f"\x1b[<65;{column};9M" * 30)
+            compare(f"resize-burst-{width}-{height}")
+            send(f"\x1b[<64;{column};9M" * 20)
+            compare(f"resize-reverse-{width}-{height}")
         send("G")
         compare("bottom")
         send("g")
         compare("top")
-        print(f"All 36 screens match. Artifacts: {base}")
+        print(f"All 46 screens match. Artifacts: {base}")
     finally:
         for block in blocks:
             try:

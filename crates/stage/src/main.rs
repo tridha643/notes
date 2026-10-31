@@ -2,8 +2,8 @@
 //!
 //! Three blocking sources feed one channel: crossterm's reader (keys, mouse,
 //! SIGWINCH resizes), the notesd watch stream, and nothing else. The loop
-//! blocks on the channel, coalesces input (4 ms work budget, 8 ms touch-scroll
-//! frames), then draws once. Idle never wakes; output is flushed once per frame.
+//! blocks on the channel, drains queued input within a 4 ms work budget, then
+//! draws once. Idle never wakes; output is flushed once per frame.
 
 use std::{
     io::{self, BufWriter, Write},
@@ -43,10 +43,6 @@ fn restore() {
 /// The most one turn spends taking further messages before it paints, so a steady
 /// stream of events can't hold a frame back.
 const TURN: Duration = Duration::from_millis(4);
-// Coalesce touch-wheel bursts into at most 120 presentations/sec. Only wait
-// while processing scroll input; keys stay immediate and idle has no timer.
-const SCROLL_FRAME: Duration = Duration::from_millis(8);
-
 /// How long after the last scroll live pages start moving again.
 const SCROLL_SETTLE: Duration = Duration::from_millis(150);
 
@@ -129,18 +125,16 @@ fn main() -> ExitCode {
     }
     let mut latency = Latency::from_env();
     let mut gallery = Gallery::new(tx.clone(), StageClient::new(sock.clone()), cache_dir(), notes_proto::default_stage_path(), app.target());
-    let mut drawn_size = app.size;
     let mut screen = Screen::default();
-    let mut draw = |term: &mut Terminal<CrosstermBackend<BufWriter<io::Stdout>>>, app: &mut App, gallery: &mut Gallery| {
+    let mut draw = |term: &mut Terminal<CrosstermBackend<BufWriter<io::Stdout>>>, app: &mut App, gallery: &mut Gallery, screen: &mut Screen| {
         let _ = term.backend_mut().write_all(b"\x1b[?2026h");
-        let _ = screen.draw(term, app);
-        // A resize makes ratatui clear the screen (inside `autoresize`), and Rex frees the
-        // images with it: send them again after the clear, before placing them.
+        let cleared = screen.draw(term, app).unwrap_or(false);
+        // Rex frees images on a screen clear, including a coalesced resize back
+        // to the same dimensions. Restore pixels after the clear, before placing.
         let focused = app.focused_visual();
         gallery.view(app.zoom_view);
-        if app.size != drawn_size {
+        if cleared {
             gallery.replace_all(term.backend_mut(), app.target(), focused.as_ref());
-            drawn_size = app.size;
         } else {
             gallery.retarget(app.target(), focused.as_ref());
         }
@@ -155,7 +149,7 @@ fn main() -> ExitCode {
     // terminal sends; a busy terminal can take well over 100 ms, and missing the
     // replies would leave stage without graphics for the whole run.
     let _ = probe::send(&mut io::stdout());
-    draw(&mut term, &mut app, &mut gallery);
+    draw(&mut term, &mut app, &mut gallery, &mut screen);
     gallery.warm();
     let p = probe::read(0, Duration::from_secs(2));
     app.update(Msg::Probed { cell_px: p.cell_px, kitty: p.kitty });
@@ -304,7 +298,7 @@ fn main() -> ExitCode {
         }
         if redraw {
             let t = std::time::Instant::now();
-            draw(&mut term, &mut app, &mut gallery);
+            draw(&mut term, &mut app, &mut gallery, &mut screen);
             if let Some(f) = loop_trace.as_mut() {
                 let _ = writeln!(f, "draw {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
             }
@@ -343,20 +337,21 @@ fn main() -> ExitCode {
         let mut n = 0;
         let mut scroll_events = 0;
         let scroll_before = app.scroll;
-        let scrolling = is_scroll(&msg);
-        let budget = if scrolling { SCROLL_FRAME } else { TURN };
-        // Touch events often arrive a millisecond apart. A plain try_recv drain
-        // paints each one separately; wait for the rest of this scroll frame,
-        // preserving every delta and reversal rather than adding fake inertia.
+        // Coalesce input already queued, but never wait before painting it.
+        // macOS can coalesce an 8 ms condition-variable timeout into 50+ ms;
+        // that made scrolling and even single navigation keys visibly lag.
         for msg in std::iter::once(msg).chain(std::iter::from_fn(|| {
-            let left = budget.checked_sub(t.elapsed())?;
-            if scrolling { rx.recv_timeout(left).ok() } else { rx.try_recv().ok() }
+            TURN.checked_sub(t.elapsed())?;
+            rx.try_recv().ok()
         })) {
             n += 1;
             if is_scroll(&msg) {
                 scroll_events += 1;
                 scrolled_at = Some(std::time::Instant::now());
                 gallery.hold_live(true);
+            }
+            if matches!(msg, Msg::Resize(..)) {
+                screen.invalidate();
             }
             match msg {
                 // Graphics plumbing goes to the gallery; only its results reach the app.
