@@ -31,7 +31,9 @@ against the same fixtures.
 
 `default_socket_path()`, `default_vault_path()`, `default_stage_path()` and `app_support_dir()`
 are the single source of truth for where things live. `NOTES_SOCK` and `NOTES_VAULT` override
-the first two; the stage folder (`~/Desktop/Stage`) has no override on purpose.
+the first two; `NOTES_STAGE_DIR` overrides the stage session directory (default `~/Desktop/Stage`).
+Use an absolute path. An empty override keeps the default. Choosing a directory does not move old sessions.
+Stage reads the daemon's directory from `doctor`, so its environment need not match the daemon's.
 
 ## Contract tests
 

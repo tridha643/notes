@@ -34,15 +34,19 @@ impl Notesd {
     }
 
     fn spawn(dir: &std::path::Path) -> Child {
-        Command::new(env!("CARGO_BIN_EXE_notesd"))
-            .env("NOTES_VAULT", dir.join("vault"))
+        Self::command(dir).spawn().unwrap()
+    }
+
+    fn command(dir: &std::path::Path) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_notesd"));
+        command.env("NOTES_VAULT", dir.join("vault"))
             .env("NOTES_DB", dir.join("state/notes.db"))
             .env("NOTES_SOCK", dir.join("s.sock"))
-            // The session folder is always ~/Desktop/Stage, so a temp HOME isolates it.
+            // Never inherit a real session directory into a test daemon.
+            .env_remove("NOTES_STAGE_DIR")
             .env("HOME", dir.join("home"))
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap()
+            .stderr(Stdio::null());
+        command
     }
 
     fn ready(self) -> Notesd {
@@ -776,6 +780,31 @@ fn sessions_live_in_the_desktop_folder_and_doctor_reports_it() {
     d.crash_and_restart();
     let shown = d.ok("post-show", json!({ "id": post["post"]["id"] }));
     assert_eq!(shown["parts"][0]["markdown"], "hi");
+}
+
+#[test]
+fn configured_stage_directory_works_without_desktop_and_survives_restart() {
+    let mut d = Notesd::new();
+    d.child.kill().unwrap();
+    d.child.wait().unwrap();
+    // A regular file makes Desktop/Stage impossible to open. The override must
+    // avoid that path altogether, rather than trying it and falling back.
+    fs::remove_dir_all(d.dir.join("home/Desktop")).unwrap();
+    fs::write(d.dir.join("home/Desktop"), "leave the original Desktop untouched").unwrap();
+    let stage = d.dir.join("Application Support/Stage/sessions");
+    d.child = Notesd::command(&d.dir).env("NOTES_STAGE_DIR", &stage).spawn().unwrap();
+    let mut d = d.ready();
+    let post = d.ok("post-new", json!({ "title": "Remote host", "parts": [md("persisted")] }));
+    let doctor = d.ok("doctor", Value::Null);
+    assert_eq!(doctor["stage"]["path"], stage.to_string_lossy().as_ref());
+    assert_eq!(doctor["stage"]["sessions"], 1);
+    assert!(fs::read_dir(&stage).unwrap().any(|entry| entry.unwrap().path().extension().is_some_and(|ext| ext == "json")));
+    d.child.kill().unwrap();
+    d.child.wait().unwrap();
+    d.child = Notesd::command(&d.dir).env("NOTES_STAGE_DIR", &stage).spawn().unwrap();
+    let d = d.ready();
+    assert_eq!(d.ok("post-show", json!({ "id": post["post"]["id"] }))["parts"][0]["markdown"], "persisted");
+    assert_eq!(fs::read_to_string(d.dir.join("home/Desktop")).unwrap(), "leave the original Desktop untouched");
 }
 
 #[test]

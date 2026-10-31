@@ -163,7 +163,12 @@ fn main() -> ExitCode {
     // After the first frame (connecting can wait on launchd starting notesd): the watch
     // starts at the seq notesd had committed before bootstrap lists anything,
     // so nothing published in between is missed (duplicates are deduped by version).
-    let start = StageClient::new(sock.clone()).latest_seq().ok();
+    let doctor = StageClient::new(sock.clone()).doctor().ok();
+    if let Some(path) = doctor.as_ref().and_then(|d| d.stage.as_ref())
+        .and_then(|stage| stage.get("path")).and_then(|path| path.as_str()) {
+        gallery.set_stage_path(PathBuf::from(path));
+    }
+    let start = doctor.map(|d| d.seq.unwrap_or(0));
     let first = Watch::open(&sock, start);
     {
         let (tx, sock) = (tx.clone(), sock.clone());

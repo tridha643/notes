@@ -455,6 +455,11 @@ fn helper_path() -> PathBuf {
 }
 
 impl Gallery {
+    /// Set the daemon's session directory before requesting any post assets.
+    pub fn set_stage_path(&mut self, path: PathBuf) {
+        self.stage = path;
+    }
+
     pub fn new(tx: Sender<Msg>, client: StageClient, cache: PathBuf, stage: PathBuf, target: Target) -> Gallery {
         Gallery {
             tx: tx.clone(),
