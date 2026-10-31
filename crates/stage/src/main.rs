@@ -129,18 +129,16 @@ fn main() -> ExitCode {
     }
     let mut latency = Latency::from_env();
     let mut gallery = Gallery::new(tx.clone(), StageClient::new(sock.clone()), cache_dir(), notes_proto::default_stage_path(), app.target());
-    let mut drawn_size = app.size;
     let mut screen = Screen::default();
-    let mut draw = |term: &mut Terminal<CrosstermBackend<BufWriter<io::Stdout>>>, app: &mut App, gallery: &mut Gallery| {
+    let mut draw = |term: &mut Terminal<CrosstermBackend<BufWriter<io::Stdout>>>, app: &mut App, gallery: &mut Gallery, screen: &mut Screen| {
         let _ = term.backend_mut().write_all(b"\x1b[?2026h");
-        let _ = screen.draw(term, app);
-        // A resize makes ratatui clear the screen (inside `autoresize`), and Rex frees the
-        // images with it: send them again after the clear, before placing them.
+        let cleared = screen.draw(term, app).unwrap_or(false);
+        // Rex frees images on a screen clear, including a coalesced resize back
+        // to the same dimensions. Restore pixels after the clear, before placing.
         let focused = app.focused_visual();
         gallery.view(app.zoom_view);
-        if app.size != drawn_size {
+        if cleared {
             gallery.replace_all(term.backend_mut(), app.target(), focused.as_ref());
-            drawn_size = app.size;
         } else {
             gallery.retarget(app.target(), focused.as_ref());
         }
@@ -155,7 +153,7 @@ fn main() -> ExitCode {
     // terminal sends; a busy terminal can take well over 100 ms, and missing the
     // replies would leave stage without graphics for the whole run.
     let _ = probe::send(&mut io::stdout());
-    draw(&mut term, &mut app, &mut gallery);
+    draw(&mut term, &mut app, &mut gallery, &mut screen);
     gallery.warm();
     let p = probe::read(0, Duration::from_secs(2));
     app.update(Msg::Probed { cell_px: p.cell_px, kitty: p.kitty });
@@ -304,7 +302,7 @@ fn main() -> ExitCode {
         }
         if redraw {
             let t = std::time::Instant::now();
-            draw(&mut term, &mut app, &mut gallery);
+            draw(&mut term, &mut app, &mut gallery, &mut screen);
             if let Some(f) = loop_trace.as_mut() {
                 let _ = writeln!(f, "draw {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
             }
@@ -357,6 +355,9 @@ fn main() -> ExitCode {
                 scroll_events += 1;
                 scrolled_at = Some(std::time::Instant::now());
                 gallery.hold_live(true);
+            }
+            if matches!(msg, Msg::Resize(..)) {
+                screen.invalidate();
             }
             match msg {
                 // Graphics plumbing goes to the gallery; only its results reach the app.

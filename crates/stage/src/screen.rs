@@ -14,6 +14,7 @@ pub struct Screen {
     scroll: usize,
     movable: bool,
     enabled: bool,
+    invalidated: bool,
 }
 
 impl Default for Screen {
@@ -25,6 +26,7 @@ impl Default for Screen {
             scroll: 0,
             movable: false,
             enabled: std::env::var_os("STAGE_NO_SCROLL_REGION").is_none(),
+            invalidated: false,
         }
     }
 }
@@ -47,15 +49,28 @@ fn shift(buffer: &mut Buffer, top: u16, bottom: u16, delta: isize) {
 }
 
 impl Screen {
+    /// A resize notification invalidates terminal contents even if the final size
+    /// is unchanged: coalesced SIGWINCH signals can hide a shrink/grow round trip.
+    pub fn invalidate(&mut self) {
+        self.invalidated = true;
+    }
+
     /// Uses Ratatui's documented manual-rendering API. We own presentation and
     /// cursor policy (Stage keeps the terminal cursor hidden), so never mix this
     /// with Terminal::draw/flush. The caller flushes once after graphics and the
-    /// synchronized-output end marker, making one buffered frame write.
-    pub fn draw<W: Write>(&mut self, term: &mut Terminal<CrosstermBackend<W>>, app: &mut App) -> io::Result<()> {
+    /// synchronized-output end marker, making one buffered frame write. Returns
+    /// whether graphics must be restored after a screen clear.
+    pub fn draw<W: Write>(&mut self, term: &mut Terminal<CrosstermBackend<W>>, app: &mut App) -> io::Result<bool> {
         term.autoresize()?;
         let area = term.current_buffer_mut().area;
         let resized = self.previous.area != area;
-        if resized {
+        let cleared = resized || self.invalidated;
+        if self.invalidated && !resized {
+            // We own the full-screen buffers and keep the cursor hidden. Avoid
+            // Terminal::clear's cursor query, which would race the input reader.
+            term.backend_mut().clear()?;
+        }
+        if cleared {
             self.previous = Buffer::empty(area);
             self.next = Buffer::empty(area);
             self.shifted = Buffer::empty(area);
@@ -72,7 +87,7 @@ impl Screen {
         let delta = app.scroll as isize - self.scroll as isize;
         let (top, bottom) = (g.main.y + 1, g.main.bottom());
         let mut scrolled = false;
-        if self.enabled && !resized && self.movable && movable
+        if self.enabled && !cleared && self.movable && movable
             && delta != 0 && delta.unsigned_abs() < bottom.saturating_sub(top) as usize {
             self.shifted.content.clone_from(&self.previous.content);
             shift(&mut self.shifted, top, bottom, delta);
@@ -92,13 +107,54 @@ impl Screen {
         self.next.reset();
         self.scroll = app.scroll;
         self.movable = movable;
-        Ok(())
+        self.invalidated = false;
+        Ok(cleared)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_size_resize_clears_and_repaints_then_returns_to_diffing() {
+        use ratatui::{TerminalOptions, Viewport};
+        use std::{cell::RefCell, rc::Rc};
+
+        #[derive(Clone, Default)]
+        struct Output(Rc<RefCell<Vec<u8>>>);
+        impl Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> { self.0.borrow_mut().write(bytes) }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        let output = Output::default();
+        let take_output = || std::mem::take(&mut *output.0.borrow_mut());
+        let mut app = App::new(None);
+        app.size = (80, 24);
+        let mut term = Terminal::with_options(
+            CrosstermBackend::new(output.clone()),
+            TerminalOptions { viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)) },
+        ).unwrap();
+        let mut screen = Screen::default();
+        assert!(screen.draw(&mut term, &mut app).unwrap());
+        let first = take_output();
+
+        assert!(!screen.draw(&mut term, &mut app).unwrap());
+        let unchanged = take_output();
+        assert!(unchanged.len() < first.len());
+
+        // Multiple SIGWINCH notifications may be coalesced into one frame whose
+        // dimensions equal the previous frame. The terminal still lost cells.
+        screen.invalidate();
+        screen.invalidate();
+        assert!(screen.draw(&mut term, &mut app).unwrap(), "graphics must be restored too");
+        let repaint = take_output();
+        assert!(repaint.starts_with(b"\x1b[2J"), "clear remnants before repainting");
+        assert!(repaint.ends_with(&first), "every original cell must be repainted");
+
+        assert!(!screen.draw(&mut term, &mut app).unwrap());
+        assert_eq!(take_output(), unchanged);
+    }
 
     #[test]
     fn region_scroll_preserves_bars_and_clears_exposed_rows() {

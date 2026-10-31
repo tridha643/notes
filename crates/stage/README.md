@@ -31,6 +31,9 @@ coalesced into 8ms frames, with a single buffered terminal flush per frame. On
 full-width text feeds, native scroll regions move existing rows and only changed
 cells are sent; sidebars, resize transitions, and visible graphics use normal
 cell diffs. Set `STAGE_NO_SCROLL_REGION=1` to compare the fallback.
+Every resize notification invalidates the screen, even when coalesced signals
+report the previous dimensions after a shrink/grow round trip. Stage clears and
+repaints text, then restores Kitty images after that clear.
 Scrolling back within
 the newest post pauses auto-follow until you reach the bottom again. Stage
 handles the wheel events Rex sends; native swipe recognition and inertia remain
@@ -103,5 +106,6 @@ of every part and post.
 cargo test -p stage
 cargo bench -p stage            # frame and visual budgets: benches/budget.txt
 python3 scripts/stage-scroll-e2e.py REX_SESSION  # live Rex A/B, isolated generated fixtures
+python3 scripts/stage-resize-e2e.py REX_SESSION # background Rex resize recovery, isolated text/PNG
 scripts/stage-latency.sh        # 100 posts, fails if publish→paint p95 ≥ 250 ms
 ```
