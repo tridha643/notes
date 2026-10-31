@@ -2,11 +2,11 @@
 //!
 //! Three blocking sources feed one channel: crossterm's reader (keys, mouse,
 //! SIGWINCH resizes), the notesd watch stream, and nothing else. The loop
-//! blocks on the channel, drains what's pending (for up to 4 ms), then draws once,
-//! so an idle stage never wakes and a 240-key paste is one frame.
+//! blocks on the channel, coalesces input (4 ms work budget, 8 ms touch-scroll
+//! frames), then draws once. Idle never wakes; output is flushed once per frame.
 
 use std::{
-    io::{self, Write},
+    io::{self, BufWriter, Write},
     path::PathBuf,
     process::{Command, ExitCode},
     sync::mpsc,
@@ -29,7 +29,7 @@ use stage::{
     client::{StageClient, Watch},
     gallery::Gallery,
     latency::Latency,
-    perform, probe, pump, ui,
+    perform, probe, pump, screen::Screen,
 };
 
 fn restore() {
@@ -43,6 +43,9 @@ fn restore() {
 /// The most one turn spends taking further messages before it paints, so a steady
 /// stream of events can't hold a frame back.
 const TURN: Duration = Duration::from_millis(4);
+// Coalesce touch-wheel bursts into at most 120 presentations/sec. Only wait
+// while processing scroll input; keys stay immediate and idle has no timer.
+const SCROLL_FRAME: Duration = Duration::from_millis(8);
 
 /// How long after the last scroll live pages start moving again.
 const SCROLL_SETTLE: Duration = Duration::from_millis(150);
@@ -107,28 +110,31 @@ fn main() -> ExitCode {
         eprintln!("stage: needs a terminal");
         return ExitCode::from(1);
     }
+    // crossterm enables all-motion (1003), but Stage only uses clicks, drags
+    // and wheels. Button-motion avoids streaming idle pointer movement across
+    // a remote/mobile connection while preserving selection and touch scrolling.
+    let _ = out.write_all(b"\x1b[?1003l\x1b[?1002h");
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore();
         hook(info);
     }));
-    let Ok(mut term) = Terminal::new(CrosstermBackend::new(io::stdout())) else {
+    let Ok(mut term) = Terminal::new(CrosstermBackend::new(BufWriter::with_capacity(64 * 1024, io::stdout()))) else {
         restore();
         return ExitCode::from(1);
     };
     let mut app = App::new(want);
     if let Ok(size) = term.size() {
         app.size = (size.width, size.height);
-        // Through the loop too, so the starting card width reaches notesd.
-        let _ = tx.send(Msg::Resize(size.width, size.height));
     }
     let mut latency = Latency::from_env();
     let mut gallery = Gallery::new(tx.clone(), StageClient::new(sock.clone()), cache_dir(), notes_proto::default_stage_path(), app.target());
     let mut drawn_size = app.size;
-    let mut draw = |term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App, gallery: &mut Gallery| {
+    let mut screen = Screen::default();
+    let mut draw = |term: &mut Terminal<CrosstermBackend<BufWriter<io::Stdout>>>, app: &mut App, gallery: &mut Gallery| {
         let _ = term.backend_mut().write_all(b"\x1b[?2026h");
-        let _ = term.draw(|f| ui::draw(f, app));
-        // A resize makes ratatui clear the screen (inside `draw`), and Rex frees the
+        let _ = screen.draw(term, app);
+        // A resize makes ratatui clear the screen (inside `autoresize`), and Rex frees the
         // images with it: send them again after the clear, before placing them.
         let focused = app.focused_visual();
         gallery.view(app.zoom_view);
@@ -217,6 +223,18 @@ fn main() -> ExitCode {
             }
         });
     }
+    // A resize while probing/warming the helper can precede crossterm's
+    // SIGWINCH reader. Never bootstrap from the placeholder size used for the
+    // first frame (Rex initially reports 80x24). Read it again after starting
+    // input, and report this size through the loop, not the stale first one.
+    if let Ok(size) = term.size() {
+        app.size = (size.width, size.height);
+        let _ = tx.send(Msg::Resize(size.width, size.height));
+    }
+    if let Some(px) = cell_px() {
+        app.cell_px = px;
+        let _ = tx.send(Msg::CellPx(px));
+    }
     exit_on_hangup();
     drop(tx);
 
@@ -224,6 +242,7 @@ fn main() -> ExitCode {
     let mut scrolled_at: Option<std::time::Instant> = None;
     // `STAGE_LOOP_TRACE=<file>`: per loop turn, time spent updating and drawing.
     let mut loop_trace = std::env::var_os("STAGE_LOOP_TRACE").and_then(|p| std::fs::File::create(p).ok());
+    let trace_start = std::time::Instant::now();
     let start = app.start();
     let t = std::time::Instant::now();
     let mut pending = perform(&mut app, &mut client, start);
@@ -238,6 +257,7 @@ fn main() -> ExitCode {
                 Effect::Redraw => redraw = true,
                 Effect::Quit => {
                     gallery.clear(term.backend_mut());
+                    let _ = term.backend_mut().flush();
                     restore();
                     return ExitCode::SUCCESS;
                 }
@@ -316,10 +336,20 @@ fn main() -> ExitCode {
         };
         let t = std::time::Instant::now();
         let mut n = 0;
-        // The clock is read before each `try_recv`, so a message past the bound stays queued.
-        for msg in std::iter::once(msg).chain(std::iter::from_fn(|| (t.elapsed() < TURN).then(|| rx.try_recv().ok()).flatten())) {
+        let mut scroll_events = 0;
+        let scroll_before = app.scroll;
+        let scrolling = is_scroll(&msg);
+        let budget = if scrolling { SCROLL_FRAME } else { TURN };
+        // Touch events often arrive a millisecond apart. A plain try_recv drain
+        // paints each one separately; wait for the rest of this scroll frame,
+        // preserving every delta and reversal rather than adding fake inertia.
+        for msg in std::iter::once(msg).chain(std::iter::from_fn(|| {
+            let left = budget.checked_sub(t.elapsed())?;
+            if scrolling { rx.recv_timeout(left).ok() } else { rx.try_recv().ok() }
+        })) {
             n += 1;
             if is_scroll(&msg) {
+                scroll_events += 1;
                 scrolled_at = Some(std::time::Instant::now());
                 gallery.hold_live(true);
             }
@@ -334,7 +364,8 @@ fn main() -> ExitCode {
             }
         }
         if let Some(f) = loop_trace.as_mut() {
-            let _ = writeln!(f, "update {n} msgs {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
+            let _ = writeln!(f, "update {n} msgs {:.2} ms at {:.2} ms scroll-events {scroll_events} rows {scroll_before}->{}",
+                t.elapsed().as_secs_f64() * 1000.0, trace_start.elapsed().as_secs_f64() * 1000.0, app.scroll);
         }
     }
 }

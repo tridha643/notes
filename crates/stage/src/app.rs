@@ -223,6 +223,8 @@ pub struct App {
     pub mode: Mode,
     /// Whether the session sidebar is hidden outside card focus.
     pub sidebar_hidden: bool,
+    /// Full-width session picker on narrow terminals; independent of desktop preference.
+    pub session_picker: bool,
     pub size: (u16, u16),
     /// The space last sent to notesd, so a resize only writes on change.
     space: Option<StageSpace>,
@@ -305,6 +307,7 @@ impl App {
             sel: 0,
             mode: Mode::Nav,
             sidebar_hidden: false,
+            session_picker: false,
             size: (80, 24),
             space: None,
             cell_px: (8, 16),
@@ -449,6 +452,7 @@ impl App {
             Msg::Mouse(m) => self.mouse(m),
             Msg::Resize(w, h) => {
                 self.size = (w, h);
+                if w >= ui::SIDEBAR_MIN_WIDTH { self.session_picker = false; }
                 let mut fx = vec![Effect::Redraw];
                 fx.extend(self.report_space());
                 fx
@@ -545,6 +549,7 @@ impl App {
     // ---- Sidebar ----------------------------------------------------------------
 
     fn open_session(&mut self, id: SessionId) -> Vec<Effect> {
+        self.session_picker = false;
         self.unread.remove(&id);
         if self.open.as_ref() == Some(&id) {
             return vec![];
@@ -834,6 +839,12 @@ impl App {
         self.follow_cursor();
     }
 
+    fn wheel_lines(&self) -> isize {
+        // Touch clients already emit a stream of wheel ticks during a swipe.
+        // Tripling each tick skips a fifth of a short phone viewport.
+        if self.size.0 < ui::SIDEBAR_MIN_WIDTH || self.page() < 20 { 1 } else { WHEEL as isize }
+    }
+
     /// Scroll the feed by `delta` lines, dragging the cursor along.
     fn scroll(&mut self, delta: isize) {
         let total = self.feed().lines.len();
@@ -842,6 +853,9 @@ impl App {
         self.scroll = (self.scroll as isize + delta).clamp(0, max as isize) as usize;
         self.cursor = self.cursor.clamp(self.scroll, (self.scroll + page).saturating_sub(1).max(self.scroll));
         self.follow_cursor();
+        // Reading earlier lines of the *last* post must not let a new post yank
+        // the viewport away. Resume following only at the bottom of the feed.
+        self.follow = self.scroll == max;
     }
 
     pub fn hit_at_cursor(&mut self) -> (Option<usize>, Hit) {
@@ -923,6 +937,11 @@ impl App {
     }
 
     fn toggle_sidebar(&mut self) -> Vec<Effect> {
+        if self.size.0 < ui::SIDEBAR_MIN_WIDTH {
+            self.session_picker = !self.session_picker;
+            self.drag = None;
+            return vec![];
+        }
         if self.pending_sidebar.take().is_some() {
             self.pending_sidebar_frames.clear();
             return vec![];
@@ -957,8 +976,10 @@ impl App {
             fx.extend(self.report_space());
             fx.push(Effect::Redraw);
         }
-        fx.extend(self.request_visuals());
-        fx.extend(self.zoom_ahead());
+        if ui::session_area(self).is_none() {
+            fx.extend(self.request_visuals());
+            fx.extend(self.zoom_ahead());
+        }
         fx
     }
 
@@ -1020,7 +1041,7 @@ impl App {
     /// A card's text width (the feed column less its border and padding), sent to notesd on change.
     fn report_space(&mut self) -> Vec<Effect> {
         let (cols, rows) = (ui::geometry_for(self).main.width.saturating_sub(5), self.page() as u16);
-        let css = |cells: u16, px: u16| (cells as f64 * px as f64 / crate::gallery::SCALE) as u32;
+        let css = |cells: u16, px: u16| (cells as f64 * px as f64 / crate::gallery::content_scale(self.cell_px)) as u32;
         let space = StageSpace {
             cols,
             rows,
@@ -1160,7 +1181,22 @@ impl App {
     }
 
     fn nav_key(&mut self, k: KeyEvent) -> Vec<Effect> {
-        let page = self.page() as isize;
+        let page = self.page().saturating_sub(1).max(1) as isize;
+        if self.session_picker {
+            return match k.code {
+                KeyCode::Esc | KeyCode::Char('s') => { self.session_picker = false; vec![] }
+                KeyCode::Down | KeyCode::Char('j' | 'J') => self.select_session(self.sel + 1, false),
+                KeyCode::Up | KeyCode::Char('k' | 'K') => self.select_session(self.sel.saturating_sub(1), false),
+                KeyCode::Enter => self.select_session(self.sel, true),
+                KeyCode::Char('/') => {
+                    self.session_picker = false;
+                    self.mode = Mode::Search { query: String::new(), hits: Vec::new(), sel: 0 };
+                    vec![]
+                }
+                KeyCode::Char('q') => vec![Effect::Quit],
+                _ => vec![],
+            };
+        }
         if let Some(fx) = self.zoom_key(k.code) {
             return fx;
         }
@@ -1197,12 +1233,10 @@ impl App {
             }
             KeyCode::PageDown | KeyCode::Char(' ') => {
                 self.scroll(page);
-                self.cursor(0);
                 vec![]
             }
             KeyCode::PageUp | KeyCode::Char('b') => {
                 self.scroll(-page);
-                self.cursor(0);
                 vec![]
             }
             KeyCode::Char('g') => {
@@ -1351,25 +1385,57 @@ impl App {
         let inside = |r: ratatui::layout::Rect| {
             m.column >= r.x && m.column < r.x + r.width && m.row >= r.y && m.row < r.y + r.height
         };
+        let session_area = ui::session_area(self);
         let fx = match m.kind {
-            MouseEventKind::Down(MouseButton::Left) if m.row == g.header.y && m.column < 3 && matches!(self.mode, Mode::Nav) => {
+            MouseEventKind::Down(MouseButton::Left) if m.row == g.header.y && m.column < 3 => {
+                if matches!(self.mode, Mode::Search { .. }) {
+                    self.mode = Mode::Nav;
+                    return vec![Effect::Redraw];
+                }
+                if !matches!(self.mode, Mode::Nav) { return vec![]; }
                 self.toggle_sidebar()
             }
-            MouseEventKind::ScrollDown => {
-                self.scroll(WHEEL as isize);
+            MouseEventKind::Down(MouseButton::Left) if m.row == g.keybar.y && matches!(self.mode, Mode::Nav) => {
+                match ui::compact_action(self, m.column) {
+                    Some(key) => self.nav_key(KeyEvent::new(key, KeyModifiers::NONE)),
+                    None => vec![],
+                }
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if session_area.is_some() || matches!(self.mode, Mode::Search { .. }) => {
+                let down = m.kind == MouseEventKind::ScrollDown;
+                if let Mode::Search { sel, hits, .. } = &mut self.mode {
+                    *sel = if down { (*sel + 1).min(hits.len().saturating_sub(1)) } else { sel.saturating_sub(1) };
+                    vec![]
+                } else {
+                    self.select_session(if down { self.sel + 1 } else { self.sel.saturating_sub(1) }, false)
+                }
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if matches!(self.mode, Mode::Nav) => {
+                let before = (self.scroll, self.cursor);
+                self.drag = None;
+                let step = self.wheel_lines();
+                self.scroll(if m.kind == MouseEventKind::ScrollDown { step } else { -step });
+                if before == (self.scroll, self.cursor) { return vec![]; }
                 vec![]
             }
-            MouseEventKind::ScrollUp => {
-                self.scroll(-(WHEEL as isize));
-                vec![]
-            }
-            MouseEventKind::Down(MouseButton::Left) if inside(g.sidebar) => {
-                let row = (m.row - g.sidebar.y) as usize + ui::sidebar_offset(self, g.sidebar.height);
-                self.select_session(row, true)
+            MouseEventKind::Down(MouseButton::Left) if session_area.is_some_and(inside) || inside(g.sidebar) => {
+                let area = session_area.unwrap_or(g.sidebar);
+                if let Mode::Search { sel, hits, .. } = &mut self.mode {
+                    let row = (m.row - area.y) as usize;
+                    if row == 0 { return vec![]; }
+                    let offset = ui::search_offset(*sel, area.height);
+                    let index = offset + row - 1;
+                    if index >= hits.len() { return vec![]; }
+                    *sel = index;
+                    self.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                } else {
+                    let row = (m.row - area.y) as usize + ui::sidebar_offset(self, area.height);
+                    self.select_session(row, true)
+                }
             }
             // In the feed: press starts a selection, drag extends it, release
             // copies it; a press and release in one place is a click.
-            MouseEventKind::Down(MouseButton::Left) if inside(g.main) && m.row > g.main.y => {
+            MouseEventKind::Down(MouseButton::Left) if session_area.is_none() && inside(g.main) && m.row > g.main.y => {
                 let at = self.feed_point(m.column, m.row);
                 self.drag = Some((at, at));
                 vec![]
@@ -1985,6 +2051,106 @@ mod tests {
         assert_eq!(app.focused_card, None);
         assert_eq!((app.scroll, app.cursor), original);
         assert!(app.feed().lines.iter().any(|line| line.to_string().contains("first card")));
+    }
+
+    fn phone_draw(app: &mut App) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut term = Terminal::new(TestBackend::new(app.size.0, app.size.1)).unwrap();
+        term.draw(|f| ui::draw(f, app)).unwrap();
+        let buf = term.backend().buffer();
+        (0..app.size.1).map(|y| (0..app.size.0).map(|x| buf[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn phone_picker_opens_by_tap_and_returns_to_the_same_feed() {
+        let mut app = booted(&fake());
+        app.update(Msg::Resize(49, 19));
+        app.feed();
+        let original = (app.scroll, app.cursor, app.target());
+        let tap = |column, row| Msg::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column, row, modifiers: KeyModifiers::NONE });
+        app.update(tap(1, 0));
+        assert!(app.session_picker);
+        assert!(phone_draw(&mut app).contains("Sessions"));
+        assert!(app.on_screen.is_empty(), "graphics cannot cover the picker");
+        assert_eq!(app.target(), original.2, "a picker must not resize live HTML");
+        app.update(tap(4, 1)); // the already-open session must close the picker too
+        assert!(!app.session_picker);
+        app.feed();
+        assert_eq!((app.scroll, app.cursor), (original.0, original.1));
+        app.update(key(KeyCode::Char('s')));
+        app.update(key(KeyCode::Down));
+        let fx = app.update(key(KeyCode::Enter));
+        serve(&mut app, fx, &fake());
+        assert_eq!(app.open.as_deref(), Some("s2"));
+        assert!(!app.session_picker);
+        assert!(!app.sidebar_hidden, "phone navigation must preserve desktop preference");
+        app.update(Msg::Resize(100, 30));
+        assert!(ui::geometry_for(&app).sidebar.width > 0);
+    }
+
+    #[test]
+    fn search_is_visible_and_tappable_without_a_sidebar() {
+        for width in [49, 100] {
+            let db = fake();
+            let mut app = booted(&db);
+            app.sidebar_hidden = true;
+            app.update(Msg::Resize(width, 19));
+            app.update(key(KeyCode::Char('/')));
+            let fx = app.update(key(KeyCode::Char('2')));
+            serve(&mut app, fx, &db);
+            assert!(phone_draw(&mut app).contains("1 matches"));
+            let fx = app.update(Msg::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 4, row: 2, modifiers: KeyModifiers::NONE }));
+            serve(&mut app, fx, &db);
+            assert_eq!(app.open.as_deref(), Some("s2"));
+            assert_eq!(app.mode, Mode::Nav);
+        }
+    }
+
+    #[test]
+    fn phone_swipes_are_line_precise_bounded_and_do_not_resume_following_mid_post() {
+        let mut db = fake();
+        db.md = (0..100).map(|i| format!("line {i}\n\n")).collect();
+        let mut app = booted(&db);
+        app.update(Msg::Resize(49, 19));
+        app.update(key(KeyCode::Char('G')));
+        let bottom = app.scroll;
+        let wheel = |kind| Msg::Mouse(MouseEvent { kind, column: 20, row: 9, modifiers: KeyModifiers::NONE });
+        for i in 1..=12 {
+            app.update(wheel(MouseEventKind::ScrollUp));
+            assert_eq!(app.scroll, bottom - i);
+            assert!(!app.follow, "scrolling back in the last post must stop auto-follow");
+            assert_eq!(app.shown.as_deref(), Some("b"));
+        }
+        for _ in 0..12 { app.update(wheel(MouseEventKind::ScrollDown)); }
+        assert_eq!(app.scroll, bottom);
+        assert!(app.follow);
+        assert!(app.update(wheel(MouseEventKind::ScrollDown)).is_empty(), "no redraw for inertia at the edge");
+        app.update(key(KeyCode::Char('g')));
+        for _ in 0..2000 { app.update(wheel(MouseEventKind::ScrollUp)); }
+        assert_eq!(app.scroll, 0);
+        // The bottom controls are tappable pages, with one line of overlap.
+        app.update(Msg::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 9, row: 18, modifiers: KeyModifiers::NONE }));
+        assert_eq!(app.scroll, app.page() - 1);
+        // An active picker scrolls its selection, not the feed behind it.
+        let scroll = app.scroll;
+        app.update(key(KeyCode::Char('s')));
+        app.update(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.sel, 1);
+        assert_eq!(app.scroll, scroll);
+    }
+
+    #[test]
+    fn phone_prompts_keep_the_end_of_the_input_visible() {
+        let mut app = booted(&fake());
+        for width in [24, 39, 49, 59, 100] {
+            app.update(Msg::Resize(width, 19));
+            let input = format!("{}END", "long comment 界 ".repeat(20));
+            for mode in [Mode::Comment { input: input.clone() }, Mode::Command { input: input.clone() }, Mode::Search { query: input, hits: vec![], sel: 0 }] {
+                app.mode = mode;
+                let screen = phone_draw(&mut app);
+                assert!(screen.lines().last().unwrap().contains("END▏"), "{screen}");
+            }
+        }
     }
 
     #[test]

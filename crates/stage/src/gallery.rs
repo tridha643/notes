@@ -69,6 +69,13 @@ pub type RasterTarget = (u32, u32, (u16, u16), Option<ZoomView>);
 
 /// CSS px → device px for helper renders (Retina).
 pub const SCALE: f64 = 2.0;
+
+/// Keep web/diagram type readable relative to terminal rows on high-density
+/// clients. A fixed 2x backing scale makes HTML tiny in Rex's 51px phone cells.
+/// This is a typography scale, not a guess at the device's hardware DPR.
+pub fn content_scale(cell: (u16, u16)) -> f64 {
+    (cell.1 as f64 / 16.0).clamp(SCALE, 4.0)
+}
 /// Limit very large diagrams without shrinking ordinary tall ones to the viewport.
 const MAX_MERMAID_HEIGHT_PX: u32 = 4096;
 /// Diagram pixels the terminal holds for stage. Past this, the diagrams shown least
@@ -161,7 +168,7 @@ impl RasterWorkers {
                         if !current() { return Err("superseded".into()); }
                         match zoom {
                             Some(view) => fit_view(tree, w, h, cell, view),
-                            None => fit_tree(tree, w, h, cell, SCALE as f32),
+                            None => fit_tree(tree, w, h, cell, content_scale(cell) as f32),
                         }.and_then(|fitted| {
                             if !current() { return Err("superseded".into()); }
                             draw_shm(fitted)
@@ -558,7 +565,8 @@ impl Gallery {
     }
 
     fn html_size(&self) -> (f64, f64) {
-        (self.target.width_px as f64 / SCALE, self.target.html_height_px as f64 / SCALE)
+        let scale = content_scale(self.target.cell_px);
+        (self.target.width_px as f64 / scale, self.target.html_height_px as f64 / scale)
     }
 
     fn resize_pages(&mut self) {
@@ -568,7 +576,7 @@ impl Gallery {
             .map(|(id, _)| *id)
             .collect();
         for page in pages {
-            let _ = self.send(&HelperRequest::HtmlResize { id: page, width, max_height, scale: SCALE });
+            let _ = self.send(&HelperRequest::HtmlResize { id: page, width, max_height, scale: content_scale(self.target.cell_px) });
         }
     }
 
@@ -583,7 +591,7 @@ impl Gallery {
         self.asked.insert(key.clone(), (std::time::Instant::now(), kind));
         let result = match &source {
             VisualSource::Mermaid(src) => {
-                let max_width = self.target.width_px as f64 / SCALE;
+                let max_width = self.target.width_px as f64 / content_scale(self.target.cell_px);
                 self.ask(|id| HelperRequest::Mermaid { id, source: src.clone(), max_width, font_size: 14.0 })
                     .map(|req| {
                         self.pending.insert(req, Pending::Mermaid(key.clone()));
@@ -623,7 +631,8 @@ impl Gallery {
                     return msgs;
                 }
                 let (width, max_height) = self.html_size();
-                self.ask(|id| HelperRequest::HtmlOpen { id, path, width, max_height, scale: SCALE, fps: 60.0 })
+                let scale = content_scale(self.target.cell_px);
+                self.ask(|id| HelperRequest::HtmlOpen { id, path, width, max_height, scale, fps: 60.0 })
                     .map(|req| {
                         self.pages.insert(req, key.clone());
                     })
@@ -1136,6 +1145,19 @@ fn crop(p: &Place, (w, h): (u32, u32)) -> Place {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phone_html_scales_type_with_terminal_rows_and_keeps_exact_pixel_width() {
+        let (tx, _) = std::sync::mpsc::channel();
+        let gallery = Gallery::new(tx, StageClient::new("/nonexistent".into()), std::env::temp_dir(), std::env::temp_dir(),
+            Target { width_px: 44 * 23, max_height_px: 8 * 51, cell_px: (23, 51), html_height_px: 13 * 51 });
+        let scale = content_scale(gallery.target.cell_px);
+        let (width, height) = gallery.html_size();
+        assert!((width - 317.49).abs() < 0.01, "phone CSS viewport, not a 506px desktop page: {width}");
+        assert_eq!(height, 208.0);
+        assert_eq!((width * scale).round() as u32, gallery.target.width_px);
+        assert_eq!(content_scale((14, 30)), SCALE, "desktop typography stays unchanged");
+    }
 
     fn test_key(name: &str) -> VisualKey { (name.into(), 1, 0) }
     fn test_target(zoom: bool) -> RasterTarget {
