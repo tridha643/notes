@@ -12,6 +12,7 @@ pub mod latency;
 pub mod page;
 pub mod probe;
 pub mod sanitize;
+pub mod screen;
 pub mod ui;
 
 use std::collections::VecDeque;

@@ -63,6 +63,38 @@ This verifies terminal input and graphics, not physical touchscreen recognition
 or iOS inertia. Those remain Rex client behaviour and need an on-device swipe
 check. HTML still has its documented viewport-height cap.
 
+## Follow-up: scroll presentation, not just draw CPU
+
+The user still reported unsmooth scrolling on-device after the first pass.
+Fast server-side draws alone did not establish smooth remote presentation.
+
+The follow-up adds a buffered frame writer, 8ms event-driven wheel batching, and
+native DECSTBM scroll regions for full-width text feeds. The renderer retains its
+own previous frame, applies the same row shift to that buffer, and emits only the
+remaining differences. The optimization is used only if it saves at least a row
+of cells. Sidebars, resize transitions and frames with graphics take the normal
+cell-diff path; no image placements are scrolled implicitly. There are no idle
+frame timers and no synthetic inertia.
+
+A real-PTY A/B with the same 49×40 highlighted Rust fixture measured:
+
+| Input | Previous build | New presentation |
+| --- | ---: | ---: |
+| Output per isolated one-line scroll | 4,669 bytes | 487 bytes |
+| Output for 100 rapid wheel events | 222,370 bytes | 15,404 bytes |
+| Presentations during that burst | 48 | 23 |
+
+These are bytes from Stage to the terminal, not measured iPhone network traffic
+or touch-to-photon latency. A synthetic stream is not a physical gesture test.
+
+`python3 scripts/stage-scroll-e2e.py REX_SESSION` now reproduces the live Rex
+comparison using an isolated daemon and two background panes. All 36 checkpoints
+match visible text, Unicode, colours, backgrounds, cursor highlighting and card
+borders between the native-scroll and normal-diff paths, across reversals,
+bursts, picker/prompt transitions, and five viewport sizes. Only invisible
+foreground/italic/bold differences on whitespace and omitted trailing default
+blanks are normalized. Windows and daemon are cleaned up after the run.
+
 ## Installation caveat
 
 The normal install script also rebuilds/restarts notesd. On this machine the
