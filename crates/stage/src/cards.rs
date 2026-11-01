@@ -367,7 +367,9 @@ fn patch_lines(text: &str) -> Diff {
                 .map(|p| p.strip_prefix("b/").unwrap_or(p)),
         };
         if let Some(name) = name.filter(|n| files.last().is_none_or(|(_, last)| last != n)) {
-            files.push((i, name.to_owned()));
+            // Without a `diff --git` row the file starts at its `---` row.
+            let start = if l.starts_with("+++ ") { i - 1 } else { i };
+            files.push((start, name.to_owned()));
         }
     }
     Diff::new(capped(lines.into_iter().map(Line::from).collect(), text.len()), Gutter { width: 1, rule: false }, hunks, files)
@@ -1514,6 +1516,16 @@ mod tests {
         assert_eq!(&rows[5..7], ["│ -abcdefghijklmnopqrs │", "│  tuvwxyz             │"]);
         let stops: Vec<&str> = laid.hunks.iter().map(|&l| rows[l].as_str()).collect();
         assert_eq!(stops, ["│ @@ -1 +1 @@          │", "│ @@ -9 +9 @@          │"]);
+    }
+
+    #[test]
+    fn a_patch_without_a_git_row_keeps_its_source_lines_when_styled() {
+        let raw = patch_lines("--- a/f\n+++ b/f\n@@ -1 +1 @@\n-x\n+y");
+        let (_, PartRender::Diff { files, .. }) = diff_part(vec![dl(DiffLineKind::Removed, Some(1), None, "x"), dl(DiffLineKind::Added, None, Some(1), "y")]) else { unreachable!() };
+        let styled = diff_lines(&files, 0);
+        assert_eq!(raw.files, [(0, "f".to_owned())], "the file starts at its `---` row");
+        assert_eq!(raw.src[raw.hunks[0]], styled.src[styled.hunks[0]], "the hunk row");
+        assert_eq!(raw.src.last(), styled.src.last(), "the `+y` row");
     }
 }
 
