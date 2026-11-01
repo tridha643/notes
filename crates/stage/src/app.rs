@@ -38,6 +38,8 @@ pub struct Feed {
     pub hunks: Vec<usize>,
     /// Per post: the layout its lines came from, so the next rebuild moves them instead of copying.
     laid: Vec<Option<(PostId, u64)>>,
+    /// The search needle and its matches in `lines` as (line, from cell, to cell), ascending.
+    pub found: (Vec<char>, Vec<(usize, usize, usize)>),
     #[cfg(debug_assertions)]
     inputs: FeedInputs,
 }
@@ -754,8 +756,8 @@ impl App {
 
     /// `n`/`N`: the next or previous line matching the search, wrapping round the feed.
     fn step_match(&mut self, forward: bool) {
-        let needle = self.needle.clone();
-        let found = crate::search::lines(&self.feed().lines, &needle);
+        let mut found: Vec<usize> = self.feed().found.1.iter().map(|m| m.0).collect();
+        found.dedup();
         let cursor = self.cursor;
         let at = if forward { found.iter().position(|&l| l > cursor).unwrap_or(0) } else { found.iter().rposition(|&l| l < cursor).unwrap_or(found.len().saturating_sub(1)) };
         match found.get(at) {
@@ -775,7 +777,8 @@ impl App {
             return;
         }
         let end = feed.starts.get(i + 1).copied().unwrap_or(feed.lines.len());
-        let found = crate::search::lines(&feed.lines, &self.needle);
+        let mut found: Vec<usize> = feed.found.1.iter().map(|m| m.0).collect();
+        found.dedup();
         let first = found.iter().position(|&l| l >= feed.starts[i] && l < end);
         let line = first.map_or(feed.starts[i], |n| found[n]);
         let toast = first.map(|n| format!("match {}/{}", n + 1, found.len()));
@@ -1017,6 +1020,10 @@ impl App {
             self.scroll = self.scroll.min(total.saturating_sub(page as usize));
             self.cursor = self.cursor.min(total.saturating_sub(1)).clamp(self.scroll, self.scroll + page as usize - 1);
             self.feed = Some((stamp, feed));
+        }
+        let feed = &mut self.feed.as_mut().expect("built above").1;
+        if feed.found.0 != self.needle {
+            feed.found = (self.needle.clone(), crate::search::matches(&feed.lines, &self.needle));
         }
         if self.find_post.is_some() {
             self.land_find();
@@ -3504,5 +3511,50 @@ mod tests {
         let top = app.scroll;
         assert_eq!(source_at(&mut app, top), want_src, "the new version's same line is at the top");
         assert!(bar_text(&mut app).contains("b  v3"), "{}", bar_text(&mut app));
+    }
+
+    /// Per screen row of the main column: its text and the text drawn on the match color.
+    fn drawn_matches(app: &mut App) -> Vec<(String, String)> {
+        use ratatui::{backend::TestBackend, Terminal};
+        let (w, h) = app.size;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| ui::draw(f, app)).unwrap();
+        let main = ui::geometry(app.size).main;
+        let buf = term.backend().buffer();
+        (main.y + 1..main.y + main.height)
+            .map(|y| {
+                let cells = (main.x..main.x + main.width).map(|x| &buf[(x, y)]);
+                (cells.clone().map(|c| c.symbol()).collect(), cells.filter(|c| c.bg == ui::MATCH).map(|c| c.symbol()).collect())
+            })
+            .collect()
+    }
+
+    /// Every on-screen occurrence of `needle` is lit, and nothing else is.
+    fn assert_lit(app: &mut App, needle: &str) {
+        let rows = drawn_matches(app);
+        assert!(rows.iter().any(|(_, lit)| !lit.is_empty()), "something on screen matches {needle:?}");
+        for (text, lit) in rows {
+            let want: String = text.to_lowercase().match_indices(needle).map(|(at, _)| &text[at..at + needle.len()]).collect();
+            assert_eq!(lit, want, "row {text:?}");
+        }
+    }
+
+    #[test]
+    fn search_highlights_follow_scrolling_the_needle_and_feed_changes() {
+        let mut db = fake();
+        db.md = (0..60).map(|i| if i % 7 == 3 { format!("see the Needle {i}") } else { format!("row {i}") }).collect::<Vec<_>>().join("\n\n");
+        let mut app = md_post(&db);
+        app.needle = crate::search::needle("needle");
+        assert_lit(&mut app, "needle");
+        scroll_to(&mut app, 70);
+        assert_lit(&mut app, "needle");
+        app.needle = crate::search::needle("row 4");
+        assert_lit(&mut app, "row 4");
+        db.posts[0].version = 2;
+        db.md = (0..60).map(|i| format!("again, row {i}")).collect::<Vec<_>>().join("\n\n");
+        let fx = app.update(Msg::Event(Event { seq: 9, kind: "post-updated".into(), path: None, version: Some(2), id: Some("a".into()), session: Some("s1".into()) }));
+        serve(&mut app, fx, &db);
+        assert!(drawn_matches(&mut app).iter().any(|(text, _)| text.contains("again")), "the new version is on screen");
+        assert_lit(&mut app, "row 4");
     }
 }

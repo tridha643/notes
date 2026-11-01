@@ -14,7 +14,7 @@ fn fold(c: char) -> char {
 }
 
 /// The cell ranges `from..to` where `needle` occurs in `line`.
-pub fn ranges(line: &Line<'_>, needle: &[char]) -> Vec<(usize, usize)> {
+fn ranges(line: &Line<'_>, needle: &[char]) -> Vec<(usize, usize)> {
     if needle.is_empty() {
         return vec![];
     }
@@ -42,9 +42,9 @@ pub fn ranges(line: &Line<'_>, needle: &[char]) -> Vec<(usize, usize)> {
     out
 }
 
-/// The lines of `lines` that contain `needle`.
-pub fn lines(lines: &[Line<'_>], needle: &[char]) -> Vec<usize> {
-    (0..lines.len()).filter(|&i| !ranges(&lines[i], needle).is_empty()).collect()
+/// Every match of `needle` in `lines` as (line, from cell, to cell), in order.
+pub fn matches(lines: &[Line<'_>], needle: &[char]) -> Vec<(usize, usize, usize)> {
+    lines.iter().enumerate().flat_map(|(i, line)| ranges(line, needle).into_iter().map(move |(from, to)| (i, from, to))).collect()
 }
 
 #[cfg(test)]

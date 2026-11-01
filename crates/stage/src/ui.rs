@@ -511,7 +511,6 @@ fn main(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(bar(spans, title.width, BAR), title);
     let content = Rect::new(body.x + 1, body.y, body.width.saturating_sub(1), body.height);
     let drag = app.drag;
-    let needle = app.needle.clone();
     let feed = app.feed();
     let mut lines: Vec<Line> = feed.lines.iter().skip(scroll).take(body.height as usize).cloned().collect();
     // The cursor line: a soft band across the card (a fold node gets the stronger one).
@@ -520,12 +519,10 @@ fn main(f: &mut Frame, app: &mut App, area: Rect) {
         let w = content.width as usize;
         *line = highlight(line.clone(), 1, w.saturating_sub(1), if on_node { SELECTED } else { CURSOR });
     }
-    if !needle.is_empty() {
-        for line in &mut lines {
-            for (from, to) in crate::search::ranges(line, &needle) {
-                *line = highlight(line.clone(), from, to, MATCH);
-            }
-        }
+    let (found, end) = (&feed.found.1, scroll + lines.len());
+    for &(at, from, to) in found[found.partition_point(|m| m.0 < scroll)..].iter().take_while(|m| m.0 < end) {
+        let line = &mut lines[at - scroll];
+        *line = highlight(std::mem::take(line), from, to, MATCH);
     }
     // A mouse selection, cell-exact on its first and last lines.
     if let Some((a, b)) = drag.filter(|(a, b)| a != b) {
