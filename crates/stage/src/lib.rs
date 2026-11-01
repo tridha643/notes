@@ -13,4 +13,5 @@ pub mod page;
 pub mod probe;
 pub mod sanitize;
 pub mod screen;
+pub mod search;
 pub mod ui;

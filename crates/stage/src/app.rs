@@ -31,6 +31,9 @@ pub struct Feed {
     pub slots: Vec<(VisualKey, Slot)>,
     /// First line of each post, by index into `App::posts`.
     pub starts: Vec<usize>,
+    /// Ascending lines where a card starts and where a diff hunk header sits.
+    pub cards: Vec<usize>,
+    pub hunks: Vec<usize>,
     /// The local day the headers' times were written on (`ui::today`).
     day: (i32, i32),
 }
@@ -283,6 +286,10 @@ pub struct App {
     /// coming back shows them at once (then refreshes) instead of a blank pane.
     remembered: HashMap<SessionId, Remembered>,
     wheel: WheelAccel,
+    /// The search being read: its query's chars (empty: none), lit in the feed and stepped by `n`/`N`.
+    pub needle: Vec<char>,
+    /// The post a search hit opened, until its first matching line is on screen.
+    find_post: Option<PostId>,
 }
 
 struct Remembered {
@@ -380,6 +387,8 @@ impl App {
             remembered: HashMap::new(),
             drag: None,
             wheel: WheelAccel::default(),
+            needle: Vec::new(),
+            find_post: None,
         }
     }
 
@@ -648,7 +657,7 @@ impl App {
 
     /// `j`/`k`: bring the next post's title (or this one's, then the previous) to the top.
     fn step_post(&mut self, forward: bool) {
-        let (cursor, page) = (self.cursor, self.page());
+        let cursor = self.cursor;
         let feed = self.feed();
         let Some(&(at, _)) = feed.hits.get(cursor) else { return };
         let target = match (forward, cursor > feed.starts[at]) {
@@ -657,9 +666,65 @@ impl App {
             (false, false) => at.saturating_sub(1),
         };
         let Some(&line) = feed.starts.get(target) else { return };
-        let max = feed.lines.len().saturating_sub(page);
+        self.goto(line);
+    }
+
+    /// Put `line` at the top of the viewport (as far as the feed's end allows), cursor on it.
+    fn goto(&mut self, line: usize) {
+        let page = self.page();
+        let max = self.feed().lines.len().saturating_sub(page);
         (self.cursor, self.scroll) = (line, line.min(max));
         self.follow_cursor();
+    }
+
+    /// `]`/`[` (hunks, else cards) and `.`/`,` (cards): the next or previous stop.
+    fn step_stop(&mut self, hunks: bool, forward: bool) {
+        let cursor = self.cursor;
+        let feed = self.feed();
+        let pick = |stops: &[usize]| {
+            if forward {
+                stops.get(stops.partition_point(|&l| l <= cursor))
+            } else {
+                stops[..stops.partition_point(|&l| l < cursor)].last()
+            }
+            .copied()
+        };
+        let stop = if hunks { pick(&feed.hunks).or_else(|| pick(&feed.cards)) } else { pick(&feed.cards) };
+        if let Some(line) = stop {
+            self.goto(line);
+        }
+    }
+
+    /// `n`/`N`: the next or previous line matching the search, wrapping round the feed.
+    fn step_match(&mut self, forward: bool) {
+        let needle = self.needle.clone();
+        let found = crate::search::lines(&self.feed().lines, &needle);
+        let cursor = self.cursor;
+        let at = if forward { found.iter().position(|&l| l > cursor).unwrap_or(0) } else { found.iter().rposition(|&l| l < cursor).unwrap_or(found.len().saturating_sub(1)) };
+        match found.get(at) {
+            Some(&line) => {
+                self.goto(line);
+                self.toast = Some(format!("match {}/{}", at + 1, found.len()));
+            }
+            None => self.toast = Some("no matches".into()),
+        }
+    }
+
+    /// Bring the first line of the search hit's post that matches the query to the top.
+    fn land_find(&mut self) {
+        let (Some(id), Some((key, feed))) = (self.find_post.clone(), &self.feed) else { return };
+        let Some(i) = self.posts.iter().position(|p| p.id == id) else { return };
+        if !key.0.get(i).is_some_and(|p| p.3) {
+            return;
+        }
+        let end = feed.starts.get(i + 1).copied().unwrap_or(feed.lines.len());
+        let found = crate::search::lines(&feed.lines, &self.needle);
+        let first = found.iter().position(|&l| l >= feed.starts[i] && l < end);
+        let line = first.map_or(feed.starts[i], |n| found[n]);
+        let toast = first.map(|n| format!("match {}/{}", n + 1, found.len()));
+        self.find_post = None;
+        self.goto(line);
+        self.toast = toast;
     }
 
     // ---- Posts ------------------------------------------------------------------
@@ -815,6 +880,8 @@ impl App {
                     Some(laid) => {
                         feed.lines.extend(laid.lines.iter().cloned());
                         feed.hits.extend(laid.hits.iter().map(|h| (i, *h)));
+                        feed.cards.extend(laid.cards.iter().map(|l| l + start));
+                        feed.hunks.extend(laid.hunks.iter().map(|l| l + start));
                         feed.slots.extend(laid.slots.iter().map(|s| {
                             ((id.clone(), *version, s.card), Slot { line: s.line + start, ..*s })
                         }));
@@ -843,6 +910,9 @@ impl App {
             self.cursor = self.cursor.min(total.saturating_sub(1));
             self.scroll = self.scroll.min(total.saturating_sub(page as usize)).min(self.cursor);
             self.feed = Some((key, feed));
+        }
+        if self.find_post.is_some() {
+            self.land_find();
         }
         &self.feed.as_ref().expect("built above").1
     }
@@ -1248,6 +1318,14 @@ impl App {
         if let Some(fx) = self.zoom_key(k.code) {
             return fx;
         }
+        self.find_post = None;
+        if k.modifiers.contains(KeyModifiers::CONTROL) {
+            if let KeyCode::Char(c @ ('d' | 'u')) = k.code {
+                let half = (self.page() / 2).max(1) as isize;
+                self.scroll(if c == 'd' { half } else { -half });
+                return vec![];
+            }
+        }
         match k.code {
             KeyCode::Char('q') => vec![Effect::Quit],
             KeyCode::Char('z') => self.toggle_card_focus(),
@@ -1259,6 +1337,18 @@ impl App {
             }
             KeyCode::Char('k') if self.focused_card.is_none() => {
                 self.step_post(false);
+                vec![]
+            }
+            KeyCode::Char(c @ ('[' | ']' | ',' | '.')) => {
+                self.step_stop(matches!(c, '[' | ']'), matches!(c, ']' | '.'));
+                vec![]
+            }
+            KeyCode::Char(c @ ('n' | 'N')) => {
+                self.step_match(c == 'n');
+                vec![]
+            }
+            KeyCode::Esc if !self.needle.is_empty() => {
+                self.needle.clear();
                 vec![]
             }
             KeyCode::Char('J') => self.select_session(self.sel + 1, false),
@@ -1345,6 +1435,8 @@ impl App {
             }
             KeyCode::Enter => match hits.get(sel) {
                 Some(hit) => {
+                    self.needle = crate::search::needle(&query);
+                    self.find_post = hit.post.clone();
                     let mut fx = self.open_session(hit.session.id.clone());
                     // The hit's post is shown once the post list arrives.
                     if let Some(post) = &hit.post {
@@ -1771,7 +1863,7 @@ pub fn fit_cells((w, h): (u32, u32), max_scale: f32, cols: u16, rows: u16, (cw, 
 mod tests {
     use super::*;
     use crossterm::event::KeyEventState;
-    use notes_proto::posts::Part;
+    use notes_proto::posts::{DiffFileRender, DiffHunk, DiffLayout, DiffLine, DiffLineKind, Part, PartRender, Span as WireSpan};
 
     fn key(c: KeyCode) -> Msg {
         Msg::Key(KeyEvent { code: c, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE })
@@ -2869,5 +2961,126 @@ mod tests {
         serve(&mut app, fx, &db);
         assert_eq!((app.open.as_deref(), app.shown.as_deref()), (Some("s2"), Some("z")));
         assert_eq!((app.sel, app.posts.len()), (0, 1));
+    }
+
+    fn ctrl(c: char) -> Msg {
+        Msg::Key(KeyEvent { code: KeyCode::Char(c), modifiers: KeyModifiers::CONTROL, kind: KeyEventKind::Press, state: KeyEventState::NONE })
+    }
+
+    /// The text of the line under the cursor.
+    fn row(app: &mut App) -> String {
+        let line = app.cursor;
+        app.feed().lines[line].spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn paragraphs(db: &mut Fake, n: usize) {
+        db.md = (0..n).map(|i| format!("row {i}")).collect::<Vec<_>>().join("\n\n");
+    }
+
+    #[test]
+    fn ctrl_d_and_u_scroll_half_a_page_dragging_the_cursor() {
+        let mut db = fake();
+        paragraphs(&mut db, 120);
+        let mut app = booted(&db);
+        app.update(key(KeyCode::Char('g')));
+        let half = app.page() / 2;
+        assert_eq!((app.scroll, app.cursor), (0, 0));
+        app.update(ctrl('d'));
+        assert_eq!((app.scroll, app.cursor), (half, half), "viewport and cursor move together");
+        app.update(ctrl('d'));
+        assert_eq!(app.scroll, 2 * half);
+        app.update(ctrl('u'));
+        assert_eq!(app.scroll, half);
+        assert!(app.cursor >= app.scroll && app.cursor < app.scroll + app.page(), "cursor stays in view");
+        assert!(matches!(app.mode, Mode::Nav), "ctrl-d is not the delete key");
+    }
+
+    fn diff_post(app: &mut App) {
+        let hunk = |n: u32| DiffHunk {
+            header: format!("@@ -{n} +{n} @@"),
+            lines: (0..12)
+                .map(|i| DiffLine { kind: DiffLineKind::Context, old_line: Some(n + i), new_line: Some(n + i), spans: vec![WireSpan { text: format!("ctx {n} {i}"), class: None }] })
+                .collect(),
+        };
+        let file = DiffFileRender { filename: "a.rs".into(), language: None, added: 0, removed: 0, hunks: vec![hunk(1), hunk(100), hunk(200)] };
+        let mut post = post("b", "s1", 2, "");
+        post.parts = vec![
+            Part::Markdown { markdown: "intro".into(), id: None },
+            Part::Diff { patch: Some("x".into()), files: vec![], layout: DiffLayout::Unified, id: None },
+            Part::Markdown { markdown: "tail\n\n".repeat(40), id: None },
+        ];
+        let render = PostRender {
+            id: "b".into(),
+            version: 2,
+            parts: vec![PartRender::Native, PartRender::Diff { layout: DiffLayout::Unified, files: vec![file] }, PartRender::Native],
+        };
+        app.loaded.get_mut(&("b".into(), 2)).unwrap().cards = Some(cards::build_cards(&post, Some(&render)));
+        app.views.get_mut(&PostId::from("b")).unwrap().laid = None;
+        app.feed = None;
+    }
+
+    #[test]
+    fn brackets_step_hunks_then_cards_and_comma_period_step_cards() {
+        let mut app = booted(&fake());
+        diff_post(&mut app);
+        app.update(key(KeyCode::Char('g')));
+        let at = |app: &mut App| (app.scroll, app.cursor, row(app));
+        for want in ["@@ -1 +1 @@", "@@ -100 +100 @@", "@@ -200 +200 @@"] {
+            app.update(key(KeyCode::Char(']')));
+            let (scroll, cursor, text) = at(&mut app);
+            assert!(text.contains(want), "{text}");
+            assert_eq!(scroll, cursor, "the stop sits at the top of the viewport");
+        }
+        app.update(key(KeyCode::Char(']')));
+        assert!(at(&mut app).2.contains("markdown"), "no hunk ahead falls back to the next card: {}", at(&mut app).2);
+        app.update(key(KeyCode::Char('[')));
+        assert!(at(&mut app).2.contains("@@ -200"), "back to the last hunk");
+        app.update(key(KeyCode::Char('g')));
+        let mut labels = Vec::new();
+        for _ in 0..4 {
+            app.update(key(KeyCode::Char('.')));
+            labels.push(at(&mut app).2);
+        }
+        assert!(labels[0].contains("markdown") && labels[1].contains("markdown") && labels[2].contains("diff") && labels[3].contains("markdown"), "{labels:?}");
+        app.update(key(KeyCode::Char(',')));
+        assert!(at(&mut app).2.contains("diff"));
+        assert_eq!(app.shown.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn search_hit_lands_on_the_matching_line_and_n_steps_matches() {
+        let mut db = fake();
+        db.md = (0..60).map(|i| if i % 20 == 5 { format!("see the Needle {i}") } else { format!("row {i}") }).collect::<Vec<_>>().join("\n\n");
+        let mut app = booted(&db);
+        let hit = SessionHit { session: session("s2", 1), post: Some("z".into()), text: None };
+        app.mode = Mode::Search { query: "needle".into(), hits: vec![hit], sel: 0 };
+        let fx = app.update(key(KeyCode::Enter));
+        serve(&mut app, fx, &db);
+        app.feed();
+        assert_eq!(app.open.as_deref(), Some("s2"));
+        assert_eq!(app.scroll, app.cursor, "the match is the top line");
+        assert!(row(&mut app).contains("Needle 5"), "{}", row(&mut app));
+        assert_eq!(app.toast.as_deref(), Some("match 1/3"));
+        app.update(key(KeyCode::Char('n')));
+        assert!(row(&mut app).contains("Needle 25"));
+        assert_eq!((app.toast.as_deref(), app.scroll), (Some("match 2/3"), app.cursor));
+        app.update(key(KeyCode::Char('n')));
+        app.update(key(KeyCode::Char('n')));
+        assert!(row(&mut app).contains("Needle 5"), "n wraps round");
+        assert_eq!(app.toast.as_deref(), Some("match 1/3"));
+        app.update(key(KeyCode::Char('N')));
+        assert!(row(&mut app).contains("Needle 45"), "N wraps back");
+        assert_eq!(app.toast.as_deref(), Some("match 3/3"));
+        // The matches are lit in the drawn feed, and esc puts them out.
+        let lit = |app: &mut App| {
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            term.draw(|f| ui::draw(f, app)).unwrap();
+            term.backend().buffer().content().iter().filter(|c| c.bg == ui::MATCH).map(|c| c.symbol().to_string()).collect::<String>()
+        };
+        assert_eq!(lit(&mut app), "Needle");
+        app.update(key(KeyCode::Esc));
+        assert_eq!(lit(&mut app), "");
+        app.update(key(KeyCode::Char('n')));
+        assert_eq!(app.toast.as_deref(), Some("no matches"));
     }
 }

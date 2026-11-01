@@ -34,6 +34,8 @@ pub const SELECTED: Color = Color::Rgb(0x31, 0x32, 0x44);
 pub const CURSOR: Color = Color::Rgb(0x24, 0x25, 0x3a);
 /// Text selected by a mouse drag.
 pub const SELECTION: Color = Color::Rgb(0x45, 0x47, 0x5a);
+/// Matches of the search being read.
+pub const MATCH: Color = Color::Rgb(0x6b, 0x55, 0x1f);
 pub const ADDED_BG: Color = Color::Rgb(0x1f, 0x3a, 0x2a);
 pub const REMOVED_BG: Color = Color::Rgb(0x45, 0x22, 0x2a);
 /// Changed words inside an added or removed line.
@@ -506,6 +508,7 @@ fn main(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(bar(spans, title.width, BAR), title);
     let content = Rect::new(body.x + 1, body.y, body.width.saturating_sub(1), body.height);
     let drag = app.drag;
+    let needle = app.needle.clone();
     let feed = app.feed();
     let mut lines: Vec<Line> = feed.lines.iter().skip(scroll).take(body.height as usize).cloned().collect();
     // The cursor line: a soft band across the card (a fold node gets the stronger one).
@@ -513,6 +516,13 @@ fn main(f: &mut Frame, app: &mut App, area: Rect) {
     if let Some(line) = lines.get_mut(cursor.wrapping_sub(scroll)) {
         let w = content.width as usize;
         *line = highlight(line.clone(), 1, w.saturating_sub(1), if on_node { SELECTED } else { CURSOR });
+    }
+    if !needle.is_empty() {
+        for line in &mut lines {
+            for (from, to) in crate::search::ranges(line, &needle) {
+                *line = highlight(line.clone(), from, to, MATCH);
+            }
+        }
     }
     // A mouse selection, cell-exact on its first and last lines.
     if let Some((a, b)) = drag.filter(|(a, b)| a != b) {

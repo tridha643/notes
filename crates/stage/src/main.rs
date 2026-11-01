@@ -52,7 +52,10 @@ const SCROLL_SETTLE: Duration = Duration::from_millis(150);
 fn is_scroll(msg: &Msg) -> bool {
     match msg {
         Msg::Wheel(..) => true,
-        Msg::Key(k) => matches!(k.code, KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Char(' ' | 'b' | 'j' | 'k')),
+        Msg::Key(k) => match k.code {
+            KeyCode::Char('d' | 'u') => k.modifiers.contains(KeyModifiers::CONTROL),
+            code => matches!(code, KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Char(' ' | 'b' | 'j' | 'k')),
+        },
         _ => false,
     }
 }

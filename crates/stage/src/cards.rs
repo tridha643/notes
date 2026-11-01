@@ -36,6 +36,7 @@ pub enum CardBody {
     /// number column's blank twin) or a dim `↪`. `shade` gives it a terminal's
     /// own background.
     Pre { lines: Vec<Line<'static>>, gutter: Option<Gutter>, shade: bool },
+    Diff(Diff),
     /// Pixels drawn through kitty graphics; `fallback` shows until they're
     /// ready, and for good if they can't be made.
     Visual { source: VisualSource, fallback: Vec<Line<'static>> },
@@ -48,6 +49,14 @@ pub enum CardBody {
 pub struct Gutter {
     pub width: usize,
     pub rule: bool,
+}
+
+/// A diff card: rows laid out like [`CardBody::Pre`] under `gutter`, and the
+/// indexes in `lines` of its hunk headers.
+pub struct Diff {
+    pub lines: Vec<Line<'static>>,
+    pub gutter: Gutter,
+    pub hunks: Vec<usize>,
 }
 
 /// What a visual card renders from.
@@ -158,21 +167,14 @@ fn card(part: &Part, render: Option<&PartRender>) -> Card {
             }
             let bytes = patch.as_ref().map_or(0, |p| p.len())
                 + files.iter().map(|f| f.before.len() + f.after.len()).sum::<usize>();
-            let (lines, number_w) = diff_lines(rendered);
-            Card {
-                label,
-                body: CardBody::Pre {
-                    lines: capped(lines, bytes),
-                    gutter: Some(Gutter { width: diff_gutter_width(number_w), rule: false }),
-                    shade: false,
-                },
-            }
+            let diff = diff_lines(rendered);
+            Card { label, body: CardBody::Diff(Diff { lines: capped(diff.lines, bytes), ..diff }) }
         }
         (Part::Diff { patch, .. }, _) => {
             let text = patch.as_deref().unwrap_or("");
             Card {
                 label: "diff".into(),
-                body: CardBody::Lines(capped(sanitize::lines(text).map(Line::from).collect(), text.len())),
+                body: CardBody::Diff(patch_lines(text)),
             }
         }
         (Part::Terminal { title, text, .. }, Some(PartRender::Terminal { lines })) => Card {
@@ -325,15 +327,22 @@ fn plain_code(code: &str, start: u32) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// A raw patch before (or without) its render: plain rows, wrapped under the sign column.
+fn patch_lines(text: &str) -> Diff {
+    let lines: Vec<String> = sanitize::lines(text).collect();
+    let hunks = lines.iter().enumerate().filter(|(_, l)| l.starts_with("@@")).map(|(i, _)| i).collect();
+    Diff { lines: capped(lines.into_iter().map(Line::from).collect(), text.len()), gutter: Gutter { width: 1, rule: false }, hunks }
+}
+
 /// Cells of a diff row's gutter: two line numbers, a sign, and the spaces between.
 fn diff_gutter_width(number_w: usize) -> usize {
     2 * number_w + 4
 }
 
-/// A diff's rows, and the digits of its widest line number: the gutter is
-/// sized by the file, not a fixed four. Changed words inside a paired
+/// A diff's rows, gutter and hunk stops. The gutter is sized by the file's
+/// widest line number, not a fixed four. Changed words inside a paired
 /// removed/added run get a stronger background.
-fn diff_lines(files: &[notes_proto::posts::DiffFileRender]) -> (Vec<Line<'static>>, usize) {
+fn diff_lines(files: &[notes_proto::posts::DiffFileRender]) -> Diff {
     let number_w = files
         .iter()
         .flat_map(|f| &f.hunks)
@@ -343,6 +352,7 @@ fn diff_lines(files: &[notes_proto::posts::DiffFileRender]) -> (Vec<Line<'static
         .max()
         .map_or(1, |n| n.to_string().len());
     let mut out = Vec::new();
+    let mut hunks = Vec::new();
     for file in files {
         out.push(Line::from(vec![
             Span::styled(sanitize(&file.filename).into_owned(), Style::new().add_modifier(Modifier::BOLD)),
@@ -350,6 +360,7 @@ fn diff_lines(files: &[notes_proto::posts::DiffFileRender]) -> (Vec<Line<'static
             Span::styled(format!(" −{}", file.removed), Style::new().fg(ui::RED)),
         ]));
         for hunk in &file.hunks {
+            hunks.push(out.len());
             out.push(Line::styled(sanitize(&hunk.header).into_owned(), Style::new().fg(ui::CYAN)));
             let mut body: Vec<Line<'static>> = hunk.lines.iter().map(|l| styled(&l.spans)).collect();
             emphasize_pairs(&hunk.lines, &mut body);
@@ -371,7 +382,7 @@ fn diff_lines(files: &[notes_proto::posts::DiffFileRender]) -> (Vec<Line<'static
             }
         }
     }
-    (out, number_w)
+    Diff { lines: out, gutter: Gutter { width: diff_gutter_width(number_w), rule: false }, hunks }
 }
 
 /// Pair each run of removed lines with the added run right after it (line i
@@ -839,6 +850,9 @@ pub struct Laid {
     pub lines: Vec<Line<'static>>,
     pub hits: Vec<Hit>,
     pub slots: Vec<Slot>,
+    /// Lines where a card starts, and where a diff hunk header sits (ascending).
+    pub cards: Vec<usize>,
+    pub hunks: Vec<usize>,
 }
 
 /// Rows reserved for a card's pixels: from `line`, `rows` tall, `cols` wide,
@@ -974,21 +988,32 @@ pub fn layout(
         laid.hits.push(hit);
     };
     for (c, card) in cards.iter().enumerate().filter(|(c, _)| selected.is_none_or(|s| s == *c)) {
+        laid.cards.push(laid.lines.len());
         push(&mut laid, bordered(&card.label, width), Hit::Card(c));
+        // Preformatted rows hard-wrap under their gutter; a diff's hunk headers are stops.
+        let pre = |laid: &mut Laid, lines: &[Line<'static>], gutter: Option<Gutter>, shade: Style, hunks: &[usize]| {
+            for (i, line) in lines.iter().enumerate() {
+                if hunks.binary_search(&i).is_ok() {
+                    laid.hunks.push(laid.lines.len());
+                }
+                for row in hard_wrap(line, inner, gutter) {
+                    push(laid, boxed(row.patch_style(shade), inner), Hit::Card(c));
+                }
+            }
+            push(laid, Line::styled(format!("╰{}╯", "─".repeat(width - 2)), ui::border()), Hit::Card(c));
+            push(laid, Line::default(), Hit::None);
+        };
         let rows: Vec<(Line<'static>, Hit)> = match &card.body {
             CardBody::Lines(lines) => lines.iter().map(|l| (l.clone(), Hit::Card(c))).collect(),
             CardBody::Markdown(src) => {
                 capped(markdown_lines(src, inner), src.len()).into_iter().map(|l| (l, Hit::Card(c))).collect()
             }
             CardBody::Pre { lines, gutter, shade } => {
-                let shade = if *shade { Style::new().bg(ui::CODE_BG) } else { Style::new() };
-                for line in lines {
-                    for row in hard_wrap(line, inner, *gutter) {
-                        push(&mut laid, boxed(row.patch_style(shade), inner), Hit::Card(c));
-                    }
-                }
-                push(&mut laid, Line::styled(format!("╰{}╯", "─".repeat(width - 2)), ui::border()), Hit::Card(c));
-                push(&mut laid, Line::default(), Hit::None);
+                pre(&mut laid, lines, *gutter, if *shade { Style::new().bg(ui::CODE_BG) } else { Style::new() }, &[]);
+                continue;
+            }
+            CardBody::Diff(diff) => {
+                pre(&mut laid, &diff.lines, Some(diff.gutter), Style::new(), &diff.hunks);
                 continue;
             }
             CardBody::Placeholder(text) => vec![(Line::styled(text.clone(), ui::dim()), Hit::Card(c))],
@@ -1044,6 +1069,9 @@ pub fn layout(
     }
     let dropped = cap(&mut laid.lines, sanitize::POST_LINES, sanitize::POST_BYTES);
     if dropped > 0 {
+        let kept = laid.lines.len();
+        laid.cards.retain(|&l| l < kept);
+        laid.hunks.retain(|&l| l < kept);
         laid.hits.truncate(laid.lines.len() - 1);
         laid.hits.push(Hit::None);
     }
@@ -1416,6 +1444,17 @@ mod tests {
         for row in [3, 4] {
             assert!(laid.lines[row].spans.iter().all(|s| s.style.bg != Some(ui::ADDED_WORD_BG) && s.style.bg != Some(ui::REMOVED_WORD_BG)));
         }
+    }
+
+    #[test]
+    fn a_raw_patch_wraps_under_its_sign_and_stops_at_its_hunks() {
+        let patch = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-abcdefghijklmnopqrstuvwxyz\n@@ -9 +9 @@\n+x\n";
+        let part = Part::Diff { patch: Some(patch.into()), files: vec![], layout: DiffLayout::Unified, id: None };
+        let laid = layout(&build_cards(&post(vec![part]), None), &[], 24, &Folds::new(), &|_| Fit::Pending { rows: 1 }, None);
+        let rows: Vec<String> = laid.lines.iter().map(|l| l.to_string()).collect();
+        assert_eq!(&rows[5..7], ["│ -abcdefghijklmnopqrs │", "│  tuvwxyz             │"]);
+        let stops: Vec<&str> = laid.hunks.iter().map(|&l| rows[l].as_str()).collect();
+        assert_eq!(stops, ["│ @@ -1 +1 @@          │", "│ @@ -9 +9 @@          │"]);
     }
 }
 
