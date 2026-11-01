@@ -18,17 +18,22 @@ use notes_proto::{
     to_line, Event, Request, Response, Verb, PROTOCOL_VERSION,
 };
 use stage::{
-    app::{App, Effect, Msg},
-    client::{StageClient, Watch},
+    app::{App, Effect, Msg, StageRequest},
+    client::{next_request, StageClient, Watch},
 };
 
-/// Answer the app's requests in order, as the request worker does, until none are left.
+fn requests(fx: Vec<Effect>) -> impl Iterator<Item = StageRequest> {
+    fx.into_iter().filter_map(|e| match e {
+        Effect::Request(r) => Some(r),
+        _ => None,
+    })
+}
+
+/// Answer the app's requests in the request worker's order until none are left.
 fn settle(app: &mut App, client: &mut StageClient, fx: Vec<Effect>) {
-    let mut queue: std::collections::VecDeque<Effect> = fx.into();
-    while let Some(e) = queue.pop_front() {
-        if let Effect::Request(r) = e {
-            queue.extend(app.update(Msg::Reply(client.perform(&r))));
-        }
+    let mut queue: Vec<StageRequest> = requests(fx).collect();
+    while let Some(r) = next_request(&mut queue) {
+        queue.extend(requests(app.update(Msg::Reply(client.perform(&r)))));
     }
 }
 

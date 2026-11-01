@@ -28,7 +28,7 @@ use ratatui::{
 };
 use stage::{
     app::{App, Effect, Msg, StageRequest},
-    client::{StageClient, Watch},
+    client::{next_request, StageClient, Watch},
     gallery::Gallery,
     latency::Latency,
     probe,
@@ -241,13 +241,20 @@ fn main() -> ExitCode {
         app.cell_px = px;
         let _ = tx.send(Msg::CellPx(px));
     }
-    // Requests run in order on their own thread; each answer is one more message.
+    // Requests run on their own thread, renders last (`next_request`); each answer is one more message.
     let (req_tx, req_rx) = mpsc::channel::<StageRequest>();
     {
         let tx = tx.clone();
         thread::spawn(move || {
             let mut client = StageClient::new(sock);
-            for req in req_rx {
+            let mut queue = Vec::new();
+            loop {
+                if queue.is_empty() {
+                    let Ok(req) = req_rx.recv() else { return };
+                    queue.push(req);
+                }
+                queue.extend(req_rx.try_iter());
+                let req = next_request(&mut queue).expect("the queue holds a request");
                 if tx.send(Msg::Reply(client.perform(&req))).is_err() {
                     return;
                 }
