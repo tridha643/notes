@@ -18,7 +18,7 @@ use ratatui::{
     backend::CrosstermBackend,
     crossterm::{
         cursor::{Hide, Show},
-        event::{self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers},
+        event::{self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseEventKind},
         execute,
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     },
@@ -47,9 +47,8 @@ const TURN: Duration = Duration::from_millis(4);
 const SCROLL_SETTLE: Duration = Duration::from_millis(150);
 
 fn is_scroll(msg: &Msg) -> bool {
-    use ratatui::crossterm::event::MouseEventKind;
     match msg {
-        Msg::Mouse(m) => matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown),
+        Msg::Wheel(..) => true,
         Msg::Key(k) => matches!(k.code, KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Char(' ' | 'b' | 'j' | 'k')),
         _ => false,
     }
@@ -201,6 +200,8 @@ fn main() -> ExitCode {
             while let Ok(ev) = event::read() {
                 let msgs = match ev {
                     TermEvent::Key(k) => vec![Msg::Key(k)],
+                    // Stamped here: wheel acceleration needs arrival times, not batch times.
+                    TermEvent::Mouse(m) if matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => vec![Msg::Wheel(m, std::time::Instant::now())],
                     TermEvent::Mouse(m) => vec![Msg::Mouse(m)],
                     // A pane can start at a placeholder size (Rex: 80x24, 8x16 px cells)
                     // and get its real one in the first resize, so re-measure cells too.

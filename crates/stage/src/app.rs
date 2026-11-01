@@ -3,7 +3,7 @@
 //! effects for `main` to perform. Requests are limited to [`StageRequest`], whose
 //! writes are comments, session renames and deletes the user confirmed.
 
-use std::collections::{HashMap, HashSet};
+use std::{collections::{HashMap, HashSet}, time::Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use notes_proto::{
@@ -131,6 +131,8 @@ pub enum Reply {
 pub enum Msg {
     Key(KeyEvent),
     Mouse(MouseEvent),
+    /// A wheel tick and when the terminal reader got it (`Mouse` ticks count as now).
+    Wheel(MouseEvent, Instant),
     Resize(u16, u16),
     /// The terminal's cell size in px changed (or became known).
     CellPx((u16, u16)),
@@ -279,6 +281,7 @@ pub struct App {
     /// Sessions opened before: their posts, comments and place in the feed, so
     /// coming back shows them at once (then refreshes) instead of a blank pane.
     remembered: HashMap<SessionId, Remembered>,
+    wheel: WheelAccel,
 }
 
 struct Remembered {
@@ -291,6 +294,43 @@ struct Remembered {
 }
 
 const WHEEL: usize = 3;
+
+/// Wheel acceleration from tick cadence, hunk's tuning of OpenTUI's
+/// `MacOSScrollAccel`: a lone notch moves one row, a fast spin ramps to `WHEEL`.
+/// Fractions carry between ticks so the ramp is smooth.
+#[derive(Default)]
+struct WheelAccel {
+    last: Option<Instant>,
+    gaps: [f64; 3],
+    n: usize,
+    carry: f64,
+}
+
+impl WheelAccel {
+    fn rows(&mut self, at: Instant, dir: f64) -> isize {
+        let gap = self.last.map(|l| at.saturating_duration_since(l).as_secs_f64() * 1000.0);
+        let mult = match gap {
+            Some(ms) if ms < 6.0 => 1.0,
+            Some(ms) if ms <= 150.0 => {
+                self.last = Some(at);
+                self.gaps[self.n % 3] = ms;
+                self.n += 1;
+                let avg = self.gaps[..self.n.min(3)].iter().sum::<f64>() / self.n.min(3) as f64;
+                (1.0 + 0.4 * ((100.0 / avg / 4.0).exp() - 1.0)).min(WHEEL as f64)
+            }
+            _ => {
+                *self = WheelAccel { last: Some(at), ..WheelAccel::default() };
+                1.0
+            }
+        };
+        // A reversal moves at once instead of first paying back the other way's fraction.
+        if self.carry * dir < 0.0 { self.carry = 0.0; }
+        self.carry += dir * mult;
+        let rows = self.carry.trunc();
+        self.carry -= rows;
+        rows as isize
+    }
+}
 
 impl App {
     pub fn new(want: Option<SessionId>) -> App {
@@ -338,6 +378,7 @@ impl App {
             jump: None,
             remembered: HashMap::new(),
             drag: None,
+            wheel: WheelAccel::default(),
         }
     }
 
@@ -449,7 +490,8 @@ impl App {
                 fx
             }
             Msg::Key(_) => vec![],
-            Msg::Mouse(m) => self.mouse(m),
+            Msg::Mouse(m) => self.mouse(m, Instant::now()),
+            Msg::Wheel(m, at) => self.mouse(m, at),
             Msg::Resize(w, h) => {
                 self.size = (w, h);
                 if w >= ui::SIDEBAR_MIN_WIDTH { self.session_picker = false; }
@@ -839,10 +881,11 @@ impl App {
         self.follow_cursor();
     }
 
-    fn wheel_lines(&self) -> isize {
+    fn wheel_rows(&mut self, down: bool, at: Instant) -> isize {
+        let dir = if down { 1 } else { -1 };
         // Touch clients already emit a stream of wheel ticks during a swipe.
-        // Tripling each tick skips a fifth of a short phone viewport.
-        if self.size.0 < ui::SIDEBAR_MIN_WIDTH || self.page() < 20 { 1 } else { WHEEL as isize }
+        // Accelerating them skips a fifth of a short phone viewport.
+        if self.size.0 < ui::SIDEBAR_MIN_WIDTH || self.page() < 20 { dir } else { self.wheel.rows(at, dir as f64) }
     }
 
     /// Scroll the feed by `delta` lines, dragging the cursor along.
@@ -1380,7 +1423,7 @@ impl App {
         }
     }
 
-    fn mouse(&mut self, m: MouseEvent) -> Vec<Effect> {
+    fn mouse(&mut self, m: MouseEvent, at: Instant) -> Vec<Effect> {
         let g = ui::geometry_for(self);
         let inside = |r: ratatui::layout::Rect| {
             m.column >= r.x && m.column < r.x + r.width && m.row >= r.y && m.row < r.y + r.height
@@ -1413,8 +1456,8 @@ impl App {
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if matches!(self.mode, Mode::Nav) => {
                 let before = (self.scroll, self.cursor);
                 self.drag = None;
-                let step = self.wheel_lines();
-                self.scroll(if m.kind == MouseEventKind::ScrollDown { step } else { -step });
+                let rows = self.wheel_rows(m.kind == MouseEventKind::ScrollDown, at);
+                self.scroll(rows);
                 if before == (self.scroll, self.cursor) { return vec![]; }
                 vec![]
             }
@@ -1931,6 +1974,27 @@ mod tests {
     }
 
     #[test]
+    fn wheel_accelerates_with_cadence_and_settles() {
+        let mut db = fake();
+        db.md = (0..400).map(|i| format!("line {i}\n\n")).collect();
+        let mut app = booted(&db);
+        app.update(key(KeyCode::Char('g')));
+        let t0 = Instant::now();
+        let tick = |app: &mut App, ms: u64, kind| {
+            let before = app.scroll as isize;
+            app.update(Msg::Wheel(MouseEvent { kind, column: 60, row: 10, modifiers: KeyModifiers::NONE }, t0 + std::time::Duration::from_millis(ms)));
+            app.scroll as isize - before
+        };
+        assert_eq!(tick(&mut app, 0, MouseEventKind::ScrollDown), 1, "a lone notch moves one row");
+        let fast: isize = (1..=20).map(|i| tick(&mut app, i * 10, MouseEventKind::ScrollDown)).sum();
+        assert_eq!(fast, 20 * WHEEL as isize, "a fast spin ramps to the cap");
+        assert_eq!(tick(&mut app, 205, MouseEventKind::ScrollDown), 1, "under 6 ms apart counts as one row");
+        assert_eq!(tick(&mut app, 500, MouseEventKind::ScrollDown), 1, "a pause resets the ramp");
+        assert_eq!(tick(&mut app, 550, MouseEventKind::ScrollDown), 1, "a slow notch stays near one row");
+        assert_eq!(tick(&mut app, 600, MouseEventKind::ScrollUp), -1, "a reversal moves at once");
+    }
+
+    #[test]
     fn wheel_scrolls_and_click_folds() {
         let mut db = fake();
         db.md = (0..80).map(|i| format!("line {i}\n\n")).collect();
@@ -1939,7 +2003,7 @@ mod tests {
         app.update(wheel(MouseEventKind::ScrollUp));
         let top = app.scroll;
         app.update(wheel(MouseEventKind::ScrollDown));
-        assert_eq!(app.scroll, top + WHEEL);
+        assert_eq!(app.scroll, top + 1, "a lone notch moves one row");
         app.update(wheel(MouseEventKind::ScrollUp));
         assert_eq!(app.scroll, top);
         // Motion doesn't redraw.
