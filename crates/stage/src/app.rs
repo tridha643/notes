@@ -258,6 +258,8 @@ pub struct App {
     pub unread: HashSet<SessionId>,
     pub unseen: HashSet<PostId>,
     pub loaded: HashMap<(PostId, u64), Loaded>,
+    /// Plain posts whose render failed while notesd was away; asked again when the watch is back.
+    restyle: HashSet<(PostId, u64)>,
     pub views: HashMap<PostId, View>,
     pub shown: Option<PostId>,
     /// The sidebar's selected session (index into `sessions`).
@@ -386,6 +388,7 @@ impl App {
             unread: HashSet::new(),
             unseen: HashSet::new(),
             loaded: HashMap::new(),
+            restyle: HashSet::new(),
             views: HashMap::new(),
             shown: None,
             sel: 0,
@@ -566,6 +569,11 @@ impl App {
                 if let Some(s) = self.open.clone() {
                     fx.push(Effect::Request(StageRequest::PostList(s.clone())));
                     fx.push(Effect::Request(StageRequest::CommentList(s)));
+                }
+                for (id, v) in std::mem::take(&mut self.restyle) {
+                    if self.loaded.get(&(id.clone(), v)).is_some_and(|l| l.render.is_none()) {
+                        fx.push(Effect::Request(StageRequest::PostRender(PostShowArgs { id, version: Some(v) })));
+                    }
                 }
                 fx.push(Effect::Redraw);
                 fx
@@ -1872,13 +1880,15 @@ impl App {
             Reply::Failed(req, e) => {
                 if let StageRequest::PostShow(a) | StageRequest::PostRender(a) = &req {
                     if let Some(v) = a.version {
-                        // A render that failed after its post arrived would fail again on a
-                        // retry (the daemon could not render it), so the plain cards stay up
-                        // instead of the post dropping back to "loading…".
+                        // A render that failed after its post arrived keeps the plain cards up
+                        // instead of the post dropping back to "loading…". Only one notesd
+                        // never answered is worth asking again; any other would fail again.
                         let key = (a.id.clone(), v);
                         let plain = matches!(req, StageRequest::PostRender(_)) && self.loaded.get(&key).is_some_and(|l| l.post.is_some());
                         if !plain {
                             self.loaded.remove(&key);
+                        } else if e.code == ErrorCode::DaemonUnreachable {
+                            self.restyle.insert(key);
                         }
                     }
                 }
@@ -2173,6 +2183,22 @@ mod tests {
         app.update(Msg::Reply(Reply::Failed(StageRequest::PostRender(PostShowArgs { id: "b".into(), version: Some(3) }), err)));
         assert!(app.feed().lines.iter().any(|l| l.to_string().contains("hello")), "the post is still readable");
         assert!(app.toast.as_deref().is_some_and(|t| t.contains("no highlighter")));
+    }
+
+    #[test]
+    fn a_render_lost_to_a_notesd_restart_is_asked_again_when_the_watch_is_back() {
+        let db = fake();
+        let mut app = booted(&db);
+        db_less_version(&mut app, &db);
+        let render = StageRequest::PostRender(PostShowArgs { id: "b".into(), version: Some(3) });
+        let err = ErrorBody { code: ErrorCode::DaemonUnreachable, message: "notesd: refused".into(), hint: None, details: None };
+        app.update(Msg::Reply(Reply::Failed(render.clone(), err)));
+        app.update(Msg::WatchLost);
+        let fx = app.update(Msg::WatchBack);
+        assert!(requests(&fx).contains(&render), "{:?}", requests(&fx));
+        serve(&mut app, fx, &db);
+        assert!(app.loaded[&("b".into(), 3)].render.is_some(), "styled once notesd answers");
+        assert!(!requests(&app.update(Msg::WatchBack)).contains(&render), "asked once, not on every reconnect");
     }
 
     /// Post b at version 3 with its post reply landed and its render still in flight.
