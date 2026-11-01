@@ -17,7 +17,7 @@ use notes_proto::{
 use ratatui::text::{Line, Span};
 
 use crate::{
-    cards::{self, build_cards, Card, CardBody, Fit, Folds, Hit, Laid, Slot, VisualSource},
+    cards::{self, build_cards, Card, CardBody, Fit, Folds, Hit, Laid, Origin, Slot, VisualSource},
     commands, ui,
 };
 
@@ -28,6 +28,8 @@ pub struct Feed {
     pub lines: Vec<Line<'static>>,
     /// Per line: the post (index into `App::posts`) and what in it.
     pub hits: Vec<(usize, Hit)>,
+    /// Per line: the card, source line and wrap row it came from.
+    pub origins: Vec<Origin>,
     pub slots: Vec<(VisualKey, Slot)>,
     /// First line of each post, by index into `App::posts`.
     pub starts: Vec<usize>,
@@ -36,6 +38,40 @@ pub struct Feed {
     pub hunks: Vec<usize>,
     /// The local day the headers' times were written on (`ui::today`).
     day: (i32, i32),
+}
+
+impl Feed {
+    /// The line of `post` showing `spot`'s source line (its same wrap row, else the
+    /// last), or `None` when that source line no longer exists.
+    fn locate(&self, post: usize, spot: &Spot) -> Option<usize> {
+        let end = self.starts.get(post + 1).copied().unwrap_or(self.lines.len());
+        let rows: Vec<usize> = (self.starts[post]..end)
+            .filter(|&i| (self.origins[i].card, self.origins[i].src) == (spot.origin.card, spot.origin.src))
+            .collect();
+        rows.get(spot.origin.wrap).or(rows.last()).copied()
+    }
+
+    /// Where `line` is: its post, source origin, and how far into the post.
+    fn spot(&self, apps: &[PostSummary], line: usize) -> Option<Spot> {
+        let (post, _) = *self.hits.get(line)?;
+        Some(Spot { post: apps.get(post)?.id.clone(), origin: self.origins[line], offset: line - self.starts[post] })
+    }
+}
+
+/// A feed line named by content: the post and source line it shows, plus its row
+/// offset in that post for when the source line is gone.
+struct Spot {
+    post: PostId,
+    origin: Origin,
+    offset: usize,
+}
+
+/// The reader's place across a rebuild: the line at the top of the viewport and the
+/// cursor's line, each by source identity, and the cursor's screen row for the fallback.
+struct Anchor {
+    top: Option<Spot>,
+    cursor: Spot,
+    cursor_row: usize,
 }
 
 /// Everything the feed reads: per post (id, version, fold generation, built, styled),
@@ -733,8 +769,23 @@ impl App {
         self.posts.iter().find(|p| &p.id == id).map(|p| self.listed_version(p))
     }
 
+    /// The post owning the top visible feed row, and the diff file that row is in.
+    pub fn top_row(&mut self) -> Option<(usize, Option<String>)> {
+        let scroll = self.scroll;
+        let feed = self.feed();
+        let (post, _) = *feed.hits.get(scroll)?;
+        let Origin { card, src, .. } = feed.origins[scroll];
+        let p = self.posts.get(post)?;
+        let cards = self.loaded.get(&(p.id.clone(), self.listed_version(p))).and_then(|l| l.cards.as_ref());
+        let file = cards.and_then(|cards| match &cards.get(card)?.body {
+            CardBody::Diff(diff) => diff.files.iter().rev().find(|(row, _)| diff.src.get(*row).is_some_and(|&s| s < src)).map(|(_, f)| f.clone()),
+            _ => None,
+        });
+        Some((post, file))
+    }
+
     /// The version shown for a listed post: the pinned one, else its latest.
-    fn listed_version(&self, p: &PostSummary) -> u64 {
+    pub fn listed_version(&self, p: &PostSummary) -> u64 {
         self.views.get(&p.id).and_then(|v| v.pinned).unwrap_or(p.version)
     }
 
@@ -839,7 +890,7 @@ impl App {
 
     /// The feed for the main column, rebuilt only when something it reads changed.
     /// A rebuild (a post loading above, a resize rewrapping everything, a fold)
-    /// keeps the line under the cursor where it was on screen.
+    /// keeps the source line at the top of the viewport (and the cursor's) in place.
     pub fn feed(&mut self) -> &Feed {
         let width = ui::geometry_for(self).main.width.saturating_sub(1);
         let page = self.page() as u16;
@@ -855,10 +906,12 @@ impl App {
             .collect();
         let key: FeedKey = (posts.clone(), width, page, self.cell_px, self.comments_gen, self.visual_gen, self.focused_card.clone());
         if self.feed.as_ref().is_none_or(|(k, _)| *k != key) {
-            // Where the cursor was: which post, how far into it, how far down the screen.
             let anchor = self.feed.as_ref().and_then(|(_, f)| {
-                let (post, _) = *f.hits.get(self.cursor)?;
-                Some((self.posts.get(post)?.id.clone(), self.cursor - f.starts[post], self.cursor.saturating_sub(self.scroll)))
+                Some(Anchor {
+                    top: f.spot(&self.posts, self.scroll),
+                    cursor: f.spot(&self.posts, self.cursor)?,
+                    cursor_row: self.cursor.saturating_sub(self.scroll),
+                })
             });
             // Posts only appended (a burst while following): lay out just the new ones
             // instead of copying every post's lines again. Headers show the date, so not
@@ -875,6 +928,7 @@ impl App {
                 }
                 feed.lines.push(self.header(i));
                 feed.hits.push((i, Hit::None));
+                feed.origins.push(Origin { card: usize::MAX, src: 0, wrap: 0 });
                 let start = feed.lines.len();
                 match self.post_laid(id, *version, width, page) {
                     Some(laid) => {
@@ -882,15 +936,16 @@ impl App {
                         feed.hits.extend(laid.hits.iter().map(|h| (i, *h)));
                         feed.cards.extend(laid.cards.iter().map(|l| l + start));
                         feed.hunks.extend(laid.hunks.iter().map(|l| l + start));
+                        feed.origins.extend(laid.origins.iter().copied());
                         feed.slots.extend(laid.slots.iter().map(|s| {
                             ((id.clone(), *version, s.card), Slot { line: s.line + start, ..*s })
                         }));
                     }
                     None => {
                         feed.lines.push(Line::styled("  loading…", ui::dim()));
-                        feed.hits.push((i, Hit::None));
                         feed.lines.push(Line::default());
-                        feed.hits.push((i, Hit::None));
+                        feed.hits.extend([(i, Hit::None); 2]);
+                        feed.origins.extend([1, 2].map(|src| Origin { card: usize::MAX, src, wrap: 0 }));
                     }
                 }
             }
@@ -900,15 +955,22 @@ impl App {
                     self.cursor = feed.starts[i];
                     self.scroll = self.cursor;
                 }
-            } else if let Some((id, offset, row)) = anchor {
-                if let Some(i) = self.posts.iter().position(|p| p.id == id) {
+            } else if let Some(anchor) = anchor {
+                let find = |spot: &Spot| {
+                    let i = self.posts.iter().position(|p| p.id == spot.post)?;
                     let end = feed.starts.get(i + 1).copied().unwrap_or(total);
-                    self.cursor = (feed.starts[i] + offset).min(end.saturating_sub(1));
-                    self.scroll = self.cursor.saturating_sub(row);
+                    Some(feed.locate(i, spot).unwrap_or((feed.starts[i] + spot.offset).min(end.saturating_sub(1))))
+                };
+                if let Some(cursor) = find(&anchor.cursor) {
+                    self.cursor = cursor;
+                    self.scroll = anchor.top.as_ref().and_then(|t| {
+                        let i = self.posts.iter().position(|p| p.id == t.post)?;
+                        feed.locate(i, t)
+                    }).unwrap_or(cursor.saturating_sub(anchor.cursor_row));
                 }
             }
-            self.cursor = self.cursor.min(total.saturating_sub(1));
-            self.scroll = self.scroll.min(total.saturating_sub(page as usize)).min(self.cursor);
+            self.scroll = self.scroll.min(total.saturating_sub(page as usize));
+            self.cursor = self.cursor.min(total.saturating_sub(1)).clamp(self.scroll, self.scroll + page as usize - 1);
             self.feed = Some((key, feed));
         }
         if self.find_post.is_some() {
@@ -2252,8 +2314,8 @@ mod tests {
     }
 
     /// Every pane size from 1×1 to 160×50, with real content: drawing never
-    /// panics, no row runs past the pane, and the feed keeps the line under
-    /// the cursor in place across a resize.
+    /// panics, no row runs past the pane, and the feed keeps the cursor's
+    /// source line in place across a resize.
     #[test]
     fn every_size_draws_cleanly_and_keeps_its_place() {
         use ratatui::{backend::TestBackend, Terminal};
@@ -2277,11 +2339,14 @@ mod tests {
         for _ in 0..12 {
             app.update(Msg::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
         }
-        let before = (app.shown.clone(), app.cursor - app.scroll);
+        let cursor = app.cursor;
+        let before = (app.shown.clone(), app.feed().origins[cursor]);
         app.update(Msg::Resize(70, 30));
         let _ = app.feed();
         assert_eq!(app.shown, before.0);
-        assert_eq!(app.cursor - app.scroll, before.1, "the cursor's row on screen survives a rewrap");
+        let cursor = app.cursor;
+        let now = app.feed().origins[cursor];
+        assert_eq!((now.card, now.src), (before.1.card, before.1.src), "the cursor keeps its source line across a rewrap");
     }
 
     #[test]
@@ -3082,5 +3147,210 @@ mod tests {
         assert_eq!(lit(&mut app), "");
         app.update(key(KeyCode::Char('n')));
         assert_eq!(app.toast.as_deref(), Some("no matches"));
+    }
+
+    fn md_post(db: &Fake) -> App {
+        let mut app = booted(db);
+        app.update(Msg::Resize(100, 20));
+        app
+    }
+
+    /// The whole source line behind feed line `at`, whitespace-normalized.
+    fn source_at(app: &mut App, at: usize) -> String {
+        let feed = app.feed();
+        let (post, o) = (feed.hits[at].0, feed.origins[at]);
+        (0..feed.lines.len())
+            .filter(|&i| feed.hits[i].0 == post && (feed.origins[i].card, feed.origins[i].src) == (o.card, o.src))
+            .map(|i| feed.lines[i].to_string())
+            .collect::<String>()
+            .replace(['│', '↪'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn resize_keeps_the_same_source_line_at_the_viewport_top() {
+        let mut db = fake();
+        db.md = (0..40).map(|i| format!("para {i} with plenty of words so that this paragraph wraps differently at every width\n\n")).collect();
+        let mut app = md_post(&db);
+        scroll_to(&mut app, 30);
+        let top = app.scroll;
+        let want = source_at(&mut app, top);
+        assert!(want.starts_with("para "), "{want}");
+        for (w, h) in [(60, 20), (40, 20), (150, 20), (100, 20), (35, 12)] {
+            app.update(Msg::Resize(w, h));
+            app.feed();
+            let top = app.scroll;
+            assert_eq!(source_at(&mut app, top), want, "after resizing to {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn resize_from_a_wrapped_row_stays_in_the_same_paragraph() {
+        let mut db = fake();
+        db.md = (0..20).map(|i| format!("para {i} {}\n\n", "word ".repeat(60))).collect();
+        let mut app = md_post(&db);
+        app.update(Msg::Resize(40, 20));
+        let first = (0..app.feed().lines.len()).find(|&i| app.feed().origins[i].wrap == 2).unwrap();
+        app.scroll = first;
+        app.cursor = first;
+        let want = source_at(&mut app, first);
+        app.update(Msg::Resize(150, 20));
+        app.feed();
+        let top = app.scroll;
+        assert_eq!(source_at(&mut app, top), want);
+    }
+
+    #[test]
+    fn folding_a_card_above_leaves_the_top_line_unchanged() {
+        let mut app = booted(&fake());
+        app.update(Msg::Resize(100, 20));
+        let id = PostId::from("b");
+        let data: serde_json::Value = (0..30).map(|i| (format!("k{i}"), serde_json::json!(i))).collect::<serde_json::Map<_, _>>().into();
+        let p = Post {
+            parts: vec![
+                Part::Json { data, id: None },
+                Part::Markdown { markdown: (0..40).map(|i| format!("para {i}\n\n")).collect(), id: None },
+            ],
+            ..post("b", "s1", 2, "")
+        };
+        let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native; 2] };
+        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, Some(&r)));
+        app.views.get_mut(&id).unwrap().laid = None;
+        app.feed = None;
+        let b = app.posts.iter().position(|post| post.id == id).unwrap();
+        let (node_line, node) = {
+            let feed = app.feed();
+            let line = (feed.starts[b]..feed.lines.len()).find(|&i| matches!(feed.hits[i].1, Hit::Node(..))).unwrap();
+            (line, feed.hits[line].1)
+        };
+        let to = app.feed().starts[b] as isize + 46 - app.scroll as isize;
+        app.scroll(to);
+        let top = app.scroll;
+        assert!(top > node_line + 30, "scrolled past the json card");
+        let want = source_at(&mut app, top);
+        assert!(want.starts_with("para "), "{want:?}");
+        let before = app.feed().lines.len();
+        assert!(app.toggle((Some(b), node)));
+        assert!(app.feed().lines.len() < before - 20, "the fold removed rows above");
+        let top = app.scroll;
+        assert_eq!(source_at(&mut app, top), want);
+    }
+
+    fn scroll_to(app: &mut App, line: usize) {
+        let delta = line as isize - app.scroll as isize;
+        app.scroll(delta);
+    }
+
+    fn bar_text(app: &mut App) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let (w, h) = app.size;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| ui::draw(f, app)).unwrap();
+        let y = ui::geometry(app.size).main.y;
+        let buf = term.backend().buffer();
+        (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>()
+    }
+
+    #[test]
+    fn sticky_title_names_the_post_at_the_top_of_the_viewport_not_the_cursor() {
+        let mut db = fake();
+        db.md = (0..30).map(|i| format!("para {i}\n\n")).collect();
+        let mut app = md_post(&db);
+        let (a, b) = (app.feed().starts[0], app.feed().starts[1]);
+        assert!(bar_text(&mut app).trim().is_empty() || !bar_text(&mut app).contains("a  v1"), "header on screen: nothing sticky");
+        scroll_to(&mut app, a + 20);
+        assert!(app.scroll > a && app.scroll < b);
+        assert!(bar_text(&mut app).contains(" a  v1"), "{}", bar_text(&mut app));
+        // The cursor is in the next post while the viewport top is still in the first.
+        app.cursor = b + 2;
+        assert!(bar_text(&mut app).contains(" a  v1"));
+        scroll_to(&mut app, b + 8);
+        assert!(bar_text(&mut app).contains(" b  v2"), "{}", bar_text(&mut app));
+    }
+
+    #[test]
+    fn sticky_title_adds_the_diff_file_at_the_viewport_top() {
+        use notes_proto::posts::{DiffFileRender, DiffHunk, DiffLayout, DiffLine, DiffLineKind, Span as WireSpan};
+        let mut app = booted(&fake());
+        app.update(Msg::Resize(100, 20));
+        let id = PostId::from("b");
+        let file = |name: &str| DiffFileRender {
+            filename: name.into(),
+            language: None,
+            added: 20,
+            removed: 0,
+            hunks: vec![DiffHunk {
+                header: "@@ -0,0 +1,20 @@".into(),
+                lines: (1..=20)
+                    .map(|n| DiffLine { kind: DiffLineKind::Added, old_line: None, new_line: Some(n), spans: vec![WireSpan { text: format!("line {n}"), class: None }] })
+                    .collect(),
+            }],
+        };
+        let p = Post {
+            parts: vec![Part::Diff { patch: Some("x".into()), files: vec![], layout: DiffLayout::Unified, id: None }],
+            ..post("b", "s1", 2, "")
+        };
+        let r = PostRender {
+            id: id.clone(),
+            version: 2,
+            parts: vec![notes_proto::posts::PartRender::Diff { layout: DiffLayout::Unified, files: vec![file("src/one.rs"), file("src/two.rs")] }],
+        };
+        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, Some(&r)));
+        app.views.get_mut(&id).unwrap().laid = None;
+        app.feed = None;
+        let b = app.posts.iter().position(|post| post.id == id).unwrap();
+        let start = app.feed().starts[b];
+        scroll_to(&mut app, start + 8);
+        assert!(bar_text(&mut app).contains("b › src/one.rs"), "{}", bar_text(&mut app));
+        scroll_to(&mut app, start + 8 + 20);
+        assert!(bar_text(&mut app).contains("b › src/two.rs"), "{}", bar_text(&mut app));
+    }
+
+    #[test]
+    fn a_render_landing_under_the_viewport_top_keeps_the_same_diff_line_there() {
+        let mut app = booted(&fake());
+        app.update(Msg::Resize(100, 20));
+        let id = PostId::from("b");
+        let body = |name: &str| (0..12).map(|i| format!(" {name} {i}")).collect::<Vec<_>>().join("\n");
+        let patch = format!(
+            "diff --git a/one.rs b/one.rs\n--- a/one.rs\n+++ b/one.rs\n@@ -1,12 +1,12 @@\n{}\ndiff --git a/two.rs b/two.rs\n--- a/two.rs\n+++ b/two.rs\n@@ -1,12 +1,12 @@\n{}\n",
+            body("one"),
+            body("two")
+        );
+        let tail = Part::Markdown { markdown: "tail\n\n".repeat(80), id: None };
+        let p = Post { parts: vec![Part::Diff { patch: Some(patch), files: vec![], layout: DiffLayout::Unified, id: None }, tail], ..post("b", "s1", 2, "") };
+        let file = |name: &str| DiffFileRender {
+            filename: format!("{name}.rs"),
+            language: None,
+            added: 0,
+            removed: 0,
+            hunks: vec![DiffHunk {
+                header: "@@ -1,12 +1,12 @@".into(),
+                lines: (0..12)
+                    .map(|i| DiffLine { kind: DiffLineKind::Context, old_line: Some(i + 1), new_line: Some(i + 1), spans: vec![WireSpan { text: format!("{name} {i}"), class: None }] })
+                    .collect(),
+            }],
+        };
+        let render = PostRender { id: id.clone(), version: 2, parts: vec![PartRender::Diff { layout: DiffLayout::Unified, files: vec![file("one"), file("two")] }, PartRender::Native] };
+        app.loaded.insert((id.clone(), 2), Loaded { post: Some(p), render: None, cards: None });
+        app.built((id.clone(), 2));
+        let b = app.posts.iter().position(|post| post.id == id).unwrap();
+        let line = |app: &mut App, text: &str| {
+            let feed = app.feed();
+            (feed.starts[b]..feed.lines.len()).find(|&i| feed.lines[i].to_string().contains(text)).unwrap()
+        };
+        let at = line(&mut app, "two 5");
+        scroll_to(&mut app, at);
+        assert_eq!(app.scroll, at);
+        assert!(bar_text(&mut app).contains("b › two.rs"), "the raw patch names its file: {}", bar_text(&mut app));
+        app.update(Msg::Reply(Reply::Render(render)));
+        app.feed();
+        let top = app.scroll;
+        let row = app.feed().lines[top].to_string();
+        assert!(row.contains(" 6  6   two 5"), "the styled row for the same diff line is at the top: {row}");
+        assert_ne!(top, at, "the styled diff is shorter, so the line moved in the feed");
+        assert!(bar_text(&mut app).contains("b › two.rs"), "{}", bar_text(&mut app));
     }
 }
