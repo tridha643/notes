@@ -14,14 +14,53 @@ use std::{
 };
 
 use notes_proto::{
-    posts::{CommentNewArgs, Part, PostId, PostNewArgs, PostUpdateArgs, PostWriteResult, SessionId},
+    posts::{CommentNewArgs, DiffLayout, Part, PostId, PostNewArgs, PostUpdateArgs, PostWriteResult, SessionId},
     to_line, Event, Request, Response, Verb, PROTOCOL_VERSION,
 };
 use stage::{
-    app::{App, Msg},
-    client::{StageClient, Watch},
-    perform, pump,
+    app::{App, Effect, Msg, StageRequest},
+    client::{next_request, StageClient, Watch},
 };
+
+fn requests(fx: Vec<Effect>) -> impl Iterator<Item = StageRequest> {
+    fx.into_iter().filter_map(|e| match e {
+        Effect::Request(r) => Some(r),
+        _ => None,
+    })
+}
+
+/// Answer the app's requests in the request worker's order until none are left; returns them.
+fn settle(app: &mut App, client: &mut StageClient, fx: Vec<Effect>) -> Vec<StageRequest> {
+    let mut queue: Vec<StageRequest> = requests(fx).collect();
+    let mut asked = Vec::new();
+    while let Some(r) = next_request(&mut queue) {
+        queue.extend(requests(app.update(Msg::Reply(client.perform(&r)))));
+        asked.push(r);
+    }
+    asked
+}
+
+/// As `settle`, but stop when only renders are left (the worker runs them last) and return them.
+fn settle_plain(app: &mut App, client: &mut StageClient, fx: Vec<Effect>) -> Vec<Effect> {
+    let mut queue: Vec<StageRequest> = requests(fx).collect();
+    while let Some(r) = next_request(&mut queue) {
+        if matches!(r, StageRequest::PostRender(_)) {
+            queue.push(r);
+            break;
+        }
+        queue.extend(requests(app.update(Msg::Reply(client.perform(&r)))));
+    }
+    queue.into_iter().map(Effect::Request).collect()
+}
+
+fn feed_text(app: &mut App) -> String {
+    app.feed().lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n")
+}
+
+fn pump(app: &mut App, client: &mut StageClient, msg: Msg) {
+    let fx = app.update(msg);
+    settle(app, client, fx);
+}
 
 struct Notesd {
     dir: PathBuf,
@@ -97,9 +136,14 @@ fn events(w: &mut Watch, n: usize) -> Vec<Event> {
 }
 
 #[test]
-fn bootstrap_and_live_updates_build_each_version_once() {
+fn plain_cards_read_before_their_render_and_replayed_events_change_nothing() {
     let Some(d) = notesd() else { return };
-    let first = d.post(None, "one");
+    let patch = "diff --git a/f.rs b/f.rs\n--- a/f.rs\n+++ b/f.rs\n@@ -1 +1 @@\n-old\n+new\n";
+    let first: PostWriteResult = d.agent(Verb::PostNew(PostNewArgs {
+        title: Some("the diff".into()),
+        parts: vec![Part::Diff { patch: Some(patch.into()), files: vec![], layout: DiffLayout::Unified, id: None }],
+        ..Default::default()
+    }));
     let session = first.post.session.clone();
     d.post(Some(&session), "two");
 
@@ -107,12 +151,16 @@ fn bootstrap_and_live_updates_build_each_version_once() {
     let mut client = StageClient::new(d.sock());
     let mut app = App::new(None);
     let start = app.start();
-    perform(&mut app, &mut client, start);
+    let renders = settle_plain(&mut app, &mut client, start);
     assert_eq!(app.open.as_ref(), Some(&session));
     assert_eq!(app.posts.len(), 2);
-    assert_eq!(app.builds, 2, "the feed builds every post once");
+    let plain = feed_text(&mut app);
+    assert!(plain.contains("diff --git a/f.rs") && plain.contains("two"), "both posts read before any render:\n{plain}");
+    settle(&mut app, &mut client, renders);
+    let styled = feed_text(&mut app);
+    assert!(styled.contains("f.rs  +1 −1") && !styled.contains("diff --git"), "the render replaced the raw patch:\n{styled}");
 
-    // A new version of the shown post, then a third post: each built once.
+    // A new version of the shown post, then a third post, arrive live.
     let two = app.shown.clone().unwrap();
     let _: PostWriteResult = d.agent(Verb::PostUpdate(PostUpdateArgs { id: two.clone(), title: Some("two!".into()), parts: None }));
     d.post(Some(&session), "three");
@@ -121,15 +169,18 @@ fn bootstrap_and_live_updates_build_each_version_once() {
     }
     assert_eq!(app.posts.len(), 3);
     assert_eq!(app.shown.as_ref().map(|p| p.as_str()), app.posts.last().map(|p| p.id.as_str()));
-    let keys: Vec<_> = app.loaded.keys().cloned().collect();
-    assert_eq!(app.builds, keys.len(), "{keys:?}");
-    // Replaying the same events changes nothing.
-    let builds = app.builds;
+    let live = feed_text(&mut app);
+    assert!(live.contains("two!") && live.contains("three"), "{live}");
+
+    // Replaying every event from the start leaves the feed as it is and loads nothing.
     let mut again = Watch::open(&d.sock(), Some(0)).unwrap();
-    for e in events(&mut again, 4) {
-        pump(&mut app, &mut client, Msg::Event(e));
+    let mut asked = Vec::new();
+    for e in events(&mut again, 5) {
+        let fx = app.update(Msg::Event(e));
+        asked.extend(settle(&mut app, &mut client, fx));
     }
-    assert_eq!(app.builds, builds);
+    assert_eq!(feed_text(&mut app), live);
+    assert!(!asked.iter().any(|r| matches!(r, StageRequest::PostShow(_) | StageRequest::PostRender(_))), "{asked:?}");
 }
 
 #[test]
@@ -157,7 +208,7 @@ fn stage_never_consumes_the_agents_feedback() {
     let mut client = StageClient::new(d.sock());
     let mut app = App::new(Some(p.session.clone()));
     let start = app.start();
-    perform(&mut app, &mut client, start);
+    settle(&mut app, &mut client, start);
     // The user comments through stage, then stage refreshes comments (as it
     // does on every comment event).
     client
@@ -165,7 +216,7 @@ fn stage_never_consumes_the_agents_feedback() {
         .unwrap();
     client.comment_list(p.session.clone()).unwrap();
     let again = app.start();
-    perform(&mut app, &mut client, again);
+    settle(&mut app, &mut client, again);
     // The agent's next write still carries the comment as feedback.
     let next = d.post(Some(&p.session), "fixed");
     assert_eq!(next.feedback.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["nit"]);
@@ -183,7 +234,7 @@ fn search_finds_sessions_by_title_and_content() {
     // The app's `/` flow opens it.
     let mut app = App::new(None);
     let start = app.start();
-    perform(&mut app, &mut client, start);
+    settle(&mut app, &mut client, start);
     for c in "/walrus".chars() {
         pump(&mut app, &mut client, Msg::Key(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char(c))));
     }

@@ -34,8 +34,13 @@ pub const SELECTED: Color = Color::Rgb(0x31, 0x32, 0x44);
 pub const CURSOR: Color = Color::Rgb(0x24, 0x25, 0x3a);
 /// Text selected by a mouse drag.
 pub const SELECTION: Color = Color::Rgb(0x45, 0x47, 0x5a);
+/// Matches of the search being read.
+pub const MATCH: Color = Color::Rgb(0x6b, 0x55, 0x1f);
 pub const ADDED_BG: Color = Color::Rgb(0x1f, 0x3a, 0x2a);
 pub const REMOVED_BG: Color = Color::Rgb(0x45, 0x22, 0x2a);
+/// Changed words inside an added or removed line.
+pub const ADDED_WORD_BG: Color = Color::Rgb(0x2f, 0x6b, 0x44);
+pub const REMOVED_WORD_BG: Color = Color::Rgb(0x7a, 0x30, 0x3c);
 
 pub fn dim() -> Style {
     Style::new().fg(BORDER)
@@ -459,26 +464,28 @@ fn main(f: &mut Frame, app: &mut App, area: Rect) {
     }
     let title = Rect::new(area.x, area.y, area.width, 1);
     let body = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
-    // The title bar names the post under the cursor.
-    let (name, version) = match app.shown_post() {
-        Some(p) => (crate::sanitize::sanitize(&p.title).into_owned(), Some(p.version)),
-        None => (if app.posts.is_empty() { "no posts yet".into() } else { "loading…".into() }, None),
-    };
-    let latest = app.shown.as_ref().and_then(|id| app.posts.iter().find(|p| &p.id == id)).map(|p| p.version);
+    // The title bar names the post owning the top visible row (and its diff file),
+    // once that post's own header has scrolled off.
+    let top = app.top_row();
     let total = app.feed().lines.len();
     let (scroll, cursor) = (app.scroll, app.cursor);
-    // Sticky: the bar names the post only once its own header has scrolled off.
-    let header_visible = app.shown.as_ref().and_then(|id| app.posts.iter().position(|p| &p.id == id)).is_some_and(|i| {
-        let start = app.feed().starts.get(i).copied().unwrap_or(0);
-        start >= app.scroll
-    });
-    let name = if header_visible && version.is_some() { String::new() } else { name };
-    let version = version.filter(|_| !header_visible);
+    let scrolled_off = top.as_ref().is_some_and(|(i, _)| app.feed().starts[*i] < scroll);
+    let sticky = top.as_ref().filter(|_| scrolled_off).and_then(|(i, file)| Some((app.posts.get(*i)?.clone(), file.clone())));
+    let name = match (&top, &sticky) {
+        (None, _) => (if app.posts.is_empty() { "no posts yet" } else { "loading…" }).into(),
+        (_, Some((p, _))) => crate::sanitize::sanitize(&p.title).into_owned(),
+        _ => String::new(),
+    };
+    let file = sticky.as_ref().and_then(|(_, f)| f.clone());
+    let version = sticky.as_ref().map(|(p, _)| (app.listed_version(p), p.version, p.updated_at));
     let mut spans = vec![Span::styled(format!(" {}", clip(&name, area.width as usize / 2)), bold().fg(TEXT))];
-    if let Some(v) = version {
-        let pinned = if Some(v) != latest { format!(" (of v{})", latest.unwrap_or(v)) } else { String::new() };
+    if let Some(file) = &file {
+        spans.push(Span::styled(format!(" › {}", clip(&crate::sanitize::sanitize(file), area.width as usize / 4)), Style::new().fg(CYAN)));
+    }
+    if let Some((v, latest, updated)) = version {
+        let pinned = if v != latest { format!(" (of v{latest})") } else { String::new() };
         let agent = app.open.as_ref().and_then(|id| app.sessions.iter().find(|s| &s.id == id)).map(|s| s.agent.as_str());
-        let at = app.shown_post().map(|p| when(p.updated_at)).unwrap_or_default();
+        let at = when(updated);
         let by = agent.map(|a| format!(" · {}", crate::sanitize::sanitize(a))).unwrap_or_default();
         spans.push(Span::styled(format!("  v{v}{pinned} · {at}{by}"), dim()));
     }
@@ -494,6 +501,7 @@ fn main(f: &mut Frame, app: &mut App, area: Rect) {
         let position = if total > body.height as usize {
             format!(" ↕ {}–{}/{total}", scroll + 1, (scroll + body.height as usize).min(total))
         } else { String::new() };
+        let name = file.map_or(name.clone(), |f| format!("{name} › {f}"));
         let label = if app.focused_card.is_some() { format!("focus · {name}") } else { name };
         spans = vec![
             Span::styled(format!(" {}", clip(&label, (area.width as usize).saturating_sub(1 + position.width()))), bold().fg(TEXT)),
@@ -510,6 +518,11 @@ fn main(f: &mut Frame, app: &mut App, area: Rect) {
     if let Some(line) = lines.get_mut(cursor.wrapping_sub(scroll)) {
         let w = content.width as usize;
         *line = highlight(line.clone(), 1, w.saturating_sub(1), if on_node { SELECTED } else { CURSOR });
+    }
+    let (found, end) = (&feed.found.1, scroll + lines.len());
+    for &(at, from, to) in found[found.partition_point(|m| m.0 < scroll)..].iter().take_while(|m| m.0 < end) {
+        let line = &mut lines[at - scroll];
+        *line = highlight(std::mem::take(line), from, to, MATCH);
     }
     // A mouse selection, cell-exact on its first and last lines.
     if let Some((a, b)) = drag.filter(|(a, b)| a != b) {

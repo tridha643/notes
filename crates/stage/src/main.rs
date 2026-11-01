@@ -1,9 +1,11 @@
 //! `stage [--session S]`: terminal setup, the probe, the event loop.
 //!
 //! Three blocking sources feed one channel: crossterm's reader (keys, mouse,
-//! SIGWINCH resizes), the notesd watch stream, and nothing else. The loop
-//! blocks on the channel, drains queued input within a 4 ms work budget, then
-//! draws once. Idle never wakes; output is flushed once per frame.
+//! SIGWINCH resizes), the notesd watch stream, and the request worker, which
+//! owns the `StageClient` and answers each `Effect::Request` with a `Msg::Reply`,
+//! so a slow render never holds a key or a scroll. The loop blocks on the
+//! channel, drains queued input within a 4 ms work budget, then draws once.
+//! Idle never wakes; output is flushed once per frame.
 
 use std::{
     io::{self, BufWriter, Write},
@@ -18,18 +20,19 @@ use ratatui::{
     backend::CrosstermBackend,
     crossterm::{
         cursor::{Hide, Show},
-        event::{self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers},
+        event::{self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseEventKind},
         execute,
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     },
     Terminal,
 };
 use stage::{
-    app::{App, Effect, Msg},
-    client::{StageClient, Watch},
+    app::{App, Effect, Msg, StageRequest},
+    client::{next_request, StageClient, Watch},
     gallery::Gallery,
     latency::Latency,
-    perform, probe, pump, screen::Screen,
+    probe,
+    screen::Screen,
 };
 
 fn restore() {
@@ -47,10 +50,12 @@ const TURN: Duration = Duration::from_millis(4);
 const SCROLL_SETTLE: Duration = Duration::from_millis(150);
 
 fn is_scroll(msg: &Msg) -> bool {
-    use ratatui::crossterm::event::MouseEventKind;
     match msg {
-        Msg::Mouse(m) => matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown),
-        Msg::Key(k) => matches!(k.code, KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Char(' ' | 'b' | 'j' | 'k')),
+        Msg::Wheel(..) => true,
+        Msg::Key(k) => match k.code {
+            KeyCode::Char('d' | 'u') => k.modifiers.contains(KeyModifiers::CONTROL),
+            code => matches!(code, KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Char(' ' | 'b' | 'j' | 'k')),
+        },
         _ => false,
     }
 }
@@ -201,6 +206,8 @@ fn main() -> ExitCode {
             while let Ok(ev) = event::read() {
                 let msgs = match ev {
                     TermEvent::Key(k) => vec![Msg::Key(k)],
+                    // Stamped here: wheel acceleration needs arrival times, not batch times.
+                    TermEvent::Mouse(m) if matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => vec![Msg::Wheel(m, std::time::Instant::now())],
                     TermEvent::Mouse(m) => vec![Msg::Mouse(m)],
                     // A pane can start at a placeholder size (Rex: 80x24, 8x16 px cells)
                     // and get its real one in the first resize, so re-measure cells too.
@@ -234,20 +241,34 @@ fn main() -> ExitCode {
         app.cell_px = px;
         let _ = tx.send(Msg::CellPx(px));
     }
+    // Requests run on their own thread, renders last (`next_request`); each answer is one more message.
+    let (req_tx, req_rx) = mpsc::channel::<StageRequest>();
+    {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let mut client = StageClient::new(sock);
+            let mut queue = Vec::new();
+            loop {
+                if queue.is_empty() {
+                    let Ok(req) = req_rx.recv() else { return };
+                    queue.push(req);
+                }
+                queue.extend(req_rx.try_iter());
+                let req = next_request(&mut queue).expect("the queue holds a request");
+                if tx.send(Msg::Reply(client.perform(&req))).is_err() {
+                    return;
+                }
+            }
+        });
+    }
     exit_on_hangup();
     drop(tx);
 
-    let mut client = StageClient::new(sock);
     let mut scrolled_at: Option<std::time::Instant> = None;
     // `STAGE_LOOP_TRACE=<file>`: per loop turn, time spent updating and drawing.
     let mut loop_trace = std::env::var_os("STAGE_LOOP_TRACE").and_then(|p| std::fs::File::create(p).ok());
     let trace_start = std::time::Instant::now();
-    let start = app.start();
-    let t = std::time::Instant::now();
-    let mut pending = perform(&mut app, &mut client, start);
-    if let Some(f) = loop_trace.as_mut() {
-        let _ = writeln!(f, "bootstrap {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
-    }
+    let mut pending = app.start();
     loop {
         let mut redraw = false;
         let mut later = Vec::new();
@@ -262,12 +283,12 @@ fn main() -> ExitCode {
                 }
                 Effect::PrefetchZoom { key, target } => {
                     if let Some(m) = gallery.prefetch_zoom(key, target) {
-                        later.extend(pump(&mut app, &mut client, m));
+                        later.extend(app.update(m));
                     }
                 }
                 Effect::NeedVisual { key, source } => {
                     for m in gallery.need(term.backend_mut(), key, source) {
-                        later.extend(pump(&mut app, &mut client, m));
+                        later.extend(app.update(m));
                     }
                 }
                 Effect::Fatal(m) => {
@@ -285,7 +306,9 @@ fn main() -> ExitCode {
                         let _ = Command::new("open").arg(&path).spawn();
                     }
                 }
-                Effect::Request(_) => unreachable!("pump performs requests"),
+                Effect::Request(req) => {
+                    let _ = req_tx.send(req);
+                }
             }
         }
         if !later.is_empty() {
@@ -303,8 +326,7 @@ fn main() -> ExitCode {
                 let _ = writeln!(f, "draw {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
             }
             // Pixels for the visuals this frame shows (then their neighbors).
-            let fx = app.after_draw();
-            pending = perform(&mut app, &mut client, fx);
+            pending = app.after_draw();
             if !pending.is_empty() {
                 continue;
             }
@@ -357,10 +379,10 @@ fn main() -> ExitCode {
                 // Graphics plumbing goes to the gallery; only its results reach the app.
                 Msg::Gfx(g) => {
                     for m in gallery.handle(term.backend_mut(), g) {
-                        pending.extend(pump(&mut app, &mut client, m));
+                        pending.extend(app.update(m));
                     }
                 }
-                msg => pending.extend(pump(&mut app, &mut client, msg)),
+                msg => pending.extend(app.update(msg)),
             }
         }
         if let Some(f) = loop_trace.as_mut() {

@@ -160,6 +160,15 @@ impl StageClient {
     }
 }
 
+/// The request the worker runs next: the first that isn't a render, in order, else the
+/// newest render. A render only restyles a post that already reads as plain text, so it
+/// waits behind shows, lists and writes, and the post asked for last (the feed's newest)
+/// styles first.
+pub fn next_request(queue: &mut Vec<StageRequest>) -> Option<StageRequest> {
+    let at = queue.iter().position(|r| !matches!(r, StageRequest::PostRender(_))).or(queue.len().checked_sub(1))?;
+    Some(queue.remove(at))
+}
+
 /// The watch connection: events for posts, comments and sessions.
 pub struct Watch {
     reader: BufReader<UnixStream>,
@@ -192,5 +201,20 @@ impl Watch {
                 _ => continue,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_wait_behind_every_other_request_newest_first() {
+        let render = |id: &str| StageRequest::PostRender(PostShowArgs { id: id.into(), version: Some(1) });
+        let show = StageRequest::PostShow(PostShowArgs { id: "new".into(), version: Some(1) });
+        let list = StageRequest::PostList("other".into());
+        let mut queue = vec![render("old"), render("new"), show.clone(), list.clone()];
+        let order: Vec<_> = std::iter::from_fn(|| next_request(&mut queue)).collect();
+        assert_eq!(order, [show, list, render("new"), render("old")]);
     }
 }

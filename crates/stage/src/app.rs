@@ -3,7 +3,7 @@
 //! effects for `main` to perform. Requests are limited to [`StageRequest`], whose
 //! writes are comments, session renames and deletes the user confirmed.
 
-use std::collections::{HashMap, HashSet};
+use std::{collections::{HashMap, HashSet}, time::Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use notes_proto::{
@@ -17,7 +17,7 @@ use notes_proto::{
 use ratatui::text::{Line, Span};
 
 use crate::{
-    cards::{self, build_cards, Card, CardBody, Fit, Folds, Hit, Laid, Slot, VisualSource},
+    cards::{self, build_cards, Card, CardBody, Fit, Folds, Hit, Laid, Origin, Slot, VisualSource},
     commands, ui,
 };
 
@@ -28,16 +28,64 @@ pub struct Feed {
     pub lines: Vec<Line<'static>>,
     /// Per line: the post (index into `App::posts`) and what in it.
     pub hits: Vec<(usize, Hit)>,
+    /// Per line: the card, source line and wrap row it came from.
+    pub origins: Vec<Origin>,
     pub slots: Vec<(VisualKey, Slot)>,
     /// First line of each post, by index into `App::posts`.
     pub starts: Vec<usize>,
-    /// The local day the headers' times were written on (`ui::today`).
-    day: (i32, i32),
+    /// Ascending lines where a card starts and where a diff hunk header sits.
+    pub cards: Vec<usize>,
+    pub hunks: Vec<usize>,
+    /// Per post: the layout its lines came from, so the next rebuild moves them instead of copying.
+    laid: Vec<Option<(PostId, u64)>>,
+    /// The search needle and its matches in `lines` as (line, from cell, to cell), ascending.
+    pub found: (Vec<char>, Vec<(usize, usize, usize)>),
+    #[cfg(debug_assertions)]
+    inputs: FeedInputs,
 }
 
-/// Everything the feed reads: per post (id, version, fold generation, built),
-/// width, page height, cell px, and the comment and visual generations.
-type FeedKey = (Vec<(PostId, u64, u64, bool)>, u16, u16, (u16, u16), u64, u64, Option<(PostId, usize)>);
+impl Feed {
+    /// The line of `post` showing `spot`'s source line (its same wrap row, else the
+    /// last), or `None` when that source line no longer exists.
+    fn locate(&self, post: usize, spot: &Spot) -> Option<usize> {
+        let end = self.starts.get(post + 1).copied().unwrap_or(self.lines.len());
+        let rows: Vec<usize> = (self.starts[post]..end)
+            .filter(|&i| (self.origins[i].card, self.origins[i].src) == (spot.origin.card, spot.origin.src))
+            .collect();
+        rows.get(spot.origin.wrap).or(rows.last()).copied()
+    }
+
+    /// Where `line` is: its post, source origin, and how far into the post.
+    fn spot(&self, apps: &[PostSummary], line: usize) -> Option<Spot> {
+        let (post, _) = *self.hits.get(line)?;
+        Some(Spot { post: apps.get(post)?.id.clone(), origin: self.origins[line], offset: line - self.starts[post] })
+    }
+}
+
+/// A feed line named by content: the post and source line it shows, plus its row
+/// offset in that post for when the source line is gone.
+struct Spot {
+    post: PostId,
+    origin: Origin,
+    offset: usize,
+}
+
+/// The reader's place across a rebuild: the line at the top of the viewport and the
+/// cursor's line, each by source identity, and the cursor's screen row for the fallback.
+struct Anchor {
+    top: Option<Spot>,
+    cursor: Spot,
+    cursor_row: usize,
+}
+
+/// When the feed was built: `feed_gen`, width, page height and cell px.
+type FeedStamp = (u64, u16, u16, (u16, u16));
+
+/// Everything the feed reads besides its stamp: per post (id, version, fold generation,
+/// built, styled), the comments, visuals and focused card. Debug builds check that
+/// none of it changed without `feed_gen` moving.
+#[cfg(debug_assertions)]
+type FeedInputs = (Vec<(PostId, u64, u64, bool, bool)>, Vec<Comment>, HashMap<VisualKey, VisualState>, Option<(PostId, usize)>);
 
 /// One visual card: (post, version, card index).
 pub type VisualKey = (PostId, u64, usize);
@@ -131,6 +179,8 @@ pub enum Reply {
 pub enum Msg {
     Key(KeyEvent),
     Mouse(MouseEvent),
+    /// A wheel tick and when the terminal reader got it (`Mouse` ticks count as now).
+    Wheel(MouseEvent, Instant),
     Resize(u16, u16),
     /// The terminal's cell size in px changed (or became known).
     CellPx((u16, u16)),
@@ -194,8 +244,9 @@ pub struct Loaded {
     pub cards: Option<Vec<Card>>,
 }
 
-/// Everything a layout reads: version, width, height, cell px, comment, fold and visual generations.
-type LaidKey = (u64, u16, u16, (u16, u16), u64, u64, u64, Option<usize>);
+/// Everything a layout reads: version, width, fold generation, focused card, styled,
+/// its comments, and each card's visual fit.
+type LaidKey = (u64, u16, u64, Option<usize>, bool, Vec<Comment>, Vec<Fit>);
 
 /// Per post: folds, a pinned version, and the post's own layout cache.
 #[derive(Default)]
@@ -203,7 +254,9 @@ pub struct View {
     pub folds: Folds,
     /// A version picked with `v`; `None` follows the latest.
     pub pinned: Option<u64>,
-    laid: Option<(LaidKey, Laid)>,
+    /// The newest version that has cards, shown until the latest has them too.
+    built: Option<u64>,
+    laid: Option<(LaidKey, u64, Laid)>,
     fold_gen: u64,
 }
 
@@ -216,6 +269,8 @@ pub struct App {
     pub unread: HashSet<SessionId>,
     pub unseen: HashSet<PostId>,
     pub loaded: HashMap<(PostId, u64), Loaded>,
+    /// Plain posts whose render failed while notesd was away; asked again when the watch is back.
+    restyle: HashSet<(PostId, u64)>,
     pub views: HashMap<PostId, View>,
     pub shown: Option<PostId>,
     /// The sidebar's selected session (index into `sessions`).
@@ -239,13 +294,14 @@ pub struct App {
     /// Posts that entered the sidebar since the last paint, for the latency log.
     pub fresh: Vec<(PostId, u64)>,
     seen_rows: HashSet<(PostId, u64)>,
-    /// Card builds, one per (post, version); tests assert there are no repeats.
+    /// Card builds, plain then styled per (post, version); tests assert there are no repeats.
     pub builds: usize,
-    /// Bumped on every comment-list reply, so the layout cache sees new comments.
-    comments_gen: u64,
     pub visuals: HashMap<VisualKey, VisualState>,
-    /// Bumped when a visual's state changes, so the layout cache re-sizes it.
-    visual_gen: u64,
+    /// Bumped whenever something the feed reads changes (posts, loads, comments,
+    /// visuals, folds, pins), so `feed()` knows it's current without looking at every post.
+    feed_gen: u64,
+    /// Numbers each post layout, so a feed rebuild can tell which posts' lines it can keep.
+    layouts: u64,
     /// Visuals drawn this frame (set by `ui::draw`), for `main` to place.
     pub on_screen: Vec<OnScreen>,
     /// Feed scroll (first line on screen) and cursor line.
@@ -271,7 +327,7 @@ pub struct App {
     left_focus: Option<(VisualKey, VisualState)>,
     /// The focused diagram's zoom and pan (`+`/`-`/`0`, arrows or hjkl).
     pub zoom_view: ZoomView,
-    feed: Option<(FeedKey, Feed)>,
+    feed: Option<(FeedStamp, Feed)>,
     /// A post to bring to the top on the next layout (a sidebar pick, a follow).
     jump: Option<PostId>,
     /// A mouse drag in the feed: where it started and where it is, as (line, cell column).
@@ -279,6 +335,11 @@ pub struct App {
     /// Sessions opened before: their posts, comments and place in the feed, so
     /// coming back shows them at once (then refreshes) instead of a blank pane.
     remembered: HashMap<SessionId, Remembered>,
+    wheel: WheelAccel,
+    /// The search being read: its query's chars (empty: none), lit in the feed and stepped by `n`/`N`.
+    pub needle: Vec<char>,
+    /// The post a search hit opened, until its first matching line is on screen.
+    find_post: Option<PostId>,
 }
 
 struct Remembered {
@@ -288,9 +349,47 @@ struct Remembered {
     cursor: usize,
     shown: Option<PostId>,
     follow: bool,
+    feed: Option<(FeedStamp, Feed)>,
 }
 
 const WHEEL: usize = 3;
+
+/// Wheel acceleration from tick cadence, hunk's tuning of OpenTUI's
+/// `MacOSScrollAccel`: a lone notch moves one row, a fast spin ramps to `WHEEL`.
+/// Fractions carry between ticks so the ramp is smooth.
+#[derive(Default)]
+struct WheelAccel {
+    last: Option<Instant>,
+    gaps: [f64; 3],
+    n: usize,
+    carry: f64,
+}
+
+impl WheelAccel {
+    fn rows(&mut self, at: Instant, dir: f64) -> isize {
+        let gap = self.last.map(|l| at.saturating_duration_since(l).as_secs_f64() * 1000.0);
+        let mult = match gap {
+            Some(ms) if ms < 6.0 => 1.0,
+            Some(ms) if ms <= 150.0 => {
+                self.last = Some(at);
+                self.gaps[self.n % 3] = ms;
+                self.n += 1;
+                let avg = self.gaps[..self.n.min(3)].iter().sum::<f64>() / self.n.min(3) as f64;
+                (1.0 + 0.4 * ((100.0 / avg / 4.0).exp() - 1.0)).min(WHEEL as f64)
+            }
+            _ => {
+                *self = WheelAccel { last: Some(at), ..WheelAccel::default() };
+                1.0
+            }
+        };
+        // A reversal moves at once instead of first paying back the other way's fraction.
+        if self.carry * dir < 0.0 { self.carry = 0.0; }
+        self.carry += dir * mult;
+        let rows = self.carry.trunc();
+        self.carry -= rows;
+        rows as isize
+    }
+}
 
 impl App {
     pub fn new(want: Option<SessionId>) -> App {
@@ -302,6 +401,7 @@ impl App {
             unread: HashSet::new(),
             unseen: HashSet::new(),
             loaded: HashMap::new(),
+            restyle: HashSet::new(),
             views: HashMap::new(),
             shown: None,
             sel: 0,
@@ -319,9 +419,9 @@ impl App {
             fresh: Vec::new(),
             seen_rows: HashSet::new(),
             builds: 0,
-            comments_gen: 0,
             visuals: HashMap::new(),
-            visual_gen: 0,
+            feed_gen: 0,
+            layouts: 0,
             on_screen: Vec::new(),
             scroll: 0,
             cursor: 0,
@@ -338,6 +438,9 @@ impl App {
             jump: None,
             remembered: HashMap::new(),
             drag: None,
+            wheel: WheelAccel::default(),
+            needle: Vec::new(),
+            find_post: None,
         }
     }
 
@@ -405,6 +508,7 @@ impl App {
             if let Some(source) = self.visual_source(&key) {
                 fx.push(Effect::NeedVisual { key: key.clone(), source: source.clone() });
                 self.visuals.insert(key, VisualState::Pending);
+                self.feed_gen += 1;
             }
         }
         fx
@@ -449,7 +553,8 @@ impl App {
                 fx
             }
             Msg::Key(_) => vec![],
-            Msg::Mouse(m) => self.mouse(m),
+            Msg::Mouse(m) => self.mouse(m, Instant::now()),
+            Msg::Wheel(m, at) => self.mouse(m, at),
             Msg::Resize(w, h) => {
                 self.size = (w, h);
                 if w >= ui::SIDEBAR_MIN_WIDTH { self.session_picker = false; }
@@ -479,6 +584,11 @@ impl App {
                     fx.push(Effect::Request(StageRequest::PostList(s.clone())));
                     fx.push(Effect::Request(StageRequest::CommentList(s)));
                 }
+                for (id, v) in std::mem::take(&mut self.restyle) {
+                    if self.loaded.get(&(id.clone(), v)).is_some_and(|l| l.render.is_none()) {
+                        fx.push(Effect::Request(StageRequest::PostRender(PostShowArgs { id, version: Some(v) })));
+                    }
+                }
                 fx.push(Effect::Redraw);
                 fx
             }
@@ -505,7 +615,7 @@ impl App {
                     *state = VisualState::Ready { w, h, max_scale };
                 }
                 self.visuals.insert(key, VisualState::Ready { w, h, max_scale });
-                self.visual_gen += 1;
+                self.feed_gen += 1;
                 let mut fx = if resized_html { self.enter_card_focus() } else { vec![] };
                 fx.push(Effect::Redraw);
                 fx
@@ -519,7 +629,7 @@ impl App {
                 }
                 let failed_html = self.pending_html_focus.as_ref() == Some(&key);
                 self.visuals.insert(key, VisualState::Failed(reason));
-                self.visual_gen += 1;
+                self.feed_gen += 1;
                 let mut fx = if failed_html { self.enter_card_focus() } else { vec![] };
                 fx.push(Effect::Redraw);
                 fx
@@ -533,7 +643,7 @@ impl App {
                     return vec![];
                 }
                 self.visuals.insert(key, VisualState::Ready { w, h, max_scale: 1.0 });
-                self.visual_gen += 1;
+                self.feed_gen += 1;
                 vec![Effect::Redraw]
             }
             Msg::ZoomReady { key, w, h } => {
@@ -562,6 +672,7 @@ impl App {
                 cursor: self.cursor,
                 shown: self.shown.take(),
                 follow: self.follow,
+                feed: self.feed.take(),
             };
             self.remembered.insert(old, r);
         }
@@ -575,9 +686,9 @@ impl App {
         self.jump = None;
         match self.remembered.remove(&id) {
             Some(r) => {
-                (self.posts, self.comments, self.scroll, self.cursor, self.shown, self.follow) =
-                    (r.posts, r.comments, r.scroll, r.cursor, r.shown, r.follow);
-                self.comments_gen += 1;
+                (self.posts, self.comments, self.scroll, self.cursor, self.shown, self.follow, self.feed) =
+                    (r.posts, r.comments, r.scroll, r.cursor, r.shown, r.follow, r.feed);
+                self.feed_gen += 1;
             }
             None => {
                 (self.scroll, self.cursor, self.shown, self.follow) = (0, 0, None, true);
@@ -605,7 +716,7 @@ impl App {
 
     /// `j`/`k`: bring the next post's title (or this one's, then the previous) to the top.
     fn step_post(&mut self, forward: bool) {
-        let (cursor, page) = (self.cursor, self.page());
+        let cursor = self.cursor;
         let feed = self.feed();
         let Some(&(at, _)) = feed.hits.get(cursor) else { return };
         let target = match (forward, cursor > feed.starts[at]) {
@@ -614,9 +725,66 @@ impl App {
             (false, false) => at.saturating_sub(1),
         };
         let Some(&line) = feed.starts.get(target) else { return };
-        let max = feed.lines.len().saturating_sub(page);
+        self.goto(line);
+    }
+
+    /// Put `line` at the top of the viewport (as far as the feed's end allows), cursor on it.
+    fn goto(&mut self, line: usize) {
+        let page = self.page();
+        let max = self.feed().lines.len().saturating_sub(page);
         (self.cursor, self.scroll) = (line, line.min(max));
         self.follow_cursor();
+    }
+
+    /// `]`/`[` (hunks, else cards) and `.`/`,` (cards): the next or previous stop.
+    fn step_stop(&mut self, hunks: bool, forward: bool) {
+        let cursor = self.cursor;
+        let feed = self.feed();
+        let pick = |stops: &[usize]| {
+            if forward {
+                stops.get(stops.partition_point(|&l| l <= cursor))
+            } else {
+                stops[..stops.partition_point(|&l| l < cursor)].last()
+            }
+            .copied()
+        };
+        let stop = if hunks { pick(&feed.hunks).or_else(|| pick(&feed.cards)) } else { pick(&feed.cards) };
+        if let Some(line) = stop {
+            self.goto(line);
+        }
+    }
+
+    /// `n`/`N`: the next or previous line matching the search, wrapping round the feed.
+    fn step_match(&mut self, forward: bool) {
+        let mut found: Vec<usize> = self.feed().found.1.iter().map(|m| m.0).collect();
+        found.dedup();
+        let cursor = self.cursor;
+        let at = if forward { found.iter().position(|&l| l > cursor).unwrap_or(0) } else { found.iter().rposition(|&l| l < cursor).unwrap_or(found.len().saturating_sub(1)) };
+        match found.get(at) {
+            Some(&line) => {
+                self.goto(line);
+                self.toast = Some(format!("match {}/{}", at + 1, found.len()));
+            }
+            None => self.toast = Some("no matches".into()),
+        }
+    }
+
+    /// Bring the first line of the search hit's post that matches the query to the top.
+    fn land_find(&mut self) {
+        let (Some(id), Some((_, feed))) = (self.find_post.clone(), &self.feed) else { return };
+        let Some(i) = self.posts.iter().position(|p| p.id == id) else { return };
+        if !self.loaded.get(&(id, self.listed_version(&self.posts[i]))).is_some_and(|l| l.cards.is_some()) {
+            return;
+        }
+        let end = feed.starts.get(i + 1).copied().unwrap_or(feed.lines.len());
+        let mut found: Vec<usize> = feed.found.1.iter().map(|m| m.0).collect();
+        found.dedup();
+        let first = found.iter().position(|&l| l >= feed.starts[i] && l < end);
+        let line = first.map_or(feed.starts[i], |n| found[n]);
+        let toast = first.map(|n| format!("match {}/{}", n + 1, found.len()));
+        self.find_post = None;
+        self.goto(line);
+        self.toast = toast;
     }
 
     // ---- Posts ------------------------------------------------------------------
@@ -625,8 +793,30 @@ impl App {
         self.posts.iter().find(|p| &p.id == id).map(|p| self.listed_version(p))
     }
 
-    /// The version shown for a listed post: the pinned one, else its latest.
-    fn listed_version(&self, p: &PostSummary) -> u64 {
+    /// The post owning the top visible feed row, and the diff file that row is in.
+    pub fn top_row(&mut self) -> Option<(usize, Option<String>)> {
+        let scroll = self.scroll;
+        let feed = self.feed();
+        let (post, _) = *feed.hits.get(scroll)?;
+        let Origin { card, src, .. } = feed.origins[scroll];
+        let p = self.posts.get(post)?;
+        let cards = self.loaded.get(&(p.id.clone(), self.listed_version(p))).and_then(|l| l.cards.as_ref());
+        let file = cards.and_then(|cards| match &cards.get(card)?.body {
+            CardBody::Diff(diff) => diff.files.iter().rev().find(|(row, _)| diff.src.get(*row).is_some_and(|&s| s < src)).map(|(_, f)| f.clone()),
+            _ => None,
+        });
+        Some((post, file))
+    }
+
+    /// The version shown for a listed post: the pinned one, else its latest, or while
+    /// the latest has no cards yet the newest one that has, so an update never drops
+    /// the post to "loading…" under the reader.
+    pub fn listed_version(&self, p: &PostSummary) -> u64 {
+        self.views.get(&p.id).and_then(|v| v.pinned.or(v.built.filter(|b| *b < p.version))).unwrap_or(p.version)
+    }
+
+    /// The version a listed post should have loaded: the pinned one, else its latest.
+    fn wanted_version(&self, p: &PostSummary) -> u64 {
         self.views.get(&p.id).and_then(|v| v.pinned).unwrap_or(p.version)
     }
 
@@ -634,7 +824,7 @@ impl App {
         self.unseen.remove(&id);
         self.shown = Some(id.clone());
         self.views.entry(id.clone()).or_default();
-        match self.version_of(&id) {
+        match self.posts.iter().find(|p| p.id == id).map(|p| self.wanted_version(p)) {
             Some(v) => self.load(id, v),
             None => vec![],
         }
@@ -646,6 +836,7 @@ impl App {
             return vec![];
         }
         self.loaded.insert((id.clone(), version), Loaded { post: None, render: None, cards: None });
+        self.feed_gen += 1;
         let args = PostShowArgs { id, version: Some(version) };
         vec![
             Effect::Request(StageRequest::PostShow(args.clone())),
@@ -671,11 +862,17 @@ impl App {
         self.comments.iter().filter(|c| c.post.as_ref() == Some(id)).cloned().collect()
     }
 
+    /// Cards from what has arrived: plain text from the post alone, so it reads at
+    /// once, then styled when its render lands (`Reply::Render` drops the plain ones).
     fn built(&mut self, key: (PostId, u64)) {
         if let Some(l) = self.loaded.get_mut(&key) {
-            if let (Some(post), Some(render), None) = (&l.post, &l.render, &l.cards) {
-                l.cards = Some(build_cards(post, render));
+            if let (Some(post), None) = (&l.post, &l.cards) {
+                l.cards = Some(build_cards(post, l.render.as_ref()));
                 self.builds += 1;
+            }
+            if l.cards.is_some() {
+                let view = self.views.entry(key.0.clone()).or_default();
+                view.built = view.built.max(Some(key.1));
             }
         }
         // A new version without the focused part: nothing left to focus on.
@@ -688,27 +885,31 @@ impl App {
         }
     }
 
-    /// One post laid out at `width`, memoized in its view on everything it reads.
-    fn post_laid(&mut self, id: &PostId, version: u64, width: u16, page: u16) -> Option<&Laid> {
-        let comments = self.comments_on(id);
-        let cards = self.loaded.get(&(id.clone(), version))?.cards.as_ref()?;
+    /// One post laid out at `width`, memoized in its view on everything it reads:
+    /// its own comments and visual sizes, so another post's comments or pixels never redo it.
+    /// Returns the layout with its number, which changes only when it is redone.
+    fn post_laid(&mut self, id: &PostId, version: u64, width: u16, page: u16) -> Option<(u64, &Laid)> {
+        let loaded = self.loaded.get(&(id.clone(), version))?;
+        let cards = loaded.cards.as_ref()?;
+        let styled = loaded.render.is_some();
         let (cell, visuals) = (self.cell_px, &self.visuals);
-        let view = self.views.entry(id.clone()).or_default();
         let selected = self.focused_card.as_ref().filter(|(post, _)| post == id).map(|(_, card)| *card);
-        let key = (version, width, page, cell, self.comments_gen, view.fold_gen, self.visual_gen, selected);
-        if view.laid.as_ref().is_none_or(|(k, _)| *k != key) {
-            let inner = width.saturating_sub(4).max(1);
-            let rows = if selected.is_some() { page.saturating_sub(3) } else { page / 2 };
-            // A new version holds the size its card's last pixels had while it renders,
-            // so a patch never collapses the card to a placeholder and shifts the feed.
-            let last_ready = |c: usize| {
-                (1..version).rev().find_map(|v| visuals.get(&(id.clone(), v, c)).filter(|s| matches!(s, VisualState::Ready { .. })))
-            };
-            let fit = |c: usize| match visuals.get(&(id.clone(), version, c)).filter(|s| **s != VisualState::Pending).or_else(|| last_ready(c)) {
+        let comments = if selected.is_some() { vec![] } else { self.comments_on(id) };
+        let inner = width.saturating_sub(4).max(1);
+        let rows = if selected.is_some() { page.saturating_sub(3) } else { page / 2 };
+        // A new version holds the size its card's last pixels had while it renders,
+        // so a patch never collapses the card to a placeholder and shifts the feed.
+        let last_ready = |c: usize| {
+            (1..version).rev().find_map(|v| visuals.get(&(id.clone(), v, c)).filter(|s| matches!(s, VisualState::Ready { .. })))
+        };
+        let fits: Vec<Fit> = cards
+            .iter()
+            .enumerate()
+            .map(|(c, card)| match visuals.get(&(id.clone(), version, c)).filter(|s| **s != VisualState::Pending).or_else(|| last_ready(c)) {
                 Some(VisualState::Ready { w, h, max_scale }) => {
                     // Scroll through tall Mermaid diagrams instead of shrinking their labels;
                     // a focused one shows its pixels 1:1 until the full-width raster lands.
-                    let rows = match &cards[c].body {
+                    let rows = match &card.body {
                         CardBody::Visual { source: VisualSource::Mermaid(_), .. } => u16::MAX,
                         CardBody::Visual { source: VisualSource::Html(_), .. } => page.saturating_sub(3),
                         _ => rows,
@@ -718,67 +919,83 @@ impl App {
                 Some(VisualState::Failed(why)) => Fit::Failed(why.clone()),
                 // Hold about the room a diagram or page usually takes.
                 Some(VisualState::Pending) | None => Fit::Pending { rows: (page / 3).clamp(3, 12) },
-            };
-            let comments: &[Comment] = if selected.is_some() { &[] } else { &comments };
-            view.laid = Some((key, cards::layout(cards, comments, width, &view.folds, &fit, selected)));
+            })
+            .collect();
+        let view = self.views.entry(id.clone()).or_default();
+        let key = (version, width, view.fold_gen, selected, styled, comments, fits);
+        if view.laid.as_ref().is_none_or(|(k, ..)| *k != key) {
+            let laid = cards::layout(cards, &key.5, width, &view.folds, &|c| key.6[c].clone(), selected);
+            self.layouts += 1;
+            view.laid = Some((key, self.layouts, laid));
         }
-        view.laid.as_ref().map(|(_, l)| l)
+        view.laid.as_ref().map(|(_, n, l)| (*n, l))
     }
 
     /// The feed for the main column, rebuilt only when something it reads changed.
     /// A rebuild (a post loading above, a resize rewrapping everything, a fold)
-    /// keeps the line under the cursor where it was on screen.
+    /// keeps the source line at the top of the viewport (and the cursor's) in place.
     pub fn feed(&mut self) -> &Feed {
         let width = ui::geometry_for(self).main.width.saturating_sub(1);
         let page = self.page() as u16;
-        let posts: Vec<(PostId, u64, u64, bool)> = self
-            .posts
-            .iter()
-            .map(|p| {
-                let v = self.listed_version(p);
-                let fold_gen = self.views.get(&p.id).map_or(0, |v| v.fold_gen);
-                let built = self.loaded.get(&(p.id.clone(), v)).is_some_and(|l| l.cards.is_some());
-                (p.id.clone(), v, fold_gen, built)
-            })
-            .collect();
-        let key: FeedKey = (posts.clone(), width, page, self.cell_px, self.comments_gen, self.visual_gen, self.focused_card.clone());
-        if self.feed.as_ref().is_none_or(|(k, _)| *k != key) {
-            // Where the cursor was: which post, how far into it, how far down the screen.
+        let stamp: FeedStamp = (self.feed_gen, width, page, self.cell_px);
+        #[cfg(debug_assertions)]
+        if let Some((s, f)) = self.feed.as_ref().filter(|(s, _)| *s == stamp) {
+            assert!(f.inputs == self.feed_inputs(), "the feed's inputs changed without bumping feed_gen (stamp {s:?})");
+        }
+        if self.feed.as_ref().is_none_or(|(s, _)| *s != stamp) {
             let anchor = self.feed.as_ref().and_then(|(_, f)| {
-                let (post, _) = *f.hits.get(self.cursor)?;
-                Some((self.posts.get(post)?.id.clone(), self.cursor - f.starts[post], self.cursor.saturating_sub(self.scroll)))
+                Some(Anchor {
+                    top: f.spot(&self.posts, self.scroll),
+                    cursor: f.spot(&self.posts, self.cursor)?,
+                    cursor_row: self.cursor.saturating_sub(self.scroll),
+                })
             });
-            // Posts only appended (a burst while following): lay out just the new ones
-            // instead of copying every post's lines again. Headers show the date, so not
-            // across midnight.
-            let today = ui::today();
-            let (from, mut feed) = match self.feed.take() {
-                Some((k, f)) if f.day == today && k.0.len() < posts.len() && posts.starts_with(&k.0) && (k.1, k.2, k.3, k.4, k.5, &k.6) == (key.1, key.2, key.3, key.4, key.5, &key.6) => (k.0.len(), f),
-                _ => (0, Feed { day: today, ..Feed::default() }),
-            };
-            for (i, (id, version, _, _)) in posts.iter().enumerate().skip(from) {
+            // A post whose layout hasn't changed keeps its lines, moved out of the old
+            // feed rather than copied from the layout again: a post loading, a comment
+            // or a diagram's pixels costs that post's lines, not the whole session's.
+            let mut old = self.feed.take().map(|(_, f)| f).unwrap_or_default();
+            let mut feed = Feed::default();
+            let posts: Vec<(PostId, u64)> = self.posts.iter().map(|p| (p.id.clone(), self.listed_version(p))).collect();
+            for (i, (id, version)) in posts.iter().enumerate() {
                 feed.starts.push(feed.lines.len());
                 if self.focused_card.as_ref().is_some_and(|(post, _)| post != id) {
+                    feed.laid.push(None);
                     continue;
                 }
                 feed.lines.push(self.header(i));
                 feed.hits.push((i, Hit::None));
+                feed.origins.push(Origin { card: usize::MAX, src: 0, wrap: 0 });
                 let start = feed.lines.len();
                 match self.post_laid(id, *version, width, page) {
-                    Some(laid) => {
-                        feed.lines.extend(laid.lines.iter().cloned());
+                    Some((n, laid)) => {
+                        match old.laid.get(i) {
+                            Some(Some((was, m))) if was == id && *m == n => {
+                                let from = old.starts[i] + 1;
+                                feed.lines.extend(old.lines[from..from + laid.lines.len()].iter_mut().map(std::mem::take));
+                            }
+                            _ => feed.lines.extend(laid.lines.iter().cloned()),
+                        }
                         feed.hits.extend(laid.hits.iter().map(|h| (i, *h)));
+                        feed.cards.extend(laid.cards.iter().map(|l| l + start));
+                        feed.hunks.extend(laid.hunks.iter().map(|l| l + start));
+                        feed.origins.extend(laid.origins.iter().copied());
                         feed.slots.extend(laid.slots.iter().map(|s| {
                             ((id.clone(), *version, s.card), Slot { line: s.line + start, ..*s })
                         }));
+                        feed.laid.push(Some((id.clone(), n)));
                     }
                     None => {
                         feed.lines.push(Line::styled("  loading…", ui::dim()));
-                        feed.hits.push((i, Hit::None));
                         feed.lines.push(Line::default());
-                        feed.hits.push((i, Hit::None));
+                        feed.hits.extend([(i, Hit::None); 2]);
+                        feed.origins.extend([1, 2].map(|src| Origin { card: usize::MAX, src, wrap: 0 }));
+                        feed.laid.push(None);
                     }
                 }
+            }
+            #[cfg(debug_assertions)]
+            {
+                feed.inputs = self.feed_inputs();
             }
             let total = feed.lines.len();
             if let Some(id) = self.jump.take() {
@@ -786,18 +1003,47 @@ impl App {
                     self.cursor = feed.starts[i];
                     self.scroll = self.cursor;
                 }
-            } else if let Some((id, offset, row)) = anchor {
-                if let Some(i) = self.posts.iter().position(|p| p.id == id) {
+            } else if let Some(anchor) = anchor {
+                let find = |spot: &Spot| {
+                    let i = self.posts.iter().position(|p| p.id == spot.post)?;
                     let end = feed.starts.get(i + 1).copied().unwrap_or(total);
-                    self.cursor = (feed.starts[i] + offset).min(end.saturating_sub(1));
-                    self.scroll = self.cursor.saturating_sub(row);
+                    Some(feed.locate(i, spot).unwrap_or((feed.starts[i] + spot.offset).min(end.saturating_sub(1))))
+                };
+                if let Some(cursor) = find(&anchor.cursor) {
+                    self.cursor = cursor;
+                    self.scroll = anchor.top.as_ref().and_then(|t| {
+                        let i = self.posts.iter().position(|p| p.id == t.post)?;
+                        feed.locate(i, t)
+                    }).unwrap_or(cursor.saturating_sub(anchor.cursor_row));
                 }
             }
-            self.cursor = self.cursor.min(total.saturating_sub(1));
-            self.scroll = self.scroll.min(total.saturating_sub(page as usize)).min(self.cursor);
-            self.feed = Some((key, feed));
+            self.scroll = self.scroll.min(total.saturating_sub(page as usize));
+            self.cursor = self.cursor.min(total.saturating_sub(1)).clamp(self.scroll, self.scroll + page as usize - 1);
+            self.feed = Some((stamp, feed));
+        }
+        let feed = &mut self.feed.as_mut().expect("built above").1;
+        if feed.found.0 != self.needle {
+            feed.found = (self.needle.clone(), crate::search::matches(&feed.lines, &self.needle));
+        }
+        if self.find_post.is_some() {
+            self.land_find();
         }
         &self.feed.as_ref().expect("built above").1
+    }
+
+    #[cfg(debug_assertions)]
+    fn feed_inputs(&self) -> FeedInputs {
+        let posts = self
+            .posts
+            .iter()
+            .map(|p| {
+                let v = self.listed_version(p);
+                let fold_gen = self.views.get(&p.id).map_or(0, |v| v.fold_gen);
+                let (built, styled) = self.loaded.get(&(p.id.clone(), v)).map_or((false, false), |l| (l.cards.is_some(), l.render.is_some()));
+                (p.id.clone(), v, fold_gen, built, styled)
+            })
+            .collect();
+        (posts, self.comments.clone(), self.visuals.clone(), self.focused_card.clone())
     }
 
     /// A post's title row in the feed: bold title, dim version and time.
@@ -839,10 +1085,11 @@ impl App {
         self.follow_cursor();
     }
 
-    fn wheel_lines(&self) -> isize {
+    fn wheel_rows(&mut self, down: bool, at: Instant) -> isize {
+        let dir = if down { 1 } else { -1 };
         // Touch clients already emit a stream of wheel ticks during a swipe.
-        // Tripling each tick skips a fifth of a short phone viewport.
-        if self.size.0 < ui::SIDEBAR_MIN_WIDTH || self.page() < 20 { 1 } else { WHEEL as isize }
+        // Accelerating them skips a fifth of a short phone viewport.
+        if self.size.0 < ui::SIDEBAR_MIN_WIDTH || self.page() < 20 { dir } else { self.wheel.rows(at, dir as f64) }
     }
 
     /// Scroll the feed by `delta` lines, dragging the cursor along.
@@ -872,6 +1119,7 @@ impl App {
             set.insert(node);
         }
         v.fold_gen += 1;
+        self.feed_gen += 1;
         true
     }
 
@@ -901,6 +1149,7 @@ impl App {
         let view = self.views.entry(id.clone()).or_default();
         let current = view.pinned.unwrap_or(latest);
         view.pinned = (current > 1).then(|| current - 1);
+        self.feed_gen += 1;
         self.toast = Some(format!("v{} of {latest}", view.pinned.unwrap_or(latest)));
         let v = view.pinned.unwrap_or(latest);
         self.load(id, v)
@@ -920,13 +1169,13 @@ impl App {
         // Back before a draw: the gallery still shows what focus showed.
         if let Some((key, shown)) = self.left_focus.take().filter(|(left, _)| Some(left) == key.as_ref()) {
             self.visuals.insert(key, shown);
-            self.visual_gen += 1;
+            self.feed_gen += 1;
         }
         // Its zoomed raster was made ahead: lay it out at that size from the first frame.
         let target = self.zoom_target();
         if let Some(ZoomAhead { key, size: Some((w, h)), .. }) = self.zoom_ahead.take().filter(|ahead| Some(&ahead.key) == key.as_ref() && ahead.target == target) {
             self.visuals.insert(key, VisualState::Ready { w, h, max_scale: 1.0 });
-            self.visual_gen += 1;
+            self.feed_gen += 1;
         }
         self.focused_card = Some((id, card));
         self.feed = None;
@@ -972,7 +1221,7 @@ impl App {
         if let Some((hidden, _)) = self.pending_sidebar.take_if(|_| left) {
             self.sidebar_hidden = hidden;
             self.visuals.extend(self.pending_sidebar_frames.drain());
-            self.visual_gen += 1;
+            self.feed_gen += 1;
             fx.extend(self.report_space());
             fx.push(Effect::Redraw);
         }
@@ -1034,7 +1283,7 @@ impl App {
         self.sidebar_hidden = *hidden;
         self.pending_sidebar = None;
         self.visuals.extend(self.pending_sidebar_frames.drain());
-        self.visual_gen += 1;
+        self.feed_gen += 1;
         self.report_space()
     }
 
@@ -1107,7 +1356,7 @@ impl App {
         if let Some((key, state)) = self.unzoomed.take() {
             let shown = self.visuals.insert(key.clone(), state);
             self.left_focus = shown.map(|shown| (key, shown));
-            self.visual_gen += 1;
+            self.feed_gen += 1;
         }
         self.zoom_ahead = None;
         if let Some((scroll, cursor, follow)) = self.before_focus.take() {
@@ -1200,6 +1449,14 @@ impl App {
         if let Some(fx) = self.zoom_key(k.code) {
             return fx;
         }
+        self.find_post = None;
+        if k.modifiers.contains(KeyModifiers::CONTROL) {
+            if let KeyCode::Char(c @ ('d' | 'u')) = k.code {
+                let half = (self.page() / 2).max(1) as isize;
+                self.scroll(if c == 'd' { half } else { -half });
+                return vec![];
+            }
+        }
         match k.code {
             KeyCode::Char('q') => vec![Effect::Quit],
             KeyCode::Char('z') => self.toggle_card_focus(),
@@ -1211,6 +1468,18 @@ impl App {
             }
             KeyCode::Char('k') if self.focused_card.is_none() => {
                 self.step_post(false);
+                vec![]
+            }
+            KeyCode::Char(c @ ('[' | ']' | ',' | '.')) => {
+                self.step_stop(matches!(c, '[' | ']'), matches!(c, ']' | '.'));
+                vec![]
+            }
+            KeyCode::Char(c @ ('n' | 'N')) => {
+                self.step_match(c == 'n');
+                vec![]
+            }
+            KeyCode::Esc if !self.needle.is_empty() => {
+                self.needle.clear();
                 vec![]
             }
             KeyCode::Char('J') => self.select_session(self.sel + 1, false),
@@ -1297,6 +1566,8 @@ impl App {
             }
             KeyCode::Enter => match hits.get(sel) {
                 Some(hit) => {
+                    self.needle = crate::search::needle(&query);
+                    self.find_post = hit.post.clone();
                     let mut fx = self.open_session(hit.session.id.clone());
                     // The hit's post is shown once the post list arrives.
                     if let Some(post) = &hit.post {
@@ -1380,7 +1651,7 @@ impl App {
         }
     }
 
-    fn mouse(&mut self, m: MouseEvent) -> Vec<Effect> {
+    fn mouse(&mut self, m: MouseEvent, at: Instant) -> Vec<Effect> {
         let g = ui::geometry_for(self);
         let inside = |r: ratatui::layout::Rect| {
             m.column >= r.x && m.column < r.x + r.width && m.row >= r.y && m.row < r.y + r.height
@@ -1413,8 +1684,8 @@ impl App {
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if matches!(self.mode, Mode::Nav) => {
                 let before = (self.scroll, self.cursor);
                 self.drag = None;
-                let step = self.wheel_lines();
-                self.scroll(if m.kind == MouseEventKind::ScrollDown { step } else { -step });
+                let rows = self.wheel_rows(m.kind == MouseEventKind::ScrollDown, at);
+                self.scroll(rows);
                 if before == (self.scroll, self.cursor) { return vec![]; }
                 vec![]
             }
@@ -1549,6 +1820,7 @@ impl App {
 
     fn reply(&mut self, r: Reply) -> Vec<Effect> {
         let mut fx = Vec::new();
+        self.feed_gen += 1;
         match r {
             Reply::Saved => return fx,
             Reply::Sessions(sessions) => {
@@ -1631,7 +1903,7 @@ impl App {
                     self.shown.clone().or(last)
                 };
                 // The feed shows every post, so load them all.
-                let versions: Vec<_> = self.posts.iter().map(|p| (p.id.clone(), self.listed_version(p))).collect();
+                let versions: Vec<_> = self.posts.iter().map(|p| (p.id.clone(), self.wanted_version(p))).collect();
                 for (id, v) in versions {
                     fx.extend(self.load(id, v));
                 }
@@ -1652,24 +1924,35 @@ impl App {
                 let key = (render.id.clone(), render.version);
                 if let Some(l) = self.loaded.get_mut(&key) {
                     l.render = Some(render);
+                    l.cards = None;
                 }
                 self.built(key);
             }
             Reply::Comments(session, comments) => {
                 if self.open.as_ref() == Some(&session) {
                     self.comments = comments;
-                    self.comments_gen += 1;
                 }
             }
             Reply::Commented(c) => {
-                let agent = self.open.as_ref().and_then(|id| self.sessions.iter().find(|s| &s.id == id)).map_or("the agent".into(), |s| s.agent.clone());
-                let on = c.post.as_ref().and_then(|p| self.posts.iter().find(|x| &x.id == p)).map_or(String::new(), |p| format!(" on {}", p.title));
+                // Named from the comment, since the user may have opened another session by now.
+                let agent = self.sessions.iter().find(|s| s.id == c.session).map_or("the agent".into(), |s| s.agent.clone());
+                let post = c.post.as_ref().and_then(|p| self.loaded.iter().filter(|((id, _), _)| id == p).filter_map(|(_, l)| l.post.as_ref()).max_by_key(|p| p.version));
+                let on = post.map_or(String::new(), |p| format!(" on {}", p.title));
                 self.toast = Some(format!("sent{on} · {agent} sees it with its next post or wait"));
             }
             Reply::Failed(req, e) => {
                 if let StageRequest::PostShow(a) | StageRequest::PostRender(a) = &req {
                     if let Some(v) = a.version {
-                        self.loaded.remove(&(a.id.clone(), v));
+                        // A render that failed after its post arrived keeps the plain cards up
+                        // instead of the post dropping back to "loading…". Only one notesd
+                        // never answered is worth asking again; any other would fail again.
+                        let key = (a.id.clone(), v);
+                        let plain = matches!(req, StageRequest::PostRender(_)) && self.loaded.get(&key).is_some_and(|l| l.post.is_some());
+                        if !plain {
+                            self.loaded.remove(&key);
+                        } else if e.code == ErrorCode::DaemonUnreachable {
+                            self.restyle.insert(key);
+                        }
                     }
                 }
                 self.banner = (e.code == ErrorCode::DaemonUnreachable).then(|| "notesd is unreachable".into());
@@ -1715,7 +1998,7 @@ pub fn fit_cells((w, h): (u32, u32), max_scale: f32, cols: u16, rows: u16, (cw, 
 mod tests {
     use super::*;
     use crossterm::event::KeyEventState;
-    use notes_proto::posts::Part;
+    use notes_proto::posts::{DiffFileRender, DiffHunk, DiffLayout, DiffLine, DiffLineKind, Part, PartRender, Span as WireSpan};
 
     fn key(c: KeyCode) -> Msg {
         Msg::Key(KeyEvent { code: c, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE })
@@ -1818,7 +2101,7 @@ mod tests {
         let mut post = post("b", "s1", 2, "");
         post.parts = (0..8).map(|i| Part::Mermaid { mermaid: format!("graph TD\nA{i}-->B"), id: None }).collect();
         let render = PostRender { id: "b".into(), version: 2, parts: vec![notes_proto::posts::PartRender::Native; 8] };
-        app.loaded.get_mut(&("b".into(), 2)).unwrap().cards = Some(cards::build_cards(&post, &render));
+        app.loaded.get_mut(&("b".into(), 2)).unwrap().cards = Some(cards::build_cards(&post, Some(&render)));
         app.views.get_mut(&PostId::from("b")).unwrap().laid = None;
         app.feed = None;
         // As `main` does: update, draw, then ask for what the drawn feed shows.
@@ -1858,7 +2141,7 @@ mod tests {
             Part::Html { html: "<p>page</p>".into(), kits: vec![], id: None },
         ];
         let render = PostRender { id: "b".into(), version: 2, parts: vec![notes_proto::posts::PartRender::Native; 2] };
-        app.loaded.get_mut(&("b".into(), 2)).unwrap().cards = Some(cards::build_cards(&post, &render));
+        app.loaded.get_mut(&("b".into(), 2)).unwrap().cards = Some(cards::build_cards(&post, Some(&render)));
         for card in 0..2 {
             app.update(Msg::VisualReady { key: ("b".into(), 2, card), w: 700, h: 879, max_scale: 1.0 });
         }
@@ -1877,6 +2160,139 @@ mod tests {
         assert_eq!(app.shown.as_deref(), Some("b"));
         assert_eq!(app.sel, 0);
         assert!(app.shown_cards().is_some());
+    }
+
+    #[test]
+    fn keys_between_a_request_and_its_reply_are_handled_and_the_reply_still_lands() {
+        let db = fake();
+        let mut app = booted(&db);
+        app.feed(); // the first draw lays the feed out before any key arrives
+        // Open s2; its replies are held, as the request worker holds them while notesd is slow.
+        app.update(key(KeyCode::Char('J')));
+        let held = requests(&app.update(key(KeyCode::Enter)));
+        assert!(held.contains(&StageRequest::PostList("s2".into())), "{held:?}");
+        // Keys keep working meanwhile: back to s1, then down a line.
+        app.update(key(KeyCode::Char('K')));
+        let back = app.update(key(KeyCode::Enter));
+        assert_eq!(app.update(key(KeyCode::Down)), [Effect::Redraw]);
+        assert_eq!(app.open.as_deref(), Some("s1"));
+        // s2's late replies are for a session the user left: s1 stays as it is.
+        for r in &held {
+            app.update(Msg::Reply(db.answer(r)));
+        }
+        assert_eq!(app.open.as_deref(), Some("s1"));
+        assert_eq!(app.posts.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        serve(&mut app, back, &db);
+        assert_eq!(app.shown.as_deref(), Some("b"));
+        // A failure for a post nobody waits on changes nothing but the toast.
+        let stale = StageRequest::PostShow(PostShowArgs { id: "z".into(), version: Some(1) });
+        app.update(Msg::Reply(Reply::Failed(stale, ErrorBody { code: ErrorCode::Other, message: "gone".into(), hint: None, details: None })));
+        assert!(app.shown_cards().is_some() && app.toast.is_some());
+        // s2 loads in full when the user returns to it.
+        app.update(key(KeyCode::Char('J')));
+        let fx = app.update(key(KeyCode::Enter));
+        serve(&mut app, fx, &db);
+        assert_eq!((app.open.as_deref(), app.shown.as_deref()), (Some("s2"), Some("z")));
+        assert!(app.shown_cards().is_some());
+    }
+
+    #[test]
+    fn a_post_reads_plain_before_its_render_and_the_viewport_holds_when_it_lands() {
+        use notes_proto::posts::{DiffFileRender, DiffHunk, DiffLayout, DiffLine, DiffLineKind, PartRender, Span as WireSpan};
+        let mut db = fake();
+        db.md = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n\n");
+        let mut app = booted(&db);
+        app.update(Msg::Resize(100, 15));
+        // Reading post b from its title row, which is the top of the viewport.
+        let top = app.feed().starts[1];
+        assert_eq!((app.scroll, app.cursor), (top, top));
+        // Post a above gets a new version; only the lists come back, its show and render are in flight.
+        db.posts[0].version = 2;
+        let fx = app.update(Msg::Event(Event { seq: 9, kind: "post-updated".into(), path: None, version: Some(2), id: Some("a".into()), session: Some("s1".into()) }));
+        let lists: Vec<_> = fx.into_iter().filter(|e| !matches!(e, Effect::Request(StageRequest::PostShow(_) | StageRequest::PostRender(_)))).collect();
+        serve(&mut app, lists, &db);
+        let patch = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n";
+        let diff = Part::Diff { patch: Some(patch.into()), files: vec![], layout: DiffLayout::default(), id: None };
+        let post = Post { id: "a".into(), session: "s1".into(), title: "a".into(), parts: vec![diff], version: 2, created_at: 0, updated_at: 0 };
+        app.update(Msg::Reply(Reply::Post(post)));
+        let feed = app.feed();
+        assert!(feed.lines.iter().any(|l| l.to_string().contains("+new")), "the patch reads as plain text before its render");
+        let top = feed.starts[1];
+        assert_eq!((app.scroll, app.cursor), (top, top), "post b stays at the top of the viewport");
+        let line = |kind, old, new, text: &str| DiffLine { kind, old_line: old, new_line: new, spans: vec![WireSpan { text: text.into(), class: None }] };
+        let file = DiffFileRender {
+            filename: "f".into(),
+            language: None,
+            added: 1,
+            removed: 1,
+            hunks: vec![DiffHunk { header: "@@ -1 +1 @@".into(), lines: vec![line(DiffLineKind::Removed, Some(1), None, "old"), line(DiffLineKind::Added, None, Some(1), "new")] }],
+        };
+        let render = PostRender { id: "a".into(), version: 2, parts: vec![PartRender::Diff { layout: DiffLayout::default(), files: vec![file] }] };
+        app.update(Msg::Reply(Reply::Render(render)));
+        let feed = app.feed();
+        assert!(feed.lines.iter().any(|l| l.to_string().contains("+1 −1")), "the render's file header replaced the raw patch");
+        assert!(!feed.lines.iter().any(|l| l.to_string().contains("diff --git")));
+        let moved = feed.starts[1];
+        assert_ne!(moved, top, "the rendered diff is shorter than the raw patch, so b moved");
+        assert_eq!((app.scroll, app.cursor), (moved, moved), "b is still at the top of the viewport");
+    }
+
+    #[test]
+    fn a_render_that_fails_leaves_the_plain_cards_up() {
+        let db = fake();
+        let mut app = booted(&db);
+        db_less_version(&mut app, &db);
+        let err = ErrorBody { code: ErrorCode::Other, message: "no highlighter".into(), hint: None, details: None };
+        app.update(Msg::Reply(Reply::Failed(StageRequest::PostRender(PostShowArgs { id: "b".into(), version: Some(3) }), err)));
+        assert!(app.feed().lines.iter().any(|l| l.to_string().contains("hello")), "the post is still readable");
+        assert!(app.toast.as_deref().is_some_and(|t| t.contains("no highlighter")));
+    }
+
+    #[test]
+    fn a_render_lost_to_a_notesd_restart_is_asked_again_when_the_watch_is_back() {
+        let db = fake();
+        let mut app = booted(&db);
+        db_less_version(&mut app, &db);
+        let render = StageRequest::PostRender(PostShowArgs { id: "b".into(), version: Some(3) });
+        let err = ErrorBody { code: ErrorCode::DaemonUnreachable, message: "notesd: refused".into(), hint: None, details: None };
+        app.update(Msg::Reply(Reply::Failed(render.clone(), err)));
+        app.update(Msg::WatchLost);
+        let fx = app.update(Msg::WatchBack);
+        assert!(requests(&fx).contains(&render), "{:?}", requests(&fx));
+        serve(&mut app, fx, &db);
+        assert!(app.loaded[&("b".into(), 3)].render.is_some(), "styled once notesd answers");
+        assert!(!requests(&app.update(Msg::WatchBack)).contains(&render), "asked once, not on every reconnect");
+    }
+
+    /// Post b at version 3 with its post reply landed and its render still in flight.
+    fn db_less_version(app: &mut App, db: &Fake) {
+        let fx = app.update(Msg::Event(Event { seq: 9, kind: "post-updated".into(), path: None, version: Some(3), id: Some("b".into()), session: Some("s1".into()) }));
+        for e in fx {
+            match e {
+                Effect::Request(StageRequest::PostRender(_)) => {}
+                Effect::Request(r) => {
+                    let fx = app.update(Msg::Reply(db.answer(&r)));
+                    serve(app, fx, db);
+                }
+                _ => {}
+            }
+        }
+        assert!(app.feed().lines.iter().any(|l| l.to_string().contains("hello")));
+    }
+
+    #[test]
+    fn a_comment_reply_after_a_session_switch_names_its_own_agent_and_post() {
+        let mut db = fake();
+        db.sessions[1].agent = "codex".into();
+        let mut app = booted(&db);
+        assert_eq!(app.open.as_deref(), Some("s1"));
+        app.mode = Mode::Comment { input: "nit".into() };
+        let send = requests(&app.update(key(KeyCode::Enter)));
+        let fx = app.open_session("s2".into());
+        serve(&mut app, fx, &db);
+        app.update(Msg::Reply(db.answer(&send[0])));
+        let toast = app.toast.clone().unwrap_or_default();
+        assert!(toast.contains("on b") && toast.contains("claude") && !toast.contains("codex"), "{toast}");
     }
 
     #[test]
@@ -1931,6 +2347,27 @@ mod tests {
     }
 
     #[test]
+    fn wheel_accelerates_with_cadence_and_settles() {
+        let mut db = fake();
+        db.md = (0..400).map(|i| format!("line {i}\n\n")).collect();
+        let mut app = booted(&db);
+        app.update(key(KeyCode::Char('g')));
+        let t0 = Instant::now();
+        let tick = |app: &mut App, ms: u64, kind| {
+            let before = app.scroll as isize;
+            app.update(Msg::Wheel(MouseEvent { kind, column: 60, row: 10, modifiers: KeyModifiers::NONE }, t0 + std::time::Duration::from_millis(ms)));
+            app.scroll as isize - before
+        };
+        assert_eq!(tick(&mut app, 0, MouseEventKind::ScrollDown), 1, "a lone notch moves one row");
+        let fast: isize = (1..=20).map(|i| tick(&mut app, i * 10, MouseEventKind::ScrollDown)).sum();
+        assert_eq!(fast, 20 * WHEEL as isize, "a fast spin ramps to the cap");
+        assert_eq!(tick(&mut app, 205, MouseEventKind::ScrollDown), 1, "under 6 ms apart counts as one row");
+        assert_eq!(tick(&mut app, 500, MouseEventKind::ScrollDown), 1, "a pause resets the ramp");
+        assert_eq!(tick(&mut app, 550, MouseEventKind::ScrollDown), 1, "a slow notch stays near one row");
+        assert_eq!(tick(&mut app, 600, MouseEventKind::ScrollUp), -1, "a reversal moves at once");
+    }
+
+    #[test]
     fn wheel_scrolls_and_click_folds() {
         let mut db = fake();
         db.md = (0..80).map(|i| format!("line {i}\n\n")).collect();
@@ -1939,7 +2376,7 @@ mod tests {
         app.update(wheel(MouseEventKind::ScrollUp));
         let top = app.scroll;
         app.update(wheel(MouseEventKind::ScrollDown));
-        assert_eq!(app.scroll, top + WHEEL);
+        assert_eq!(app.scroll, top + 1, "a lone notch moves one row");
         app.update(wheel(MouseEventKind::ScrollUp));
         assert_eq!(app.scroll, top);
         // Motion doesn't redraw.
@@ -1950,7 +2387,7 @@ mod tests {
         let data = serde_json::json!({"a": 1, "b": 2});
         let p = Post { parts: vec![Part::Json { data, id: None }], ..post("b", "s1", 2, "") };
         let r = PostRender { id: "b".into(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
-        app.loaded.get_mut(&key).unwrap().cards = Some(build_cards(&p, &r));
+        app.loaded.get_mut(&key).unwrap().cards = Some(build_cards(&p, Some(&r)));
         app.loaded.get_mut(&key).unwrap().post = Some(p);
         app.views.get_mut(&PostId::from("b")).unwrap().laid = None;
         app.feed = None;
@@ -1981,8 +2418,8 @@ mod tests {
     }
 
     /// Every pane size from 1×1 to 160×50, with real content: drawing never
-    /// panics, no row runs past the pane, and the feed keeps the line under
-    /// the cursor in place across a resize.
+    /// panics, no row runs past the pane, and the feed keeps the cursor's
+    /// source line in place across a resize.
     #[test]
     fn every_size_draws_cleanly_and_keeps_its_place() {
         use ratatui::{backend::TestBackend, Terminal};
@@ -2006,11 +2443,14 @@ mod tests {
         for _ in 0..12 {
             app.update(Msg::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
         }
-        let before = (app.shown.clone(), app.cursor - app.scroll);
+        let cursor = app.cursor;
+        let before = (app.shown.clone(), app.feed().origins[cursor]);
         app.update(Msg::Resize(70, 30));
         let _ = app.feed();
         assert_eq!(app.shown, before.0);
-        assert_eq!(app.cursor - app.scroll, before.1, "the cursor's row on screen survives a rewrap");
+        let cursor = app.cursor;
+        let now = app.feed().origins[cursor];
+        assert_eq!((now.card, now.src), (before.1.card, before.1.src), "the cursor keeps its source line across a rewrap");
     }
 
     #[test]
@@ -2027,7 +2467,7 @@ mod tests {
             ..post("b", "s1", 2, "")
         };
         let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native; 2] };
-        app.loaded.get_mut(&post_key).unwrap().cards = Some(build_cards(&p, &r));
+        app.loaded.get_mut(&post_key).unwrap().cards = Some(build_cards(&p, Some(&r)));
         app.loaded.get_mut(&post_key).unwrap().post = Some(p);
         app.feed = None;
         let b = app.posts.iter().position(|post| post.id == id).unwrap();
@@ -2182,7 +2622,7 @@ mod tests {
         let post_key = (id.clone(), 2);
         let post = Post { parts: vec![Part::Html { html: "<p>hello</p>".into(), kits: vec![], id: None }], ..post("b", "s1", 2, "") };
         let render = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
-        app.loaded.get_mut(&post_key).unwrap().cards = Some(build_cards(&post, &render));
+        app.loaded.get_mut(&post_key).unwrap().cards = Some(build_cards(&post, Some(&render)));
         app.loaded.get_mut(&post_key).unwrap().post = Some(post);
         let visual = (id, 2, 0);
         let narrow = app.target().width_px;
@@ -2241,7 +2681,7 @@ mod tests {
         let html = Part::Html { html: "<p>hello</p>".into(), kits: vec![], id: None };
         let post = Post { parts: vec![html.clone(), html], ..post("b", "s1", 2, "") };
         let render = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native; 2] };
-        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&post, &render));
+        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&post, Some(&render)));
         let narrow = app.target().width_px;
         let keys: Vec<_> = (0..2).map(|card| (id.clone(), 2, card)).collect();
         for (card, key) in keys.iter().enumerate() {
@@ -2266,7 +2706,7 @@ mod tests {
         let post_key = (id.clone(), 2);
         let p = Post { parts: vec![Part::Html { html: "<p>hello</p>".into(), kits: vec![], id: None }], ..post("b", "s1", 2, "") };
         let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
-        app.loaded.get_mut(&post_key).unwrap().cards = Some(build_cards(&p, &r));
+        app.loaded.get_mut(&post_key).unwrap().cards = Some(build_cards(&p, Some(&r)));
         app.loaded.get_mut(&post_key).unwrap().post = Some(p);
         let visual = (id, 2, 0);
         let normal_width = app.target().width_px;
@@ -2309,7 +2749,7 @@ mod tests {
         let post_key = (id.clone(), 2);
         let p = Post { parts: vec![Part::Mermaid { mermaid: "flowchart TD\n A-->B".into(), id: None }], ..post("b", "s1", 2, "") };
         let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
-        app.loaded.get_mut(&post_key).unwrap().cards = Some(build_cards(&p, &r));
+        app.loaded.get_mut(&post_key).unwrap().cards = Some(build_cards(&p, Some(&r)));
         app.loaded.get_mut(&post_key).unwrap().post = Some(p);
         let visual = (id, 2, 0);
         app.visuals.insert(visual.clone(), VisualState::Ready { w: 200, h: 200, max_scale: 1.0 });
@@ -2333,7 +2773,7 @@ mod tests {
         let id = PostId::from("b");
         let p = Post { parts: vec![Part::Mermaid { mermaid: "flowchart TD\n A-->B".into(), id: None }], ..post("b", "s1", 2, "") };
         let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
-        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, &r));
+        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, Some(&r)));
         let visual = (id, 2, 0);
         app.visuals.insert(visual.clone(), VisualState::Ready { w: 360, h: 260, max_scale: 1.0 });
         app.feed = None;
@@ -2353,7 +2793,7 @@ mod tests {
         let id = PostId::from("b");
         let p = Post { parts: vec![Part::Mermaid { mermaid: "flowchart TD\n A-->B".into(), id: None }], ..post("b", "s1", 2, "") };
         let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
-        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, &r));
+        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, Some(&r)));
         let visual = (id, 2, 0);
         app.visuals.insert(visual.clone(), VisualState::Ready { w: 360, h: 260, max_scale: 1.0 });
         app.feed = None;
@@ -2376,7 +2816,7 @@ mod tests {
         let id = PostId::from("b");
         let p = Post { parts: vec![Part::Mermaid { mermaid: "flowchart TD\n A-->B".into(), id: None }], ..post("b", "s1", 2, "") };
         let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
-        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, &r));
+        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, Some(&r)));
         app.visuals.insert((id.clone(), 2, 0), VisualState::Ready { w: 360, h: 260, max_scale: 1.0 });
         app.feed = None;
         let post_index = app.posts.iter().position(|p| p.id == id).unwrap();
@@ -2409,7 +2849,7 @@ mod tests {
         let id = PostId::from("b");
         let p = Post { parts: vec![Part::Html { html: "<p>hi</p>".into(), kits: vec![], id: None }], ..post("b", "s1", 2, "") };
         let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
-        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, &r));
+        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, Some(&r)));
         let narrow = app.target().width_px;
         app.visuals.insert((id.clone(), 2, 0), VisualState::Ready { w: narrow, h: 200, max_scale: 1.0 });
         app.feed = None;
@@ -2445,18 +2885,18 @@ mod tests {
         let fx = app.update(ev("post-updated", "b", 2));
         serve(&mut app, fx, &db);
         assert_eq!(app.builds, builds);
-        // A new version builds once, even when its event repeats.
+        // A new version builds once (plain, then styled), even when its event repeats.
         db.posts[1].version = 3;
         for _ in 0..2 {
             let fx = app.update(ev("post-updated", "b", 3));
             serve(&mut app, fx, &db);
         }
-        assert_eq!(app.builds, builds + 1);
+        assert_eq!(app.builds, builds + 2);
         // Another session's post marks it unread and builds nothing.
         let fx = app.update(Msg::Event(Event { seq: 10, kind: "post-created".into(), path: None, version: Some(1), id: Some("z".into()), session: Some("s2".into()) }));
         serve(&mut app, fx, &db);
         assert!(app.unread.contains("s2"));
-        assert_eq!(app.builds, builds + 1);
+        assert_eq!(app.builds, builds + 2);
     }
 
     fn reported_cols(fx: &[Effect]) -> Option<u16> {
@@ -2561,15 +3001,42 @@ mod tests {
         let mut app = booted(&fake());
         let diagram = |v| Post { parts: vec![Part::Mermaid { mermaid: "graph TD\nA-->B".into(), id: None }], ..post("b", "s1", v, "") };
         let render = |v| PostRender { id: "b".into(), version: v, parts: vec![notes_proto::posts::PartRender::Native] };
-        app.loaded.get_mut(&("b".into(), 2)).unwrap().cards = Some(cards::build_cards(&diagram(2), &render(2)));
+        app.loaded.get_mut(&("b".into(), 2)).unwrap().cards = Some(cards::build_cards(&diagram(2), Some(&render(2))));
         app.visuals.insert(("b".into(), 2, 0), VisualState::Ready { w: 400, h: 1200, max_scale: 1.0 });
-        app.visual_gen += 1;
+        app.feed_gen += 1;
         let shown = app.feed().lines.len();
         app.posts.iter_mut().find(|p| p.id == "b").unwrap().version = 3;
-        let cards = Some(cards::build_cards(&diagram(3), &render(3)));
+        let cards = Some(cards::build_cards(&diagram(3), Some(&render(3))));
         app.loaded.insert(("b".into(), 3), Loaded { post: Some(diagram(3)), render: Some(render(3)), cards });
         app.visuals.insert(("b".into(), 3, 0), VisualState::Pending);
+        app.feed_gen += 1;
         assert_eq!(app.feed().lines.len(), shown);
+    }
+
+    #[test]
+    fn the_feed_shows_each_version_comment_and_post_as_it_changes() {
+        let mut db = fake();
+        let mut app = booted(&db);
+        let shows = |app: &mut App, text: &str| app.feed().lines.iter().any(|l| l.to_string().contains(text));
+        // `v` to an older version, then back to the latest, which is still loaded.
+        for r in requests(&app.update(key(KeyCode::Char('v')))) {
+            let reply = match db.answer(&r) {
+                Reply::Post(p) => Reply::Post(Post { parts: vec![Part::Markdown { markdown: "older text".into(), id: None }], ..p }),
+                reply => reply,
+            };
+            app.update(Msg::Reply(reply));
+        }
+        assert!(shows(&mut app, "older text"));
+        assert!(requests(&app.update(key(KeyCode::Char('v')))).is_empty(), "the latest is still loaded");
+        assert!(!shows(&mut app, "older text") && shows(&mut app, "hello"));
+        let comment = Comment { id: "c1".into(), seq: 1, session: "s1".into(), post: Some("b".into()), author: "claude".into(), text: "nice catch".into(), created_at: 0, anchor: None };
+        app.update(Msg::Reply(Reply::Comments("s1".into(), vec![comment])));
+        assert!(shows(&mut app, "nice catch"));
+        db.posts.push(summary("c", "s1", 1));
+        db.md = "a new post".into();
+        let fx = app.update(post_event("post-created", "c", 1));
+        serve(&mut app, fx, &db);
+        assert!(shows(&mut app, "a new post"));
     }
 
     #[test]
@@ -2665,7 +3132,7 @@ mod tests {
         // With the cursor on one of b's two cards, d deletes that card; with one card, the post.
         let two = Post { parts: vec![Part::Markdown { markdown: "x".into(), id: None }; 2], ..post("b", "s1", 2, "") };
         let r = PostRender { id: "b".into(), version: 2, parts: vec![notes_proto::posts::PartRender::Native; 2] };
-        app.loaded.get_mut(&(PostId::from("b"), 2)).unwrap().cards = Some(build_cards(&two, &r));
+        app.loaded.get_mut(&(PostId::from("b"), 2)).unwrap().cards = Some(build_cards(&two, Some(&r)));
         app.loaded.get_mut(&(PostId::from("b"), 2)).unwrap().post = Some(two);
         app.views.get_mut(&PostId::from("b")).unwrap().laid = None;
         app.feed = None;
@@ -2690,5 +3157,404 @@ mod tests {
         serve(&mut app, fx, &db);
         assert_eq!((app.open.as_deref(), app.shown.as_deref()), (Some("s2"), Some("z")));
         assert_eq!((app.sel, app.posts.len()), (0, 1));
+    }
+
+    fn ctrl(c: char) -> Msg {
+        Msg::Key(KeyEvent { code: KeyCode::Char(c), modifiers: KeyModifiers::CONTROL, kind: KeyEventKind::Press, state: KeyEventState::NONE })
+    }
+
+    /// The text of the line under the cursor.
+    fn row(app: &mut App) -> String {
+        let line = app.cursor;
+        app.feed().lines[line].spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn paragraphs(db: &mut Fake, n: usize) {
+        db.md = (0..n).map(|i| format!("row {i}")).collect::<Vec<_>>().join("\n\n");
+    }
+
+    #[test]
+    fn ctrl_d_and_u_scroll_half_a_page_dragging_the_cursor() {
+        let mut db = fake();
+        paragraphs(&mut db, 120);
+        let mut app = booted(&db);
+        app.update(key(KeyCode::Char('g')));
+        let half = app.page() / 2;
+        assert_eq!((app.scroll, app.cursor), (0, 0));
+        app.update(ctrl('d'));
+        assert_eq!((app.scroll, app.cursor), (half, half), "viewport and cursor move together");
+        app.update(ctrl('d'));
+        assert_eq!(app.scroll, 2 * half);
+        app.update(ctrl('u'));
+        assert_eq!(app.scroll, half);
+        assert!(app.cursor >= app.scroll && app.cursor < app.scroll + app.page(), "cursor stays in view");
+        assert!(matches!(app.mode, Mode::Nav), "ctrl-d is not the delete key");
+    }
+
+    fn diff_post(app: &mut App) {
+        let hunk = |n: u32| DiffHunk {
+            header: format!("@@ -{n} +{n} @@"),
+            lines: (0..12)
+                .map(|i| DiffLine { kind: DiffLineKind::Context, old_line: Some(n + i), new_line: Some(n + i), spans: vec![WireSpan { text: format!("ctx {n} {i}"), class: None }] })
+                .collect(),
+        };
+        let file = DiffFileRender { filename: "a.rs".into(), language: None, added: 0, removed: 0, hunks: vec![hunk(1), hunk(100), hunk(200)] };
+        let mut post = post("b", "s1", 2, "");
+        post.parts = vec![
+            Part::Markdown { markdown: "intro".into(), id: None },
+            Part::Diff { patch: Some("x".into()), files: vec![], layout: DiffLayout::Unified, id: None },
+            Part::Markdown { markdown: "tail\n\n".repeat(40), id: None },
+        ];
+        let render = PostRender {
+            id: "b".into(),
+            version: 2,
+            parts: vec![PartRender::Native, PartRender::Diff { layout: DiffLayout::Unified, files: vec![file] }, PartRender::Native],
+        };
+        app.loaded.get_mut(&("b".into(), 2)).unwrap().cards = Some(cards::build_cards(&post, Some(&render)));
+        app.views.get_mut(&PostId::from("b")).unwrap().laid = None;
+        app.feed = None;
+    }
+
+    #[test]
+    fn brackets_step_hunks_then_cards_and_comma_period_step_cards() {
+        let mut app = booted(&fake());
+        diff_post(&mut app);
+        app.update(key(KeyCode::Char('g')));
+        let at = |app: &mut App| (app.scroll, app.cursor, row(app));
+        for want in ["@@ -1 +1 @@", "@@ -100 +100 @@", "@@ -200 +200 @@"] {
+            app.update(key(KeyCode::Char(']')));
+            let (scroll, cursor, text) = at(&mut app);
+            assert!(text.contains(want), "{text}");
+            assert_eq!(scroll, cursor, "the stop sits at the top of the viewport");
+        }
+        app.update(key(KeyCode::Char(']')));
+        assert!(at(&mut app).2.contains("markdown"), "no hunk ahead falls back to the next card: {}", at(&mut app).2);
+        app.update(key(KeyCode::Char('[')));
+        assert!(at(&mut app).2.contains("@@ -200"), "back to the last hunk");
+        app.update(key(KeyCode::Char('g')));
+        let mut labels = Vec::new();
+        for _ in 0..4 {
+            app.update(key(KeyCode::Char('.')));
+            labels.push(at(&mut app).2);
+        }
+        assert!(labels[0].contains("markdown") && labels[1].contains("markdown") && labels[2].contains("diff") && labels[3].contains("markdown"), "{labels:?}");
+        app.update(key(KeyCode::Char(',')));
+        assert!(at(&mut app).2.contains("diff"));
+        assert_eq!(app.shown.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn search_hit_lands_on_the_matching_line_and_n_steps_matches() {
+        let mut db = fake();
+        db.md = (0..60).map(|i| if i % 20 == 5 { format!("see the Needle {i}") } else { format!("row {i}") }).collect::<Vec<_>>().join("\n\n");
+        let mut app = booted(&db);
+        let hit = SessionHit { session: session("s2", 1), post: Some("z".into()), text: None };
+        app.mode = Mode::Search { query: "needle".into(), hits: vec![hit], sel: 0 };
+        let fx = app.update(key(KeyCode::Enter));
+        serve(&mut app, fx, &db);
+        app.feed();
+        assert_eq!(app.open.as_deref(), Some("s2"));
+        assert_eq!(app.scroll, app.cursor, "the match is the top line");
+        assert!(row(&mut app).contains("Needle 5"), "{}", row(&mut app));
+        assert_eq!(app.toast.as_deref(), Some("match 1/3"));
+        app.update(key(KeyCode::Char('n')));
+        assert!(row(&mut app).contains("Needle 25"));
+        assert_eq!((app.toast.as_deref(), app.scroll), (Some("match 2/3"), app.cursor));
+        app.update(key(KeyCode::Char('n')));
+        app.update(key(KeyCode::Char('n')));
+        assert!(row(&mut app).contains("Needle 5"), "n wraps round");
+        assert_eq!(app.toast.as_deref(), Some("match 1/3"));
+        app.update(key(KeyCode::Char('N')));
+        assert!(row(&mut app).contains("Needle 45"), "N wraps back");
+        assert_eq!(app.toast.as_deref(), Some("match 3/3"));
+        // The matches are lit in the drawn feed, and esc puts them out.
+        let lit = |app: &mut App| {
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            term.draw(|f| ui::draw(f, app)).unwrap();
+            term.backend().buffer().content().iter().filter(|c| c.bg == ui::MATCH).map(|c| c.symbol().to_string()).collect::<String>()
+        };
+        assert_eq!(lit(&mut app), "Needle");
+        app.update(key(KeyCode::Esc));
+        assert_eq!(lit(&mut app), "");
+        app.update(key(KeyCode::Char('n')));
+        assert_eq!(app.toast.as_deref(), Some("no matches"));
+    }
+
+    fn md_post(db: &Fake) -> App {
+        let mut app = booted(db);
+        app.update(Msg::Resize(100, 20));
+        app
+    }
+
+    /// The whole source line behind feed line `at`, whitespace-normalized.
+    fn source_at(app: &mut App, at: usize) -> String {
+        let feed = app.feed();
+        let (post, o) = (feed.hits[at].0, feed.origins[at]);
+        (0..feed.lines.len())
+            .filter(|&i| feed.hits[i].0 == post && (feed.origins[i].card, feed.origins[i].src) == (o.card, o.src))
+            .map(|i| feed.lines[i].to_string())
+            .collect::<String>()
+            .replace(['│', '↪'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn resize_keeps_the_same_source_line_at_the_viewport_top() {
+        let mut db = fake();
+        db.md = (0..40).map(|i| format!("para {i} with plenty of words so that this paragraph wraps differently at every width\n\n")).collect();
+        let mut app = md_post(&db);
+        scroll_to(&mut app, 30);
+        let top = app.scroll;
+        let want = source_at(&mut app, top);
+        assert!(want.starts_with("para "), "{want}");
+        for (w, h) in [(60, 20), (40, 20), (150, 20), (100, 20), (35, 12)] {
+            app.update(Msg::Resize(w, h));
+            app.feed();
+            let top = app.scroll;
+            assert_eq!(source_at(&mut app, top), want, "after resizing to {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn resize_from_a_wrapped_row_stays_in_the_same_paragraph() {
+        let mut db = fake();
+        db.md = (0..20).map(|i| format!("para {i} {}\n\n", "word ".repeat(60))).collect();
+        let mut app = md_post(&db);
+        app.update(Msg::Resize(40, 20));
+        let first = (0..app.feed().lines.len()).find(|&i| app.feed().origins[i].wrap == 2).unwrap();
+        app.scroll = first;
+        app.cursor = first;
+        let want = source_at(&mut app, first);
+        app.update(Msg::Resize(150, 20));
+        app.feed();
+        let top = app.scroll;
+        assert_eq!(source_at(&mut app, top), want);
+    }
+
+    #[test]
+    fn folding_a_card_above_leaves_the_top_line_unchanged() {
+        let mut app = booted(&fake());
+        app.update(Msg::Resize(100, 20));
+        let id = PostId::from("b");
+        let data: serde_json::Value = (0..30).map(|i| (format!("k{i}"), serde_json::json!(i))).collect::<serde_json::Map<_, _>>().into();
+        let p = Post {
+            parts: vec![
+                Part::Json { data, id: None },
+                Part::Markdown { markdown: (0..40).map(|i| format!("para {i}\n\n")).collect(), id: None },
+            ],
+            ..post("b", "s1", 2, "")
+        };
+        let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native; 2] };
+        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, Some(&r)));
+        app.views.get_mut(&id).unwrap().laid = None;
+        app.feed = None;
+        let b = app.posts.iter().position(|post| post.id == id).unwrap();
+        let (node_line, node) = {
+            let feed = app.feed();
+            let line = (feed.starts[b]..feed.lines.len()).find(|&i| matches!(feed.hits[i].1, Hit::Node(..))).unwrap();
+            (line, feed.hits[line].1)
+        };
+        let to = app.feed().starts[b] as isize + 46 - app.scroll as isize;
+        app.scroll(to);
+        let top = app.scroll;
+        assert!(top > node_line + 30, "scrolled past the json card");
+        let want = source_at(&mut app, top);
+        assert!(want.starts_with("para "), "{want:?}");
+        let before = app.feed().lines.len();
+        assert!(app.toggle((Some(b), node)));
+        assert!(app.feed().lines.len() < before - 20, "the fold removed rows above");
+        let top = app.scroll;
+        assert_eq!(source_at(&mut app, top), want);
+    }
+
+    fn scroll_to(app: &mut App, line: usize) {
+        let delta = line as isize - app.scroll as isize;
+        app.scroll(delta);
+    }
+
+    fn bar_text(app: &mut App) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let (w, h) = app.size;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| ui::draw(f, app)).unwrap();
+        let y = ui::geometry(app.size).main.y;
+        let buf = term.backend().buffer();
+        (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>()
+    }
+
+    #[test]
+    fn sticky_title_names_the_post_at_the_top_of_the_viewport_not_the_cursor() {
+        let mut db = fake();
+        db.md = (0..30).map(|i| format!("para {i}\n\n")).collect();
+        let mut app = md_post(&db);
+        let (a, b) = (app.feed().starts[0], app.feed().starts[1]);
+        assert!(bar_text(&mut app).trim().is_empty() || !bar_text(&mut app).contains("a  v1"), "header on screen: nothing sticky");
+        scroll_to(&mut app, a + 20);
+        assert!(app.scroll > a && app.scroll < b);
+        assert!(bar_text(&mut app).contains(" a  v1"), "{}", bar_text(&mut app));
+        // The cursor is in the next post while the viewport top is still in the first.
+        app.cursor = b + 2;
+        assert!(bar_text(&mut app).contains(" a  v1"));
+        scroll_to(&mut app, b + 8);
+        assert!(bar_text(&mut app).contains(" b  v2"), "{}", bar_text(&mut app));
+    }
+
+    #[test]
+    fn sticky_title_adds_the_diff_file_at_the_viewport_top() {
+        use notes_proto::posts::{DiffFileRender, DiffHunk, DiffLayout, DiffLine, DiffLineKind, Span as WireSpan};
+        let mut app = booted(&fake());
+        app.update(Msg::Resize(100, 20));
+        let id = PostId::from("b");
+        let file = |name: &str| DiffFileRender {
+            filename: name.into(),
+            language: None,
+            added: 20,
+            removed: 0,
+            hunks: vec![DiffHunk {
+                header: "@@ -0,0 +1,20 @@".into(),
+                lines: (1..=20)
+                    .map(|n| DiffLine { kind: DiffLineKind::Added, old_line: None, new_line: Some(n), spans: vec![WireSpan { text: format!("line {n}"), class: None }] })
+                    .collect(),
+            }],
+        };
+        let p = Post {
+            parts: vec![Part::Diff { patch: Some("x".into()), files: vec![], layout: DiffLayout::Unified, id: None }],
+            ..post("b", "s1", 2, "")
+        };
+        let r = PostRender {
+            id: id.clone(),
+            version: 2,
+            parts: vec![notes_proto::posts::PartRender::Diff { layout: DiffLayout::Unified, files: vec![file("src/one.rs"), file("src/two.rs")] }],
+        };
+        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, Some(&r)));
+        app.views.get_mut(&id).unwrap().laid = None;
+        app.feed = None;
+        let b = app.posts.iter().position(|post| post.id == id).unwrap();
+        let start = app.feed().starts[b];
+        scroll_to(&mut app, start + 8);
+        assert!(bar_text(&mut app).contains("b › src/one.rs"), "{}", bar_text(&mut app));
+        scroll_to(&mut app, start + 8 + 20);
+        assert!(bar_text(&mut app).contains("b › src/two.rs"), "{}", bar_text(&mut app));
+    }
+
+    #[test]
+    fn a_render_landing_under_the_viewport_top_keeps_the_same_diff_line_there() {
+        let mut app = booted(&fake());
+        app.update(Msg::Resize(100, 20));
+        let id = PostId::from("b");
+        let body = |name: &str| (0..12).map(|i| format!(" {name} {i}")).collect::<Vec<_>>().join("\n");
+        let patch = format!(
+            "diff --git a/one.rs b/one.rs\n--- a/one.rs\n+++ b/one.rs\n@@ -1,12 +1,12 @@\n{}\ndiff --git a/two.rs b/two.rs\n--- a/two.rs\n+++ b/two.rs\n@@ -1,12 +1,12 @@\n{}\n",
+            body("one"),
+            body("two")
+        );
+        let tail = Part::Markdown { markdown: "tail\n\n".repeat(80), id: None };
+        let p = Post { parts: vec![Part::Diff { patch: Some(patch), files: vec![], layout: DiffLayout::Unified, id: None }, tail], ..post("b", "s1", 2, "") };
+        let file = |name: &str| DiffFileRender {
+            filename: format!("{name}.rs"),
+            language: None,
+            added: 0,
+            removed: 0,
+            hunks: vec![DiffHunk {
+                header: "@@ -1,12 +1,12 @@".into(),
+                lines: (0..12)
+                    .map(|i| DiffLine { kind: DiffLineKind::Context, old_line: Some(i + 1), new_line: Some(i + 1), spans: vec![WireSpan { text: format!("{name} {i}"), class: None }] })
+                    .collect(),
+            }],
+        };
+        let render = PostRender { id: id.clone(), version: 2, parts: vec![PartRender::Diff { layout: DiffLayout::Unified, files: vec![file("one"), file("two")] }, PartRender::Native] };
+        app.loaded.insert((id.clone(), 2), Loaded { post: Some(p), render: None, cards: None });
+        app.built((id.clone(), 2));
+        let b = app.posts.iter().position(|post| post.id == id).unwrap();
+        let line = |app: &mut App, text: &str| {
+            let feed = app.feed();
+            (feed.starts[b]..feed.lines.len()).find(|&i| feed.lines[i].to_string().contains(text)).unwrap()
+        };
+        let at = line(&mut app, "two 5");
+        scroll_to(&mut app, at);
+        assert_eq!(app.scroll, at);
+        assert!(bar_text(&mut app).contains("b › two.rs"), "the raw patch names its file: {}", bar_text(&mut app));
+        app.update(Msg::Reply(Reply::Render(render)));
+        app.feed();
+        let top = app.scroll;
+        let row = app.feed().lines[top].to_string();
+        assert!(row.contains(" 6  6   two 5"), "the styled row for the same diff line is at the top: {row}");
+        assert_ne!(top, at, "the styled diff is shorter, so the line moved in the feed");
+        assert!(bar_text(&mut app).contains("b › two.rs"), "{}", bar_text(&mut app));
+    }
+
+    #[test]
+    fn an_updated_post_keeps_the_reader_on_the_same_line_until_and_after_its_new_version_lands() {
+        let mut db = fake();
+        db.md = (0..40).map(|i| format!("para {i}\n\n")).collect();
+        let mut app = md_post(&db);
+        let b = app.posts.iter().position(|p| p.id == "b").unwrap();
+        let start = app.feed().starts[b];
+        scroll_to(&mut app, start + 30);
+        let top = app.scroll;
+        let (want_line, want_src) = (app.feed().lines[top].to_string(), source_at(&mut app, top));
+        assert!(want_src.starts_with("para "), "{want_src}");
+        db.posts[1].version = 3;
+        db.md.push_str("one more para\n\n");
+        let fx = app.update(Msg::Event(Event { seq: 9, kind: "post-updated".into(), path: None, version: Some(3), id: Some("b".into()), session: Some("s1".into()) }));
+        let reqs = requests(&fx);
+        let list = reqs.iter().find(|r| matches!(r, StageRequest::PostList(_))).unwrap();
+        app.update(Msg::Reply(db.answer(list)));
+        app.feed();
+        let top = app.scroll;
+        assert_eq!(app.feed().lines[top].to_string(), want_line, "the old version stays up while the new one loads");
+        let show = reqs.iter().find(|r| matches!(r, StageRequest::PostShow(_))).unwrap();
+        app.update(Msg::Reply(db.answer(show)));
+        app.feed();
+        let top = app.scroll;
+        assert_eq!(source_at(&mut app, top), want_src, "the new version's same line is at the top");
+        assert!(bar_text(&mut app).contains("b  v3"), "{}", bar_text(&mut app));
+    }
+
+    /// Per screen row of the main column: its text and the text drawn on the match color.
+    fn drawn_matches(app: &mut App) -> Vec<(String, String)> {
+        use ratatui::{backend::TestBackend, Terminal};
+        let (w, h) = app.size;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| ui::draw(f, app)).unwrap();
+        let main = ui::geometry(app.size).main;
+        let buf = term.backend().buffer();
+        (main.y + 1..main.y + main.height)
+            .map(|y| {
+                let cells = (main.x..main.x + main.width).map(|x| &buf[(x, y)]);
+                (cells.clone().map(|c| c.symbol()).collect(), cells.filter(|c| c.bg == ui::MATCH).map(|c| c.symbol()).collect())
+            })
+            .collect()
+    }
+
+    /// Every on-screen occurrence of `needle` is lit, and nothing else is.
+    fn assert_lit(app: &mut App, needle: &str) {
+        let rows = drawn_matches(app);
+        assert!(rows.iter().any(|(_, lit)| !lit.is_empty()), "something on screen matches {needle:?}");
+        for (text, lit) in rows {
+            let want: String = text.to_lowercase().match_indices(needle).map(|(at, _)| &text[at..at + needle.len()]).collect();
+            assert_eq!(lit, want, "row {text:?}");
+        }
+    }
+
+    #[test]
+    fn search_highlights_follow_scrolling_the_needle_and_feed_changes() {
+        let mut db = fake();
+        db.md = (0..60).map(|i| if i % 7 == 3 { format!("see the Needle {i}") } else { format!("row {i}") }).collect::<Vec<_>>().join("\n\n");
+        let mut app = md_post(&db);
+        app.needle = crate::search::needle("needle");
+        assert_lit(&mut app, "needle");
+        scroll_to(&mut app, 70);
+        assert_lit(&mut app, "needle");
+        app.needle = crate::search::needle("row 4");
+        assert_lit(&mut app, "row 4");
+        db.posts[0].version = 2;
+        db.md = (0..60).map(|i| format!("again, row {i}")).collect::<Vec<_>>().join("\n\n");
+        let fx = app.update(Msg::Event(Event { seq: 9, kind: "post-updated".into(), path: None, version: Some(2), id: Some("a".into()), session: Some("s1".into()) }));
+        serve(&mut app, fx, &db);
+        assert!(drawn_matches(&mut app).iter().any(|(text, _)| text.contains("again")), "the new version is on screen");
+        assert_lit(&mut app, "row 4");
     }
 }
