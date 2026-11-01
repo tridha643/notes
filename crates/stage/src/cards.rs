@@ -395,6 +395,9 @@ fn diff_lines(files: &[notes_proto::posts::DiffFileRender], bytes: usize) -> Dif
     let mut out = Vec::new();
     let mut hunks = Vec::new();
     let mut starts = Vec::new();
+    // Emphasis runs on the UI thread when a render lands, so a card gets a fixed number
+    // of LCS cells, spent only on rows the row cap keeps.
+    let mut budget = 1 << 20;
     for file in files {
         starts.push((out.len(), sanitize(&file.filename).into_owned()));
         out.push(Line::from(vec![
@@ -406,7 +409,7 @@ fn diff_lines(files: &[notes_proto::posts::DiffFileRender], bytes: usize) -> Dif
             hunks.push(out.len());
             out.push(Line::styled(sanitize(&hunk.header).into_owned(), Style::new().fg(ui::CYAN)));
             let mut body: Vec<Line<'static>> = hunk.lines.iter().map(|l| styled(&l.spans)).collect();
-            emphasize_pairs(&hunk.lines, &mut body);
+            emphasize_pairs(&hunk.lines, &mut body, sanitize::PART_LINES.saturating_sub(out.len()), &mut budget);
             for (l, mut line) in hunk.lines.iter().zip(body) {
                 let (sign, bg) = match l.kind {
                     DiffLineKind::Added => ("+", Some(ui::ADDED_BG)),
@@ -429,8 +432,8 @@ fn diff_lines(files: &[notes_proto::posts::DiffFileRender], bytes: usize) -> Dif
 }
 
 /// Pair each run of removed lines with the added run right after it (line i
-/// with line i) and mark the words that differ.
-fn emphasize_pairs(src: &[notes_proto::posts::DiffLine], body: &mut [Line<'static>]) {
+/// with line i) and mark the words that differ, in the first `rows` rows.
+fn emphasize_pairs(src: &[notes_proto::posts::DiffLine], body: &mut [Line<'static>], rows: usize, budget: &mut usize) {
     let mut i = 0;
     while i < src.len() {
         if src[i].kind != DiffLineKind::Removed {
@@ -447,8 +450,11 @@ fn emphasize_pairs(src: &[notes_proto::posts::DiffLine], body: &mut [Line<'stati
         }
         for k in 0..(added - removed).min(i - added) {
             let (old, new) = (removed + k, added + k);
+            if new >= rows {
+                return;
+            }
             let (old_text, new_text) = (body[old].to_string(), body[new].to_string());
-            if let Some((old_marks, new_marks)) = changed_words(&old_text, &new_text) {
+            if let Some((old_marks, new_marks)) = changed_words(&old_text, &new_text, budget) {
                 mark(&mut body[old], &old_marks, ui::REMOVED_WORD_BG);
                 mark(&mut body[new], &new_marks, ui::ADDED_WORD_BG);
             }
@@ -473,14 +479,17 @@ fn tokens(text: &str) -> Vec<ByteRange> {
 }
 
 /// Byte ranges of the tokens that differ between `old` and `new`, or `None`
-/// when a line is too long to diff cheaply or more than half of either line
-/// changed, where emphasis would only be noise.
-fn changed_words(old: &str, new: &str) -> Option<(Vec<ByteRange>, Vec<ByteRange>)> {
+/// when a line is too long to diff cheaply, its LCS table would overdraw
+/// `budget`, or more than half of either line changed, where emphasis would
+/// only be noise.
+fn changed_words(old: &str, new: &str, budget: &mut usize) -> Option<(Vec<ByteRange>, Vec<ByteRange>)> {
     const MAX_TOKENS: usize = 512;
     let (a, b) = (tokens(old), tokens(new));
-    if a.len() > MAX_TOKENS || b.len() > MAX_TOKENS {
+    let cells = a.len() * b.len();
+    if a.len() > MAX_TOKENS || b.len() > MAX_TOKENS || cells > *budget {
         return None;
     }
+    *budget -= cells;
     // Longest common subsequence of tokens, as a suffix table.
     let mut lcs = vec![vec![0u16; b.len() + 1]; a.len() + 1];
     for i in (0..a.len()).rev() {
@@ -1491,6 +1500,26 @@ mod tests {
         assert_eq!(emphasised(4, ui::ADDED_WORD_BG), "cost");
         let word = laid.lines[4].spans.iter().find(|s| s.content == "cost").unwrap();
         assert_eq!(word.style.fg, ui::class_style(Some("keyword")).fg, "syntax colour survives");
+    }
+
+    #[test]
+    fn word_emphasis_stops_at_the_cards_budget_but_small_pairs_keep_it() {
+        let long = |word: &str| (0..100).map(|i| if i == 50 { word.to_owned() } else { format!("w{i}") }).collect::<Vec<_>>().join(" ");
+        let pair = |n, old: &str, new: &str| [dl(DiffLineKind::Removed, Some(n), None, old), dl(DiffLineKind::Added, None, Some(n), new)];
+        let lines: Vec<DiffLine> = (0..150)
+            .flat_map(|n| [pair(2 * n + 1, &long("old"), &long("new")), pair(2 * n + 2, "a = price;", "a = cost;")])
+            .flatten()
+            .collect();
+        let (_, PartRender::Diff { files, .. }) = diff_part(lines) else { unreachable!() };
+        let diff = diff_lines(&files, 0);
+        let marked = |row: &Line| row.spans.iter().any(|s| s.style.bg == Some(ui::ADDED_WORD_BG));
+        let added: Vec<&Line> = diff.lines.iter().filter(|l| l.to_string().contains(" + ")).collect();
+        let (big, small): (Vec<&Line>, Vec<&Line>) = added.into_iter().partition(|l| l.to_string().contains("w0"));
+        assert!(small.len() > 20, "{} small pairs kept", small.len());
+        assert!(small.iter().all(|l| marked(l)), "every small pair is emphasised");
+        let big_marked = big.iter().filter(|l| marked(l)).count();
+        assert!(big_marked > 0 && big_marked < big.len(), "{big_marked} of {} long pairs", big.len());
+        assert!(big.iter().skip_while(|l| marked(l)).all(|l| !marked(l)), "emphasis stops for good once spent");
     }
 
     #[test]
