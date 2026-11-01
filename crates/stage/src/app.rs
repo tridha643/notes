@@ -252,6 +252,8 @@ pub struct View {
     pub folds: Folds,
     /// A version picked with `v`; `None` follows the latest.
     pub pinned: Option<u64>,
+    /// The newest version that has cards, shown until the latest has them too.
+    built: Option<u64>,
     laid: Option<(LaidKey, u64, Laid)>,
     fold_gen: u64,
 }
@@ -803,8 +805,15 @@ impl App {
         Some((post, file))
     }
 
-    /// The version shown for a listed post: the pinned one, else its latest.
+    /// The version shown for a listed post: the pinned one, else its latest, or while
+    /// the latest has no cards yet the newest one that has, so an update never drops
+    /// the post to "loading…" under the reader.
     pub fn listed_version(&self, p: &PostSummary) -> u64 {
+        self.views.get(&p.id).and_then(|v| v.pinned.or(v.built.filter(|b| *b < p.version))).unwrap_or(p.version)
+    }
+
+    /// The version a listed post should have loaded: the pinned one, else its latest.
+    fn wanted_version(&self, p: &PostSummary) -> u64 {
         self.views.get(&p.id).and_then(|v| v.pinned).unwrap_or(p.version)
     }
 
@@ -812,7 +821,7 @@ impl App {
         self.unseen.remove(&id);
         self.shown = Some(id.clone());
         self.views.entry(id.clone()).or_default();
-        match self.version_of(&id) {
+        match self.posts.iter().find(|p| p.id == id).map(|p| self.wanted_version(p)) {
             Some(v) => self.load(id, v),
             None => vec![],
         }
@@ -857,6 +866,10 @@ impl App {
             if let (Some(post), None) = (&l.post, &l.cards) {
                 l.cards = Some(build_cards(post, l.render.as_ref()));
                 self.builds += 1;
+            }
+            if l.cards.is_some() {
+                let view = self.views.entry(key.0.clone()).or_default();
+                view.built = view.built.max(Some(key.1));
             }
         }
         // A new version without the focused part: nothing left to focus on.
@@ -1883,7 +1896,7 @@ impl App {
                     self.shown.clone().or(last)
                 };
                 // The feed shows every post, so load them all.
-                let versions: Vec<_> = self.posts.iter().map(|p| (p.id.clone(), self.listed_version(p))).collect();
+                let versions: Vec<_> = self.posts.iter().map(|p| (p.id.clone(), self.wanted_version(p))).collect();
                 for (id, v) in versions {
                     fx.extend(self.load(id, v));
                 }
@@ -3463,5 +3476,33 @@ mod tests {
         assert!(row.contains(" 6  6   two 5"), "the styled row for the same diff line is at the top: {row}");
         assert_ne!(top, at, "the styled diff is shorter, so the line moved in the feed");
         assert!(bar_text(&mut app).contains("b › two.rs"), "{}", bar_text(&mut app));
+    }
+
+    #[test]
+    fn an_updated_post_keeps_the_reader_on_the_same_line_until_and_after_its_new_version_lands() {
+        let mut db = fake();
+        db.md = (0..40).map(|i| format!("para {i}\n\n")).collect();
+        let mut app = md_post(&db);
+        let b = app.posts.iter().position(|p| p.id == "b").unwrap();
+        let start = app.feed().starts[b];
+        scroll_to(&mut app, start + 30);
+        let top = app.scroll;
+        let (want_line, want_src) = (app.feed().lines[top].to_string(), source_at(&mut app, top));
+        assert!(want_src.starts_with("para "), "{want_src}");
+        db.posts[1].version = 3;
+        db.md.push_str("one more para\n\n");
+        let fx = app.update(Msg::Event(Event { seq: 9, kind: "post-updated".into(), path: None, version: Some(3), id: Some("b".into()), session: Some("s1".into()) }));
+        let reqs = requests(&fx);
+        let list = reqs.iter().find(|r| matches!(r, StageRequest::PostList(_))).unwrap();
+        app.update(Msg::Reply(db.answer(list)));
+        app.feed();
+        let top = app.scroll;
+        assert_eq!(app.feed().lines[top].to_string(), want_line, "the old version stays up while the new one loads");
+        let show = reqs.iter().find(|r| matches!(r, StageRequest::PostShow(_))).unwrap();
+        app.update(Msg::Reply(db.answer(show)));
+        app.feed();
+        let top = app.scroll;
+        assert_eq!(source_at(&mut app, top), want_src, "the new version's same line is at the top");
+        assert!(bar_text(&mut app).contains("b  v3"), "{}", bar_text(&mut app));
     }
 }
