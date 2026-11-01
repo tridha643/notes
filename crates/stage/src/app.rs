@@ -1873,8 +1873,10 @@ impl App {
                 }
             }
             Reply::Commented(c) => {
-                let agent = self.open.as_ref().and_then(|id| self.sessions.iter().find(|s| &s.id == id)).map_or("the agent".into(), |s| s.agent.clone());
-                let on = c.post.as_ref().and_then(|p| self.posts.iter().find(|x| &x.id == p)).map_or(String::new(), |p| format!(" on {}", p.title));
+                // Named from the comment, since the user may have opened another session by now.
+                let agent = self.sessions.iter().find(|s| s.id == c.session).map_or("the agent".into(), |s| s.agent.clone());
+                let post = c.post.as_ref().and_then(|p| self.loaded.iter().filter(|((id, _), _)| id == p).filter_map(|(_, l)| l.post.as_ref()).max_by_key(|p| p.version));
+                let on = post.map_or(String::new(), |p| format!(" on {}", p.title));
                 self.toast = Some(format!("sent{on} · {agent} sees it with its next post or wait"));
             }
             Reply::Failed(req, e) => {
@@ -2215,6 +2217,21 @@ mod tests {
             }
         }
         assert!(app.feed().lines.iter().any(|l| l.to_string().contains("hello")));
+    }
+
+    #[test]
+    fn a_comment_reply_after_a_session_switch_names_its_own_agent_and_post() {
+        let mut db = fake();
+        db.sessions[1].agent = "codex".into();
+        let mut app = booted(&db);
+        assert_eq!(app.open.as_deref(), Some("s1"));
+        app.mode = Mode::Comment { input: "nit".into() };
+        let send = requests(&app.update(key(KeyCode::Enter)));
+        let fx = app.open_session("s2".into());
+        serve(&mut app, fx, &db);
+        app.update(Msg::Reply(db.answer(&send[0])));
+        let toast = app.toast.clone().unwrap_or_default();
+        assert!(toast.contains("on b") && toast.contains("claude") && !toast.contains("codex"), "{toast}");
     }
 
     #[test]
