@@ -18,10 +18,24 @@ use notes_proto::{
     to_line, Event, Request, Response, Verb, PROTOCOL_VERSION,
 };
 use stage::{
-    app::{App, Msg},
+    app::{App, Effect, Msg},
     client::{StageClient, Watch},
-    perform, pump,
 };
+
+/// Answer the app's requests in order, as the request worker does, until none are left.
+fn settle(app: &mut App, client: &mut StageClient, fx: Vec<Effect>) {
+    let mut queue: std::collections::VecDeque<Effect> = fx.into();
+    while let Some(e) = queue.pop_front() {
+        if let Effect::Request(r) = e {
+            queue.extend(app.update(Msg::Reply(client.perform(&r))));
+        }
+    }
+}
+
+fn pump(app: &mut App, client: &mut StageClient, msg: Msg) {
+    let fx = app.update(msg);
+    settle(app, client, fx);
+}
 
 struct Notesd {
     dir: PathBuf,
@@ -107,10 +121,10 @@ fn bootstrap_and_live_updates_build_each_version_once() {
     let mut client = StageClient::new(d.sock());
     let mut app = App::new(None);
     let start = app.start();
-    perform(&mut app, &mut client, start);
+    settle(&mut app, &mut client, start);
     assert_eq!(app.open.as_ref(), Some(&session));
     assert_eq!(app.posts.len(), 2);
-    assert_eq!(app.builds, 2, "the feed builds every post once");
+    assert_eq!(app.builds, 4, "the feed builds every post once plain, once styled");
 
     // A new version of the shown post, then a third post: each built once.
     let two = app.shown.clone().unwrap();
@@ -122,7 +136,7 @@ fn bootstrap_and_live_updates_build_each_version_once() {
     assert_eq!(app.posts.len(), 3);
     assert_eq!(app.shown.as_ref().map(|p| p.as_str()), app.posts.last().map(|p| p.id.as_str()));
     let keys: Vec<_> = app.loaded.keys().cloned().collect();
-    assert_eq!(app.builds, keys.len(), "{keys:?}");
+    assert_eq!(app.builds, 2 * keys.len(), "{keys:?}");
     // Replaying the same events changes nothing.
     let builds = app.builds;
     let mut again = Watch::open(&d.sock(), Some(0)).unwrap();
@@ -157,7 +171,7 @@ fn stage_never_consumes_the_agents_feedback() {
     let mut client = StageClient::new(d.sock());
     let mut app = App::new(Some(p.session.clone()));
     let start = app.start();
-    perform(&mut app, &mut client, start);
+    settle(&mut app, &mut client, start);
     // The user comments through stage, then stage refreshes comments (as it
     // does on every comment event).
     client
@@ -165,7 +179,7 @@ fn stage_never_consumes_the_agents_feedback() {
         .unwrap();
     client.comment_list(p.session.clone()).unwrap();
     let again = app.start();
-    perform(&mut app, &mut client, again);
+    settle(&mut app, &mut client, again);
     // The agent's next write still carries the comment as feedback.
     let next = d.post(Some(&p.session), "fixed");
     assert_eq!(next.feedback.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["nit"]);
@@ -183,7 +197,7 @@ fn search_finds_sessions_by_title_and_content() {
     // The app's `/` flow opens it.
     let mut app = App::new(None);
     let start = app.start();
-    perform(&mut app, &mut client, start);
+    settle(&mut app, &mut client, start);
     for c in "/walrus".chars() {
         pump(&mut app, &mut client, Msg::Key(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char(c))));
     }

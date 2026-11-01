@@ -103,11 +103,12 @@ impl FoldTree {
     }
 }
 
-pub fn build_cards(post: &Post, render: &PostRender) -> Vec<Card> {
+/// Cards for a post; without its render, code, diff and terminal parts are plain text.
+pub fn build_cards(post: &Post, render: Option<&PostRender>) -> Vec<Card> {
     post.parts
         .iter()
         .enumerate()
-        .map(|(i, part)| card(part, render.parts.get(i)))
+        .map(|(i, part)| card(part, render.and_then(|r| r.parts.get(i))))
         .collect()
 }
 
@@ -933,7 +934,7 @@ mod tests {
     fn golden(part: Part, render: PartRender) -> String {
         let p = post(vec![part]);
         let r = PostRender { id: "p1".into(), version: 1, parts: vec![render] };
-        let laid = layout(&build_cards(&p, &r), &[], 40, &Folds::new(), &|_| Fit::Pending { rows: 1 }, None);
+        let laid = layout(&build_cards(&p, Some(&r)), &[], 40, &Folds::new(), &|_| Fit::Pending { rows: 1 }, None);
         let height = laid.lines.len() as u16;
         let mut term = Terminal::new(TestBackend::new(40, height)).unwrap();
         term.draw(|f| f.render_widget(Paragraph::new(laid.lines.clone()), f.area())).unwrap();
@@ -975,7 +976,7 @@ mod tests {
                 Part::Markdown { markdown: "first".into(), id: None },
                 Part::Markdown { markdown: "second".into(), id: None },
             ]),
-            &PostRender { id: "p1".into(), version: 1, parts: vec![PartRender::Native; 2] },
+            Some(&PostRender { id: "p1".into(), version: 1, parts: vec![PartRender::Native; 2] }),
         );
         let laid = layout(&cards, &[], 70, &Folds::new(), &|_| Fit::Pending { rows: 1 }, Some(1));
         assert!(laid.lines.iter().any(|line| line.to_string().contains("second")));
@@ -1067,7 +1068,7 @@ mod tests {
                 }],
             }],
         };
-        let laid = layout(&build_cards(&post(vec![part]), &PostRender { id: "p1".into(), version: 1, parts: vec![render] }), &[], 40, &Folds::new(), &|_| Fit::Pending { rows: 1 }, None);
+        let laid = layout(&build_cards(&post(vec![part]), Some(&PostRender { id: "p1".into(), version: 1, parts: vec![render] })), &[], 40, &Folds::new(), &|_| Fit::Pending { rows: 1 }, None);
         let row = &laid.lines[3];
         let pad = &row.spans[row.spans.len() - 2];
         assert_eq!(pad.style.bg, Some(ui::ADDED_BG));
@@ -1115,7 +1116,7 @@ mod tests {
     fn visuals_reserve_rows_or_fall_back() {
         let cards = build_cards(
             &post(vec![Part::Mermaid { mermaid: "graph TD\nA-->B".into(), id: None }]),
-            &PostRender { id: "p1".into(), version: 1, parts: vec![PartRender::Native] },
+            Some(&PostRender { id: "p1".into(), version: 1, parts: vec![PartRender::Native] }),
         );
         let lay = |fit: Fit| layout(&cards, &[], 40, &Folds::new(), &move |_| fit.clone(), None);
         let pending = lay(Fit::Pending { rows: 4 });

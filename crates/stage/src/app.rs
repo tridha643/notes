@@ -35,9 +35,9 @@ pub struct Feed {
     day: (i32, i32),
 }
 
-/// Everything the feed reads: per post (id, version, fold generation, built),
+/// Everything the feed reads: per post (id, version, fold generation, built, styled),
 /// width, page height, cell px, and the comment and visual generations.
-type FeedKey = (Vec<(PostId, u64, u64, bool)>, u16, u16, (u16, u16), u64, u64, Option<(PostId, usize)>);
+type FeedKey = (Vec<(PostId, u64, u64, bool, bool)>, u16, u16, (u16, u16), u64, u64, Option<(PostId, usize)>);
 
 /// One visual card: (post, version, card index).
 pub type VisualKey = (PostId, u64, usize);
@@ -196,8 +196,9 @@ pub struct Loaded {
     pub cards: Option<Vec<Card>>,
 }
 
-/// Everything a layout reads: version, width, height, cell px, comment, fold and visual generations.
-type LaidKey = (u64, u16, u16, (u16, u16), u64, u64, u64, Option<usize>);
+/// Everything a layout reads: version, width, height, cell px, comment, fold and visual
+/// generations, the selected card, and whether the cards are styled yet.
+type LaidKey = (u64, u16, u16, (u16, u16), u64, u64, u64, Option<usize>, bool);
 
 /// Per post: folds, a pinned version, and the post's own layout cache.
 #[derive(Default)]
@@ -241,7 +242,7 @@ pub struct App {
     /// Posts that entered the sidebar since the last paint, for the latency log.
     pub fresh: Vec<(PostId, u64)>,
     seen_rows: HashSet<(PostId, u64)>,
-    /// Card builds, one per (post, version); tests assert there are no repeats.
+    /// Card builds, plain then styled per (post, version); tests assert there are no repeats.
     pub builds: usize,
     /// Bumped on every comment-list reply, so the layout cache sees new comments.
     comments_gen: u64,
@@ -713,10 +714,12 @@ impl App {
         self.comments.iter().filter(|c| c.post.as_ref() == Some(id)).cloned().collect()
     }
 
+    /// Cards from what has arrived: plain text from the post alone, so it reads at
+    /// once, then styled when its render lands (`Reply::Render` drops the plain ones).
     fn built(&mut self, key: (PostId, u64)) {
         if let Some(l) = self.loaded.get_mut(&key) {
-            if let (Some(post), Some(render), None) = (&l.post, &l.render, &l.cards) {
-                l.cards = Some(build_cards(post, render));
+            if let (Some(post), None) = (&l.post, &l.cards) {
+                l.cards = Some(build_cards(post, l.render.as_ref()));
                 self.builds += 1;
             }
         }
@@ -733,11 +736,13 @@ impl App {
     /// One post laid out at `width`, memoized in its view on everything it reads.
     fn post_laid(&mut self, id: &PostId, version: u64, width: u16, page: u16) -> Option<&Laid> {
         let comments = self.comments_on(id);
-        let cards = self.loaded.get(&(id.clone(), version))?.cards.as_ref()?;
+        let loaded = self.loaded.get(&(id.clone(), version))?;
+        let cards = loaded.cards.as_ref()?;
+        let styled = loaded.render.is_some();
         let (cell, visuals) = (self.cell_px, &self.visuals);
         let view = self.views.entry(id.clone()).or_default();
         let selected = self.focused_card.as_ref().filter(|(post, _)| post == id).map(|(_, card)| *card);
-        let key = (version, width, page, cell, self.comments_gen, view.fold_gen, self.visual_gen, selected);
+        let key = (version, width, page, cell, self.comments_gen, view.fold_gen, self.visual_gen, selected, styled);
         if view.laid.as_ref().is_none_or(|(k, _)| *k != key) {
             let inner = width.saturating_sub(4).max(1);
             let rows = if selected.is_some() { page.saturating_sub(3) } else { page / 2 };
@@ -773,14 +778,14 @@ impl App {
     pub fn feed(&mut self) -> &Feed {
         let width = ui::geometry_for(self).main.width.saturating_sub(1);
         let page = self.page() as u16;
-        let posts: Vec<(PostId, u64, u64, bool)> = self
+        let posts: Vec<(PostId, u64, u64, bool, bool)> = self
             .posts
             .iter()
             .map(|p| {
                 let v = self.listed_version(p);
                 let fold_gen = self.views.get(&p.id).map_or(0, |v| v.fold_gen);
-                let built = self.loaded.get(&(p.id.clone(), v)).is_some_and(|l| l.cards.is_some());
-                (p.id.clone(), v, fold_gen, built)
+                let (built, styled) = self.loaded.get(&(p.id.clone(), v)).map_or((false, false), |l| (l.cards.is_some(), l.render.is_some()));
+                (p.id.clone(), v, fold_gen, built, styled)
             })
             .collect();
         let key: FeedKey = (posts.clone(), width, page, self.cell_px, self.comments_gen, self.visual_gen, self.focused_card.clone());
@@ -798,7 +803,7 @@ impl App {
                 Some((k, f)) if f.day == today && k.0.len() < posts.len() && posts.starts_with(&k.0) && (k.1, k.2, k.3, k.4, k.5, &k.6) == (key.1, key.2, key.3, key.4, key.5, &key.6) => (k.0.len(), f),
                 _ => (0, Feed { day: today, ..Feed::default() }),
             };
-            for (i, (id, version, _, _)) in posts.iter().enumerate().skip(from) {
+            for (i, (id, version, ..)) in posts.iter().enumerate().skip(from) {
                 feed.starts.push(feed.lines.len());
                 if self.focused_card.as_ref().is_some_and(|(post, _)| post != id) {
                     continue;
@@ -1695,6 +1700,7 @@ impl App {
                 let key = (render.id.clone(), render.version);
                 if let Some(l) = self.loaded.get_mut(&key) {
                     l.render = Some(render);
+                    l.cards = None;
                 }
                 self.built(key);
             }
@@ -1712,7 +1718,14 @@ impl App {
             Reply::Failed(req, e) => {
                 if let StageRequest::PostShow(a) | StageRequest::PostRender(a) = &req {
                     if let Some(v) = a.version {
-                        self.loaded.remove(&(a.id.clone(), v));
+                        // A render that failed after its post arrived would fail again on a
+                        // retry (the daemon could not render it), so the plain cards stay up
+                        // instead of the post dropping back to "loading…".
+                        let key = (a.id.clone(), v);
+                        let plain = matches!(req, StageRequest::PostRender(_)) && self.loaded.get(&key).is_some_and(|l| l.post.is_some());
+                        if !plain {
+                            self.loaded.remove(&key);
+                        }
                     }
                 }
                 self.banner = (e.code == ErrorCode::DaemonUnreachable).then(|| "notesd is unreachable".into());
@@ -1861,7 +1874,7 @@ mod tests {
         let mut post = post("b", "s1", 2, "");
         post.parts = (0..8).map(|i| Part::Mermaid { mermaid: format!("graph TD\nA{i}-->B"), id: None }).collect();
         let render = PostRender { id: "b".into(), version: 2, parts: vec![notes_proto::posts::PartRender::Native; 8] };
-        app.loaded.get_mut(&("b".into(), 2)).unwrap().cards = Some(cards::build_cards(&post, &render));
+        app.loaded.get_mut(&("b".into(), 2)).unwrap().cards = Some(cards::build_cards(&post, Some(&render)));
         app.views.get_mut(&PostId::from("b")).unwrap().laid = None;
         app.feed = None;
         // As `main` does: update, draw, then ask for what the drawn feed shows.
@@ -1901,7 +1914,7 @@ mod tests {
             Part::Html { html: "<p>page</p>".into(), kits: vec![], id: None },
         ];
         let render = PostRender { id: "b".into(), version: 2, parts: vec![notes_proto::posts::PartRender::Native; 2] };
-        app.loaded.get_mut(&("b".into(), 2)).unwrap().cards = Some(cards::build_cards(&post, &render));
+        app.loaded.get_mut(&("b".into(), 2)).unwrap().cards = Some(cards::build_cards(&post, Some(&render)));
         for card in 0..2 {
             app.update(Msg::VisualReady { key: ("b".into(), 2, card), w: 700, h: 879, max_scale: 1.0 });
         }
@@ -1920,6 +1933,108 @@ mod tests {
         assert_eq!(app.shown.as_deref(), Some("b"));
         assert_eq!(app.sel, 0);
         assert!(app.shown_cards().is_some());
+    }
+
+    #[test]
+    fn keys_between_a_request_and_its_reply_are_handled_and_the_reply_still_lands() {
+        let db = fake();
+        let mut app = booted(&db);
+        app.feed(); // the first draw lays the feed out before any key arrives
+        // Open s2; its replies are held, as the request worker holds them while notesd is slow.
+        app.update(key(KeyCode::Char('J')));
+        let held = requests(&app.update(key(KeyCode::Enter)));
+        assert!(held.contains(&StageRequest::PostList("s2".into())), "{held:?}");
+        // Keys keep working meanwhile: back to s1, then down a line.
+        app.update(key(KeyCode::Char('K')));
+        let back = app.update(key(KeyCode::Enter));
+        assert_eq!(app.update(key(KeyCode::Down)), [Effect::Redraw]);
+        assert_eq!(app.open.as_deref(), Some("s1"));
+        // s2's late replies are for a session the user left: s1 stays as it is.
+        for r in &held {
+            app.update(Msg::Reply(db.answer(r)));
+        }
+        assert_eq!(app.open.as_deref(), Some("s1"));
+        assert_eq!(app.posts.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        serve(&mut app, back, &db);
+        assert_eq!(app.shown.as_deref(), Some("b"));
+        // A failure for a post nobody waits on changes nothing but the toast.
+        let stale = StageRequest::PostShow(PostShowArgs { id: "z".into(), version: Some(1) });
+        app.update(Msg::Reply(Reply::Failed(stale, ErrorBody { code: ErrorCode::Other, message: "gone".into(), hint: None, details: None })));
+        assert!(app.shown_cards().is_some() && app.toast.is_some());
+        // s2 loads in full when the user returns to it.
+        app.update(key(KeyCode::Char('J')));
+        let fx = app.update(key(KeyCode::Enter));
+        serve(&mut app, fx, &db);
+        assert_eq!((app.open.as_deref(), app.shown.as_deref()), (Some("s2"), Some("z")));
+        assert!(app.shown_cards().is_some());
+    }
+
+    #[test]
+    fn a_post_reads_plain_before_its_render_and_the_viewport_holds_when_it_lands() {
+        use notes_proto::posts::{DiffFileRender, DiffHunk, DiffLayout, DiffLine, DiffLineKind, PartRender, Span as WireSpan};
+        let mut db = fake();
+        db.md = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n\n");
+        let mut app = booted(&db);
+        app.update(Msg::Resize(100, 15));
+        // Reading post b from its title row, which is the top of the viewport.
+        let top = app.feed().starts[1];
+        assert_eq!((app.scroll, app.cursor), (top, top));
+        // Post a above gets a new version; only the lists come back, its show and render are in flight.
+        db.posts[0].version = 2;
+        let fx = app.update(Msg::Event(Event { seq: 9, kind: "post-updated".into(), path: None, version: Some(2), id: Some("a".into()), session: Some("s1".into()) }));
+        let lists: Vec<_> = fx.into_iter().filter(|e| !matches!(e, Effect::Request(StageRequest::PostShow(_) | StageRequest::PostRender(_)))).collect();
+        serve(&mut app, lists, &db);
+        let patch = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n";
+        let diff = Part::Diff { patch: Some(patch.into()), files: vec![], layout: DiffLayout::default(), id: None };
+        let post = Post { id: "a".into(), session: "s1".into(), title: "a".into(), parts: vec![diff], version: 2, created_at: 0, updated_at: 0 };
+        app.update(Msg::Reply(Reply::Post(post)));
+        let feed = app.feed();
+        assert!(feed.lines.iter().any(|l| l.to_string().contains("+new")), "the patch reads as plain text before its render");
+        let top = feed.starts[1];
+        assert_eq!((app.scroll, app.cursor), (top, top), "post b stays at the top of the viewport");
+        let line = |kind, old, new, text: &str| DiffLine { kind, old_line: old, new_line: new, spans: vec![WireSpan { text: text.into(), class: None }] };
+        let file = DiffFileRender {
+            filename: "f".into(),
+            language: None,
+            added: 1,
+            removed: 1,
+            hunks: vec![DiffHunk { header: "@@ -1 +1 @@".into(), lines: vec![line(DiffLineKind::Removed, Some(1), None, "old"), line(DiffLineKind::Added, None, Some(1), "new")] }],
+        };
+        let render = PostRender { id: "a".into(), version: 2, parts: vec![PartRender::Diff { layout: DiffLayout::default(), files: vec![file] }] };
+        app.update(Msg::Reply(Reply::Render(render)));
+        let feed = app.feed();
+        assert!(feed.lines.iter().any(|l| l.to_string().contains("+1 −1")), "the render's file header replaced the raw patch");
+        assert!(!feed.lines.iter().any(|l| l.to_string().contains("diff --git")));
+        let moved = feed.starts[1];
+        assert_ne!(moved, top, "the rendered diff is shorter than the raw patch, so b moved");
+        assert_eq!((app.scroll, app.cursor), (moved, moved), "b is still at the top of the viewport");
+    }
+
+    #[test]
+    fn a_render_that_fails_leaves_the_plain_cards_up() {
+        let db = fake();
+        let mut app = booted(&db);
+        db_less_version(&mut app, &db);
+        let err = ErrorBody { code: ErrorCode::Other, message: "no highlighter".into(), hint: None, details: None };
+        app.update(Msg::Reply(Reply::Failed(StageRequest::PostRender(PostShowArgs { id: "b".into(), version: Some(3) }), err)));
+        assert!(app.feed().lines.iter().any(|l| l.to_string().contains("hello")), "the post is still readable");
+        assert!(app.toast.as_deref().is_some_and(|t| t.contains("no highlighter")));
+    }
+
+    /// Post b at version 3 with its post reply landed and its render still in flight.
+    fn db_less_version(app: &mut App, db: &Fake) {
+        let fx = app.update(Msg::Event(Event { seq: 9, kind: "post-updated".into(), path: None, version: Some(3), id: Some("b".into()), session: Some("s1".into()) }));
+        for e in fx {
+            match e {
+                Effect::Request(StageRequest::PostRender(_)) => {}
+                Effect::Request(r) => {
+                    let fx = app.update(Msg::Reply(db.answer(&r)));
+                    serve(app, fx, db);
+                }
+                _ => {}
+            }
+        }
+        assert!(app.feed().lines.iter().any(|l| l.to_string().contains("hello")));
     }
 
     #[test]
@@ -2014,7 +2129,7 @@ mod tests {
         let data = serde_json::json!({"a": 1, "b": 2});
         let p = Post { parts: vec![Part::Json { data, id: None }], ..post("b", "s1", 2, "") };
         let r = PostRender { id: "b".into(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
-        app.loaded.get_mut(&key).unwrap().cards = Some(build_cards(&p, &r));
+        app.loaded.get_mut(&key).unwrap().cards = Some(build_cards(&p, Some(&r)));
         app.loaded.get_mut(&key).unwrap().post = Some(p);
         app.views.get_mut(&PostId::from("b")).unwrap().laid = None;
         app.feed = None;
@@ -2091,7 +2206,7 @@ mod tests {
             ..post("b", "s1", 2, "")
         };
         let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native; 2] };
-        app.loaded.get_mut(&post_key).unwrap().cards = Some(build_cards(&p, &r));
+        app.loaded.get_mut(&post_key).unwrap().cards = Some(build_cards(&p, Some(&r)));
         app.loaded.get_mut(&post_key).unwrap().post = Some(p);
         app.feed = None;
         let b = app.posts.iter().position(|post| post.id == id).unwrap();
@@ -2246,7 +2361,7 @@ mod tests {
         let post_key = (id.clone(), 2);
         let post = Post { parts: vec![Part::Html { html: "<p>hello</p>".into(), kits: vec![], id: None }], ..post("b", "s1", 2, "") };
         let render = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
-        app.loaded.get_mut(&post_key).unwrap().cards = Some(build_cards(&post, &render));
+        app.loaded.get_mut(&post_key).unwrap().cards = Some(build_cards(&post, Some(&render)));
         app.loaded.get_mut(&post_key).unwrap().post = Some(post);
         let visual = (id, 2, 0);
         let narrow = app.target().width_px;
@@ -2305,7 +2420,7 @@ mod tests {
         let html = Part::Html { html: "<p>hello</p>".into(), kits: vec![], id: None };
         let post = Post { parts: vec![html.clone(), html], ..post("b", "s1", 2, "") };
         let render = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native; 2] };
-        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&post, &render));
+        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&post, Some(&render)));
         let narrow = app.target().width_px;
         let keys: Vec<_> = (0..2).map(|card| (id.clone(), 2, card)).collect();
         for (card, key) in keys.iter().enumerate() {
@@ -2330,7 +2445,7 @@ mod tests {
         let post_key = (id.clone(), 2);
         let p = Post { parts: vec![Part::Html { html: "<p>hello</p>".into(), kits: vec![], id: None }], ..post("b", "s1", 2, "") };
         let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
-        app.loaded.get_mut(&post_key).unwrap().cards = Some(build_cards(&p, &r));
+        app.loaded.get_mut(&post_key).unwrap().cards = Some(build_cards(&p, Some(&r)));
         app.loaded.get_mut(&post_key).unwrap().post = Some(p);
         let visual = (id, 2, 0);
         let normal_width = app.target().width_px;
@@ -2373,7 +2488,7 @@ mod tests {
         let post_key = (id.clone(), 2);
         let p = Post { parts: vec![Part::Mermaid { mermaid: "flowchart TD\n A-->B".into(), id: None }], ..post("b", "s1", 2, "") };
         let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
-        app.loaded.get_mut(&post_key).unwrap().cards = Some(build_cards(&p, &r));
+        app.loaded.get_mut(&post_key).unwrap().cards = Some(build_cards(&p, Some(&r)));
         app.loaded.get_mut(&post_key).unwrap().post = Some(p);
         let visual = (id, 2, 0);
         app.visuals.insert(visual.clone(), VisualState::Ready { w: 200, h: 200, max_scale: 1.0 });
@@ -2397,7 +2512,7 @@ mod tests {
         let id = PostId::from("b");
         let p = Post { parts: vec![Part::Mermaid { mermaid: "flowchart TD\n A-->B".into(), id: None }], ..post("b", "s1", 2, "") };
         let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
-        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, &r));
+        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, Some(&r)));
         let visual = (id, 2, 0);
         app.visuals.insert(visual.clone(), VisualState::Ready { w: 360, h: 260, max_scale: 1.0 });
         app.feed = None;
@@ -2417,7 +2532,7 @@ mod tests {
         let id = PostId::from("b");
         let p = Post { parts: vec![Part::Mermaid { mermaid: "flowchart TD\n A-->B".into(), id: None }], ..post("b", "s1", 2, "") };
         let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
-        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, &r));
+        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, Some(&r)));
         let visual = (id, 2, 0);
         app.visuals.insert(visual.clone(), VisualState::Ready { w: 360, h: 260, max_scale: 1.0 });
         app.feed = None;
@@ -2440,7 +2555,7 @@ mod tests {
         let id = PostId::from("b");
         let p = Post { parts: vec![Part::Mermaid { mermaid: "flowchart TD\n A-->B".into(), id: None }], ..post("b", "s1", 2, "") };
         let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
-        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, &r));
+        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, Some(&r)));
         app.visuals.insert((id.clone(), 2, 0), VisualState::Ready { w: 360, h: 260, max_scale: 1.0 });
         app.feed = None;
         let post_index = app.posts.iter().position(|p| p.id == id).unwrap();
@@ -2473,7 +2588,7 @@ mod tests {
         let id = PostId::from("b");
         let p = Post { parts: vec![Part::Html { html: "<p>hi</p>".into(), kits: vec![], id: None }], ..post("b", "s1", 2, "") };
         let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
-        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, &r));
+        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, Some(&r)));
         let narrow = app.target().width_px;
         app.visuals.insert((id.clone(), 2, 0), VisualState::Ready { w: narrow, h: 200, max_scale: 1.0 });
         app.feed = None;
@@ -2509,18 +2624,18 @@ mod tests {
         let fx = app.update(ev("post-updated", "b", 2));
         serve(&mut app, fx, &db);
         assert_eq!(app.builds, builds);
-        // A new version builds once, even when its event repeats.
+        // A new version builds once (plain, then styled), even when its event repeats.
         db.posts[1].version = 3;
         for _ in 0..2 {
             let fx = app.update(ev("post-updated", "b", 3));
             serve(&mut app, fx, &db);
         }
-        assert_eq!(app.builds, builds + 1);
+        assert_eq!(app.builds, builds + 2);
         // Another session's post marks it unread and builds nothing.
         let fx = app.update(Msg::Event(Event { seq: 10, kind: "post-created".into(), path: None, version: Some(1), id: Some("z".into()), session: Some("s2".into()) }));
         serve(&mut app, fx, &db);
         assert!(app.unread.contains("s2"));
-        assert_eq!(app.builds, builds + 1);
+        assert_eq!(app.builds, builds + 2);
     }
 
     fn reported_cols(fx: &[Effect]) -> Option<u16> {
@@ -2625,12 +2740,12 @@ mod tests {
         let mut app = booted(&fake());
         let diagram = |v| Post { parts: vec![Part::Mermaid { mermaid: "graph TD\nA-->B".into(), id: None }], ..post("b", "s1", v, "") };
         let render = |v| PostRender { id: "b".into(), version: v, parts: vec![notes_proto::posts::PartRender::Native] };
-        app.loaded.get_mut(&("b".into(), 2)).unwrap().cards = Some(cards::build_cards(&diagram(2), &render(2)));
+        app.loaded.get_mut(&("b".into(), 2)).unwrap().cards = Some(cards::build_cards(&diagram(2), Some(&render(2))));
         app.visuals.insert(("b".into(), 2, 0), VisualState::Ready { w: 400, h: 1200, max_scale: 1.0 });
         app.visual_gen += 1;
         let shown = app.feed().lines.len();
         app.posts.iter_mut().find(|p| p.id == "b").unwrap().version = 3;
-        let cards = Some(cards::build_cards(&diagram(3), &render(3)));
+        let cards = Some(cards::build_cards(&diagram(3), Some(&render(3))));
         app.loaded.insert(("b".into(), 3), Loaded { post: Some(diagram(3)), render: Some(render(3)), cards });
         app.visuals.insert(("b".into(), 3, 0), VisualState::Pending);
         assert_eq!(app.feed().lines.len(), shown);
@@ -2729,7 +2844,7 @@ mod tests {
         // With the cursor on one of b's two cards, d deletes that card; with one card, the post.
         let two = Post { parts: vec![Part::Markdown { markdown: "x".into(), id: None }; 2], ..post("b", "s1", 2, "") };
         let r = PostRender { id: "b".into(), version: 2, parts: vec![notes_proto::posts::PartRender::Native; 2] };
-        app.loaded.get_mut(&(PostId::from("b"), 2)).unwrap().cards = Some(build_cards(&two, &r));
+        app.loaded.get_mut(&(PostId::from("b"), 2)).unwrap().cards = Some(build_cards(&two, Some(&r)));
         app.loaded.get_mut(&(PostId::from("b"), 2)).unwrap().post = Some(two);
         app.views.get_mut(&PostId::from("b")).unwrap().laid = None;
         app.feed = None;
