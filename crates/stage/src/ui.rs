@@ -544,7 +544,9 @@ fn main(f: &mut Frame, app: &mut App, area: Rect) {
         .filter_map(|(key, slot)| {
             let end = slot.line + slot.rows as usize;
             let bottom = scroll + body.height as usize;
-            if end <= scroll || slot.line >= bottom {
+            // Zero rows shown (a body with no height) would place with r=0, which
+            // kitty reads as "size it yourself": the whole image over the UI.
+            if end.min(bottom) <= slot.line.max(scroll) {
                 return None;
             }
             let top = scroll.saturating_sub(slot.line) as u16;

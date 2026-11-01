@@ -1077,43 +1077,15 @@ impl Gallery {
         }
     }
 
-    /// The screen was cleared (a resize). Placements are gone, and Rex drops the
-    /// images too, so send every one again (at `target`); the next `place` shows them.
-    pub fn replace_all(&mut self, out: &mut impl Write, target: Target, focused: Option<&VisualKey>) {
-        self.target = target;
-        self.focused = focused.cloned();
-        // The terminal dropped every image: diagrams rasterize again as they come on screen.
-        self.rastered.clear();
-        let ahead = self.prefetch.take().and_then(|ahead| ahead.done);
-        for (shm, ..) in ahead.into_iter().chain(self.ready_zoom.take().map(|(_, _, done)| done)) {
-            kitty::unlink(&shm);
-        }
-        if let Some(zoom) = self.zoom.as_mut() {
-            zoom.made_for = None;
-            if let Some(img) = zoom.img.as_mut() {
-                img.placed = None;
+    /// Every cell was repainted (a resize): the terminal kept the pixels, but its
+    /// placements may sit where the layout no longer is. Take them all down; the
+    /// next `place` puts the on-screen ones back in the same frame.
+    pub fn unplace_all(&mut self, out: &mut impl Write) {
+        for img in self.images.values_mut() {
+            if img.placed.take().is_some() {
+                let _ = out.write_all(&kitty::unplace(img.id));
             }
         }
-        note(&mut self.trace, format_args!("clear: sending {} images again", self.images.len()));
-        let mut decode = Vec::new();
-        for (key, img) in self.images.iter_mut() {
-            img.placed = None;
-            if let Some(old) = img.previous.take() {
-                let _ = out.write_all(&kitty::delete(old));
-            }
-            match img.file.as_ref().map(|f| (kitty::png_size(&read_head(f)).is_some(), f)) {
-                Some((true, file)) => {
-                    let _ = out.write_all(&kitty::transmit_png(img.id, file));
-                }
-                Some((false, file)) => decode.push((key.clone(), file.clone())),
-                None => {}
-            }
-        }
-        for (key, file) in decode {
-            let _ = self.decode(key, file);
-        }
-        // Only the focused page needs the new size while it fills the pane.
-        self.resize_pages();
     }
 
     /// Remove every image (on quit).

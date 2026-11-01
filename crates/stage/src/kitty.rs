@@ -2,7 +2,10 @@
 //! (`t=s`) and placing them in cells, plus the shared-memory writer. Every
 //! escape carries `q=2`, so the terminal never answers into stage's input.
 
-use std::{ffi::CString, io};
+use std::{
+    ffi::CString,
+    io::{self, Write},
+};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 
@@ -72,6 +75,71 @@ pub fn delete(id: u32) -> Vec<u8> {
 
 /// Every image and placement stage made (on quit).
 pub const FREE_ALL: &[u8] = b"\x1b_Ga=d,d=A,q=2\x1b\\";
+
+/// Terminal output, buffered until `flush` writes it in one go. On Rex, an APC
+/// (kitty graphics) escape split across one of its 1024-byte pty reads is
+/// misparsed and its tail lands on screen as text, so `flush` pads with NULs
+/// (which terminals ignore) to keep each APC inside one 1024-byte block, and
+/// pads the whole write to whole blocks so the next write starts aligned too.
+pub struct Out {
+    buf: Vec<u8>,
+    align: bool,
+}
+
+impl Default for Out {
+    fn default() -> Self {
+        Out { buf: Vec::with_capacity(64 * 1024), align: std::env::var("TERM_PROGRAM").is_ok_and(|name| name == "rex") }
+    }
+}
+
+impl Write for Out {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let mut out = io::stdout().lock();
+        if self.align {
+            out.write_all(&align_apcs(&self.buf))?;
+        } else {
+            out.write_all(&self.buf)?;
+        }
+        self.buf.clear();
+        out.flush()
+    }
+}
+
+const READ_BLOCK: usize = 1024;
+
+/// `bytes` with NULs added so no APC escape crosses a `READ_BLOCK` boundary and
+/// the total is a whole number of blocks.
+pub fn align_apcs(bytes: &[u8]) -> Vec<u8> {
+    let find = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).position(|w| w == needle);
+    let pad_to_block = |out: &mut Vec<u8>| {
+        let used = out.len() % READ_BLOCK;
+        if used != 0 {
+            out.resize(out.len() + READ_BLOCK - used, 0);
+        }
+    };
+    let mut out = Vec::with_capacity(bytes.len() + 2 * READ_BLOCK);
+    let mut rest = bytes;
+    while let Some(start) = find(rest, b"\x1b_") {
+        let len = find(&rest[start..], b"\x1b\\").map_or(rest.len() - start, |end| end + 2);
+        out.extend_from_slice(&rest[..start]);
+        if len <= READ_BLOCK && out.len() % READ_BLOCK + len > READ_BLOCK {
+            pad_to_block(&mut out);
+        }
+        out.extend_from_slice(&rest[start..start + len]);
+        rest = &rest[start + len..];
+    }
+    out.extend_from_slice(rest);
+    pad_to_block(&mut out);
+    out
+}
 
 /// Write RGBA pixels into a fresh shared-memory object and return its name.
 /// The terminal unlinks it after a `t=s` transmit; call [`unlink`] otherwise.
@@ -152,6 +220,25 @@ mod tests {
         assert_eq!(shm_read(&name, px.len()).unwrap(), px);
         unlink(&name);
         assert!(shm_read(&name, px.len()).is_err());
+    }
+
+    #[test]
+    fn aligned_output_keeps_every_apc_inside_one_read_block() {
+        let apc = String::from_utf8(place(7, &Place { col: 4, row: 2, cols: 53, rows: 38, src: (0, 30, 140, 90) })).unwrap();
+        let mut frame = Vec::new();
+        for i in 0..200 {
+            frame.extend_from_slice(format!("\x1b[{};1Hrow {i} text", i % 40 + 1).as_bytes());
+            frame.extend_from_slice(apc.as_bytes());
+        }
+        let out = align_apcs(&frame);
+        assert_eq!(out.len() % READ_BLOCK, 0);
+        assert_eq!(out.iter().filter(|&&b| b != 0).copied().collect::<Vec<_>>(), frame, "only NULs are added");
+        let mut at = 0;
+        while let Some(start) = out[at..].windows(2).position(|w| w == b"\x1b_").map(|p| p + at) {
+            let end = start + out[start..].windows(2).position(|w| w == b"\x1b\\").unwrap() + 2;
+            assert_eq!(start / READ_BLOCK, (end - 1) / READ_BLOCK, "APC at {start}..{end} crosses a block");
+            at = end;
+        }
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! horizontal margins, so a text feed beside the sidebar can use it too.
 
 use std::io::{self, Write};
-use ratatui::{backend::{Backend, CrosstermBackend}, buffer::Buffer, layout::Rect, Terminal};
+use ratatui::{backend::{Backend, CrosstermBackend}, buffer::{Buffer, Cell, CellDiffOption}, layout::Rect, Terminal, TerminalOptions, Viewport};
 use crate::{app::App, ui};
 
 pub struct Screen {
@@ -78,25 +78,31 @@ impl Screen {
     /// cursor policy (Stage keeps the terminal cursor hidden), so never mix this
     /// with Terminal::draw/flush. The caller flushes once after graphics and the
     /// synchronized-output end marker, making one buffered frame write. Returns
-    /// whether graphics must be restored after a screen clear.
-    pub fn draw<W: Write>(&mut self, term: &mut Terminal<CrosstermBackend<W>>, app: &mut App) -> io::Result<bool> {
-        term.autoresize()?;
-        let area = term.current_buffer_mut().area;
-        let resized = self.previous.area != area;
-        let cleared = resized || self.invalidated;
-        if self.invalidated && !resized {
-            // We own the full-screen buffers and keep the cursor hidden. Avoid
-            // Terminal::clear's cursor query, which would race the input reader.
-            term.backend_mut().clear()?;
+    /// whether every cell was repainted, so graphics must be placed again.
+    pub fn draw<W: Write + Default>(&mut self, term: &mut Terminal<CrosstermBackend<W>>, app: &mut App) -> io::Result<bool> {
+        // Never clear the screen: Rex deletes every kitty image on a clear but keeps
+        // them across a resize, and Ratatui's own resize clears. Size a fresh
+        // Terminal instead (after flushing the old one's writer) and repaint every
+        // cell over whatever the terminal kept.
+        let area = Rect::new(0, 0, app.size.0, app.size.1);
+        if term.current_buffer_mut().area != area {
+            Backend::flush(term.backend_mut())?;
+            *term = Terminal::with_options(CrosstermBackend::new(W::default()), TerminalOptions { viewport: Viewport::Fixed(area) })?;
         }
+        let resized = self.previous.area != area;
+        let repaint = resized || self.invalidated;
         if resized {
-            self.previous = Buffer::empty(area);
             self.next = Buffer::empty(area);
             self.shifted = Buffer::empty(area);
-        } else if cleared {
-            self.previous.reset();
+        } else if repaint {
             self.next.reset();
             self.shifted.reset();
+        }
+        if repaint {
+            // Unequal to every drawn cell, so the diff rewrites the whole screen.
+            let mut stale = Cell::default();
+            stale.set_diff_option(CellDiffOption::Skip);
+            self.previous = Buffer::filled(area, stale);
         }
         {
             let mut frame = term.get_frame();
@@ -111,7 +117,7 @@ impl Screen {
             && ui::session_area(app).is_none() && app.on_screen.is_empty();
         let delta = app.scroll as isize - self.scroll as isize;
         let mut scrolled = false;
-        if self.enabled && !cleared && self.scroll_region == Some(region) && movable
+        if self.enabled && !repaint && self.scroll_region == Some(region) && movable
             && delta != 0 && delta.unsigned_abs() < region.height as usize {
             self.shifted.content.clone_from(&self.previous.content);
             shift(&mut self.shifted, region, delta);
@@ -139,7 +145,7 @@ impl Screen {
         self.scroll = app.scroll;
         self.scroll_region = movable.then_some(region);
         self.invalidated = false;
-        Ok(cleared)
+        Ok(repaint)
     }
 }
 
@@ -148,7 +154,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn same_size_resize_clears_and_repaints_then_returns_to_diffing() {
+    fn same_size_resize_repaints_without_clearing_then_returns_to_diffing() {
         use ratatui::{TerminalOptions, Viewport};
         use std::{cell::RefCell, rc::Rc};
 
@@ -178,10 +184,10 @@ mod tests {
         // dimensions equal the previous frame. The terminal still lost cells.
         screen.invalidate();
         screen.invalidate();
-        assert!(screen.draw(&mut term, &mut app).unwrap(), "graphics must be restored too");
+        assert!(screen.draw(&mut term, &mut app).unwrap(), "graphics must be placed again too");
         let repaint = take_output();
-        assert!(repaint.starts_with(b"\x1b[2J"), "clear remnants before repainting");
-        assert!(repaint.ends_with(&first), "every original cell must be repainted");
+        assert!(!repaint.windows(4).any(|w| w == b"\x1b[2J" || w.starts_with(b"\x1b[J")), "a clear would delete Rex's images");
+        assert_eq!(repaint, first, "every cell is rewritten, as on the first frame");
 
         assert!(!screen.draw(&mut term, &mut app).unwrap());
         assert_eq!(take_output(), unchanged);
