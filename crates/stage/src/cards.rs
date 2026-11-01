@@ -35,10 +35,19 @@ pub enum CardBody {
     /// than the card hard-wraps; continuations start with `gutter` (the line
     /// number column's blank twin) or a dim `↪`. `shade` gives it a terminal's
     /// own background.
-    Pre { lines: Vec<Line<'static>>, gutter: Option<usize>, shade: bool },
+    Pre { lines: Vec<Line<'static>>, gutter: Option<Gutter>, shade: bool },
     /// Pixels drawn through kitty graphics; `fallback` shows until they're
     /// ready, and for good if they can't be made.
     Visual { source: VisualSource, fallback: Vec<Line<'static>> },
+}
+
+/// The leading columns of a preformatted row that wrapped continuations leave
+/// blank. `rule` keeps the `│` a code card's line numbers end in; diff rows
+/// end theirs in a sign column instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gutter {
+    pub width: usize,
+    pub rule: bool,
 }
 
 /// What a visual card renders from.
@@ -129,7 +138,7 @@ fn card(part: &Part, render: Option<&PartRender>) -> Card {
         (Part::Code { title, language, code, .. }, Some(PartRender::Code { line_start, lines, .. })) => Card {
             label: label("code", title.as_deref().or(language.as_deref())),
             body: CardBody::Pre {
-                gutter: Some(gutter_width(*line_start, lines.len())),
+                gutter: Some(Gutter { width: gutter_width(*line_start, lines.len()), rule: true }),
                 lines: capped(code_lines(*line_start, lines), code.len()),
                 shade: false,
             },
@@ -137,7 +146,7 @@ fn card(part: &Part, render: Option<&PartRender>) -> Card {
         (Part::Code { title, language, code, line_start, .. }, _) => Card {
             label: label("code", title.as_deref().or(language.as_deref())),
             body: CardBody::Pre {
-                gutter: Some(gutter_width(line_start.unwrap_or(1), code.lines().count())),
+                gutter: Some(Gutter { width: gutter_width(line_start.unwrap_or(1), code.lines().count()), rule: true }),
                 lines: capped(plain_code(code, line_start.unwrap_or(1)), code.len()),
                 shade: false,
             },
@@ -149,7 +158,15 @@ fn card(part: &Part, render: Option<&PartRender>) -> Card {
             }
             let bytes = patch.as_ref().map_or(0, |p| p.len())
                 + files.iter().map(|f| f.before.len() + f.after.len()).sum::<usize>();
-            Card { label, body: CardBody::Lines(capped(diff_lines(rendered), bytes)) }
+            let (lines, number_w) = diff_lines(rendered);
+            Card {
+                label,
+                body: CardBody::Pre {
+                    lines: capped(lines, bytes),
+                    gutter: Some(Gutter { width: diff_gutter_width(number_w), rule: false }),
+                    shade: false,
+                },
+            }
         }
         (Part::Diff { patch, .. }, _) => {
             let text = patch.as_deref().unwrap_or("");
@@ -308,7 +325,23 @@ fn plain_code(code: &str, start: u32) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn diff_lines(files: &[notes_proto::posts::DiffFileRender]) -> Vec<Line<'static>> {
+/// Cells of a diff row's gutter: two line numbers, a sign, and the spaces between.
+fn diff_gutter_width(number_w: usize) -> usize {
+    2 * number_w + 4
+}
+
+/// A diff's rows, and the digits of its widest line number: the gutter is
+/// sized by the file, not a fixed four. Changed words inside a paired
+/// removed/added run get a stronger background.
+fn diff_lines(files: &[notes_proto::posts::DiffFileRender]) -> (Vec<Line<'static>>, usize) {
+    let number_w = files
+        .iter()
+        .flat_map(|f| &f.hunks)
+        .flat_map(|h| &h.lines)
+        .flat_map(|l| [l.old_line, l.new_line])
+        .flatten()
+        .max()
+        .map_or(1, |n| n.to_string().len());
     let mut out = Vec::new();
     for file in files {
         out.push(Line::from(vec![
@@ -318,14 +351,15 @@ fn diff_lines(files: &[notes_proto::posts::DiffFileRender]) -> Vec<Line<'static>
         ]));
         for hunk in &file.hunks {
             out.push(Line::styled(sanitize(&hunk.header).into_owned(), Style::new().fg(ui::CYAN)));
-            for l in &hunk.lines {
+            let mut body: Vec<Line<'static>> = hunk.lines.iter().map(|l| styled(&l.spans)).collect();
+            emphasize_pairs(&hunk.lines, &mut body);
+            for (l, mut line) in hunk.lines.iter().zip(body) {
                 let (sign, bg) = match l.kind {
                     DiffLineKind::Added => ("+", Some(ui::ADDED_BG)),
                     DiffLineKind::Removed => ("-", Some(ui::REMOVED_BG)),
                     DiffLineKind::Context => (" ", None),
                 };
-                let num = |n: Option<u32>| n.map_or("    ".into(), |n| format!("{n:>4}"));
-                let mut line = styled(&l.spans);
+                let num = |n: Option<u32>| n.map_or(" ".repeat(number_w), |n| format!("{n:>number_w$}"));
                 line.spans.insert(
                     0,
                     Span::styled(format!("{} {} {sign} ", num(l.old_line), num(l.new_line)), ui::dim()),
@@ -337,7 +371,127 @@ fn diff_lines(files: &[notes_proto::posts::DiffFileRender]) -> Vec<Line<'static>
             }
         }
     }
+    (out, number_w)
+}
+
+/// Pair each run of removed lines with the added run right after it (line i
+/// with line i) and mark the words that differ.
+fn emphasize_pairs(src: &[notes_proto::posts::DiffLine], body: &mut [Line<'static>]) {
+    let mut i = 0;
+    while i < src.len() {
+        if src[i].kind != DiffLineKind::Removed {
+            i += 1;
+            continue;
+        }
+        let removed = i;
+        while i < src.len() && src[i].kind == DiffLineKind::Removed {
+            i += 1;
+        }
+        let added = i;
+        while i < src.len() && src[i].kind == DiffLineKind::Added {
+            i += 1;
+        }
+        for k in 0..(added - removed).min(i - added) {
+            let (old, new) = (removed + k, added + k);
+            let (old_text, new_text) = (body[old].to_string(), body[new].to_string());
+            if let Some((old_marks, new_marks)) = changed_words(&old_text, &new_text) {
+                mark(&mut body[old], &old_marks, ui::REMOVED_WORD_BG);
+                mark(&mut body[new], &new_marks, ui::ADDED_WORD_BG);
+            }
+        }
+    }
+}
+
+type ByteRange = std::ops::Range<usize>;
+
+/// Runs of word characters, of whitespace, and single other characters.
+fn tokens(text: &str) -> Vec<ByteRange> {
+    let class = |c: char| if c.is_alphanumeric() || c == '_' { 1 } else if c.is_whitespace() { 2 } else { 0 };
+    let mut out: Vec<ByteRange> = Vec::new();
+    for (i, c) in text.char_indices() {
+        let k = class(c);
+        match out.last_mut() {
+            Some(last) if k != 0 && class(text[last.clone()].chars().next().unwrap()) == k => last.end = i + c.len_utf8(),
+            _ => out.push(i..i + c.len_utf8()),
+        }
+    }
     out
+}
+
+/// Byte ranges of the tokens that differ between `old` and `new`, or `None`
+/// when a line is too long to diff cheaply or more than half of either line
+/// changed, where emphasis would only be noise.
+fn changed_words(old: &str, new: &str) -> Option<(Vec<ByteRange>, Vec<ByteRange>)> {
+    const MAX_TOKENS: usize = 512;
+    let (a, b) = (tokens(old), tokens(new));
+    if a.len() > MAX_TOKENS || b.len() > MAX_TOKENS {
+        return None;
+    }
+    // Longest common subsequence of tokens, as a suffix table.
+    let mut lcs = vec![vec![0u16; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            lcs[i][j] = if old[a[i].clone()] == new[b[j].clone()] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+    let (mut ca, mut cb) = (vec![true; a.len()], vec![true; b.len()]);
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if old[a[i].clone()] == new[b[j].clone()] {
+            (ca[i], cb[j]) = (false, false);
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    let marked = |toks: &[ByteRange], changed: &[bool]| -> Vec<ByteRange> {
+        let mut out: Vec<ByteRange> = Vec::new();
+        for (t, _) in toks.iter().zip(changed).filter(|(_, c)| **c) {
+            match out.last_mut() {
+                Some(last) if last.end == t.start => last.end = t.end,
+                _ => out.push(t.clone()),
+            }
+        }
+        out
+    };
+    let (ma, mb) = (marked(&a, &ca), marked(&b, &cb));
+    let noisy = |text: &str, m: &[ByteRange]| m.iter().map(|r| r.len()).sum::<usize>() * 2 > text.len();
+    if noisy(old, &ma) || noisy(new, &mb) {
+        return None;
+    }
+    Some((ma, mb))
+}
+
+/// Give the bytes of `line`'s text inside `ranges` a background, splitting
+/// spans at the edges so each piece keeps its syntax colour.
+fn mark(line: &mut Line<'static>, ranges: &[ByteRange], bg: ratatui::style::Color) {
+    let mut out = Vec::with_capacity(line.spans.len() + ranges.len() * 2);
+    let mut at = 0;
+    for span in std::mem::take(&mut line.spans) {
+        let text = span.content.as_ref();
+        let (start, end) = (at, at + text.len());
+        at = end;
+        let mut cut = start;
+        for r in ranges.iter().filter(|r| r.start < end && r.end > start) {
+            let (s, e) = (r.start.max(start), r.end.min(end));
+            if s > cut {
+                out.push(Span::styled(text[cut - start..s - start].to_owned(), span.style));
+            }
+            out.push(Span::styled(text[s - start..e - start].to_owned(), span.style.bg(bg)));
+            cut = e;
+        }
+        if cut < end {
+            out.push(Span::styled(text[cut - start..].to_owned(), span.style));
+        }
+    }
+    line.spans = out;
 }
 
 // ---- JSON and trace trees ----------------------------------------------------
@@ -700,10 +854,13 @@ pub struct Slot {
 
 /// Split a preformatted line every `width` cells, keeping every space. Each
 /// continuation starts with the gutter's blank twin (`   │ `) or a dim `↪ `.
-pub fn hard_wrap(line: &Line<'static>, width: usize, gutter: Option<usize>) -> Vec<Line<'static>> {
+pub fn hard_wrap(line: &Line<'static>, width: usize, gutter: Option<Gutter>) -> Vec<Line<'static>> {
     let width = width.max(4);
     let lead: Vec<Span<'static>> = match gutter {
-        Some(g) if g + 4 <= width => vec![Span::raw(" ".repeat(g - 2)), Span::styled("│ ", ui::border())],
+        Some(Gutter { width: g, rule: true }) if g + 4 <= width => {
+            vec![Span::raw(" ".repeat(g - 2)), Span::styled("│ ", ui::border())]
+        }
+        Some(Gutter { width: g, rule: false }) if g + 4 <= width => vec![Span::raw(" ".repeat(g))],
         _ => vec![Span::styled("↪ ", ui::dim())],
     };
     let lead_w: usize = lead.iter().map(|s| s.content.width()).sum();
@@ -1046,8 +1203,8 @@ mod tests {
             "╭─ diff · 1 files ─────────────────────╮
 │ a.rs  +1 −1                          │
 │ @@ -1 +1 @@                          │
-│    1      - old                      │
-│         1 + new                      │
+│ 1   - old                            │
+│   1 + new                            │
 ╰──────────────────────────────────────╯"
         );
     }
@@ -1182,6 +1339,84 @@ mod tests {
         let rows = wrap(&Line::from("abcdefghij"), 4);
         assert_eq!(rows.iter().map(|l| l.to_string()).collect::<Vec<_>>(), ["abcd", "efgh", "ij"]);
     }
+
+    fn diff_part(lines: Vec<DiffLine>) -> (Part, PartRender) {
+        let part = Part::Diff { patch: None, files: vec![], layout: DiffLayout::Unified, id: None };
+        let render = PartRender::Diff {
+            layout: DiffLayout::Unified,
+            files: vec![DiffFileRender {
+                filename: "f".into(),
+                language: None,
+                added: 1,
+                removed: 1,
+                hunks: vec![DiffHunk { header: "@@".into(), lines }],
+            }],
+        };
+        (part, render)
+    }
+
+    fn dl(kind: DiffLineKind, old: Option<u32>, new: Option<u32>, text: &str) -> DiffLine {
+        DiffLine { kind, old_line: old, new_line: new, spans: vec![span(text, Some("keyword"))] }
+    }
+
+    fn laid_diff(lines: Vec<DiffLine>, width: u16) -> Laid {
+        let (part, render) = diff_part(lines);
+        let cards = build_cards(&post(vec![part]), Some(&PostRender { id: "p1".into(), version: 1, parts: vec![render] }));
+        layout(&cards, &[], width, &Folds::new(), &|_| Fit::Pending { rows: 1 }, None)
+    }
+
+    #[test]
+    fn wrapped_diff_rows_keep_the_gutter_and_the_background() {
+        let laid = laid_diff(vec![dl(DiffLineKind::Added, None, Some(7), "abcdefghijklmnopqrstuvwxyz")], 24);
+        let rows: Vec<String> = laid.lines[3..laid.lines.len() - 2].iter().map(|l| l.to_string()).collect();
+        assert_eq!(rows, ["│   7 + abcdefghijklmn │", "│       opqrstuvwxyz   │"]);
+        for row in &laid.lines[3..laid.lines.len() - 2] {
+            assert_eq!(row.spans[row.spans.len() - 2].style.bg, Some(ui::ADDED_BG), "pad carries the row background");
+            assert_eq!(row.spans[1].style.bg, Some(ui::ADDED_BG));
+        }
+    }
+
+    #[test]
+    fn gutter_width_follows_the_largest_line_number() {
+        let rows = |n| {
+            let laid = laid_diff(vec![dl(DiffLineKind::Context, Some(n), Some(n), "x")], 40);
+            laid.lines[3].to_string()
+        };
+        assert_eq!(rows(5), "│ 5 5   x                              │");
+        assert_eq!(rows(12345), "│ 12345 12345   x                      │");
+    }
+
+    #[test]
+    fn one_changed_word_is_the_only_emphasis() {
+        let laid = laid_diff(
+            vec![
+                dl(DiffLineKind::Removed, Some(1), None, "let total = price * count;"),
+                dl(DiffLineKind::Added, None, Some(1), "let total = cost * count;"),
+            ],
+            60,
+        );
+        let emphasised = |row: usize, bg| -> String {
+            laid.lines[row].spans.iter().filter(|s| s.style.bg == Some(bg)).map(|s| s.content.as_ref()).collect()
+        };
+        assert_eq!(emphasised(3, ui::REMOVED_WORD_BG), "price");
+        assert_eq!(emphasised(4, ui::ADDED_WORD_BG), "cost");
+        let word = laid.lines[4].spans.iter().find(|s| s.content == "cost").unwrap();
+        assert_eq!(word.style.fg, ui::class_style(Some("keyword")).fg, "syntax colour survives");
+    }
+
+    #[test]
+    fn a_rewritten_line_gets_no_word_emphasis() {
+        let laid = laid_diff(
+            vec![
+                dl(DiffLineKind::Removed, Some(1), None, "alpha beta gamma"),
+                dl(DiffLineKind::Added, None, Some(1), "one two three four"),
+            ],
+            60,
+        );
+        for row in [3, 4] {
+            assert!(laid.lines[row].spans.iter().all(|s| s.style.bg != Some(ui::ADDED_WORD_BG) && s.style.bg != Some(ui::REMOVED_WORD_BG)));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1199,7 +1434,7 @@ mod pre_tests {
         let rows: Vec<String> = hard_wrap(&Line::from("0123456789abcdef"), 10, None).iter().map(|l| l.to_string()).collect();
         assert_eq!(rows, ["0123456789", "↪ abcdef"]);
         // Code continuations sit under the gutter rule, not under the number.
-        let rows: Vec<String> = hard_wrap(&Line::from(" 9 │ 0123456789abcdef"), 14, Some(5)).iter().map(|l| l.to_string()).collect();
+        let rows: Vec<String> = hard_wrap(&Line::from(" 9 │ 0123456789abcdef"), 14, Some(Gutter { width: 5, rule: true })).iter().map(|l| l.to_string()).collect();
         assert_eq!(rows, [" 9 │ 012345678", "   │ 9abcdef"]);
     }
 }

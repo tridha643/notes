@@ -36,6 +36,9 @@ pub const CURSOR: Color = Color::Rgb(0x24, 0x25, 0x3a);
 pub const SELECTION: Color = Color::Rgb(0x45, 0x47, 0x5a);
 pub const ADDED_BG: Color = Color::Rgb(0x1f, 0x3a, 0x2a);
 pub const REMOVED_BG: Color = Color::Rgb(0x45, 0x22, 0x2a);
+/// Changed words inside an added or removed line.
+pub const ADDED_WORD_BG: Color = Color::Rgb(0x2f, 0x6b, 0x44);
+pub const REMOVED_WORD_BG: Color = Color::Rgb(0x7a, 0x30, 0x3c);
 
 pub fn dim() -> Style {
     Style::new().fg(BORDER)
