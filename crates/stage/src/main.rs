@@ -8,7 +8,7 @@
 //! Idle never wakes; output is flushed once per frame.
 
 use std::{
-    io::{self, BufWriter, Write},
+    io::{self, Write},
     path::PathBuf,
     process::{Command, ExitCode},
     sync::mpsc,
@@ -30,6 +30,7 @@ use stage::{
     app::{App, Effect, Msg, StageRequest},
     client::{next_request, StageClient, Watch},
     gallery::Gallery,
+    kitty,
     latency::Latency,
     probe,
     screen::Screen,
@@ -120,7 +121,7 @@ fn main() -> ExitCode {
         restore();
         hook(info);
     }));
-    let Ok(mut term) = Terminal::new(CrosstermBackend::new(BufWriter::with_capacity(64 * 1024, io::stdout()))) else {
+    let Ok(mut term) = Terminal::new(CrosstermBackend::new(kitty::Out::default())) else {
         restore();
         return ExitCode::from(1);
     };
@@ -131,18 +132,14 @@ fn main() -> ExitCode {
     let mut latency = Latency::from_env();
     let mut gallery = Gallery::new(tx.clone(), StageClient::new(sock.clone()), cache_dir(), notes_proto::default_stage_path(), app.target());
     let mut screen = Screen::default();
-    let mut draw = |term: &mut Terminal<CrosstermBackend<BufWriter<io::Stdout>>>, app: &mut App, gallery: &mut Gallery, screen: &mut Screen| {
+    let mut draw = |term: &mut Terminal<CrosstermBackend<kitty::Out>>, app: &mut App, gallery: &mut Gallery, screen: &mut Screen| {
         let _ = term.backend_mut().write_all(b"\x1b[?2026h");
-        let cleared = screen.draw(term, app).unwrap_or(false);
-        // Rex frees images on a screen clear, including a coalesced resize back
-        // to the same dimensions. Restore pixels after the clear, before placing.
+        if screen.draw(term, app).unwrap_or(false) {
+            gallery.unplace_all(term.backend_mut());
+        }
         let focused = app.focused_visual();
         gallery.view(app.zoom_view);
-        if cleared {
-            gallery.replace_all(term.backend_mut(), app.target(), focused.as_ref());
-        } else {
-            gallery.retarget(app.target(), focused.as_ref());
-        }
+        gallery.retarget(app.target(), focused.as_ref());
         gallery.place(term.backend_mut(), &app.on_screen);
         let _ = term.backend_mut().write_all(b"\x1b[?2026l");
         let _ = term.backend_mut().flush();
