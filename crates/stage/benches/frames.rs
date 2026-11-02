@@ -140,11 +140,9 @@ fn main() {
     };
     let dir = PathBuf::from(format!("/tmp/stb-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(dir.join("vault")).unwrap();
     fs::create_dir_all(dir.join("home")).unwrap();
     let sock = dir.join("s.sock");
     let env = [
-        ("NOTES_VAULT", dir.join("vault")),
         ("NOTES_DB", dir.join("state/notes.db")),
         ("NOTES_SOCK", sock.clone()),
         ("HOME", dir.join("home")),

@@ -109,11 +109,9 @@ fn main() {
     unsafe { std::env::set_var("STAGE_HELPER", &helper) };
     let dir = PathBuf::from(format!("/tmp/stv-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("vault")).unwrap();
     let sock = dir.join("s.sock");
     let _notesd = Proc(
         Command::new(notesd)
-            .env("NOTES_VAULT", dir.join("vault"))
             .env("NOTES_DB", dir.join("state/notes.db"))
             .env("NOTES_SOCK", &sock)
             .env("HOME", dir.join("home"))

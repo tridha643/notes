@@ -1,6 +1,6 @@
 //! Wire contract: one golden request line per verb and one golden response per
 //! sideshow result shape, in tests/fixtures/. Rust must round-trip each byte for
-//! byte; Notes.app's Swift tests decode the same files. A changed fixture is a
+//! byte; the Swift tests decode the same files. A changed fixture is a
 //! contract change, so it shows up in review. Regenerate with
 //! `UPDATE_FIXTURES=1 cargo test -p notes-proto --test contract`.
 
@@ -17,23 +17,6 @@ fn fixtures() -> PathBuf {
 /// until it has a name here, and `every_verb_has_a_request_fixture` then needs its sample.
 fn name(verb: &Verb) -> &'static str {
     match verb {
-        Verb::List(_) => "list",
-        Verb::Find(_) => "find",
-        Verb::Search(_) => "search",
-        Verb::Read(_) => "read",
-        Verb::New(_) => "new",
-        Verb::Edit(_) => "edit",
-        Verb::Append(_) => "append",
-        Verb::Prepend(_) => "prepend",
-        Verb::Write(_) => "write",
-        Verb::Move(_) => "move",
-        Verb::Mkdir(_) => "mkdir",
-        Verb::Rmdir(_) => "rmdir",
-        Verb::Delete(_) => "delete",
-        Verb::Restore(_) => "restore",
-        Verb::History(_) => "history",
-        Verb::Diff(_) => "diff",
-        Verb::Revert(_) => "revert",
         Verb::Watch(_) => "watch",
         Verb::Batch(_) => "batch",
         Verb::Manifest => "manifest",
@@ -65,32 +48,14 @@ fn name(verb: &Verb) -> &'static str {
     }
 }
 
-const VERB_COUNT: usize = 45;
+const VERB_COUNT: usize = 28;
 
 fn md(text: &str) -> Part {
     Part::Markdown { markdown: text.into(), id: Some("p0".into()) }
 }
 
 fn samples() -> Vec<Verb> {
-    let note = || "work/plan".to_string();
     vec![
-        Verb::List(ListArgs { folder: Some("work".into()), recursive: true, sort: ListSort::Title, limit: Some(10) }),
-        Verb::Find(FindArgs { query: "plan".into(), limit: Some(5) }),
-        Verb::Search(SearchArgs { query: "todo".into(), folder: None, context: 2, case_sensitive: false, fuzzy: true, limit: None }),
-        Verb::Read(ReadArgs { note: note(), lines: Some(LineRange { start: 1, end: 3 }) }),
-        Verb::New(NewArgs { path: "work/new".into(), body: "# New\n".into() }),
-        Verb::Edit(EditArgs { note: note(), edits: vec![Replacement { old: "a".into(), new: "b".into(), all: false }], if_version: Some(3) }),
-        Verb::Append(AppendArgs { note: note(), text: "- c\n".into(), under: Some("Todo".into()), if_version: None }),
-        Verb::Prepend(PrependArgs { note: note(), text: "top\n".into(), if_version: None }),
-        Verb::Write(WriteArgs { note: note(), body: "all\n".into(), if_version: Some(4), force: false }),
-        Verb::Move(MoveArgs { note: note(), to: "archive/".into() }),
-        Verb::Mkdir(FolderArgs { folder: "archive".into() }),
-        Verb::Rmdir(FolderArgs { folder: "archive".into() }),
-        Verb::Delete(DeleteArgs { note: note(), purge: false }),
-        Verb::Restore(NoteArgs { note: note() }),
-        Verb::History(HistoryArgs { note: note(), limit: Some(5) }),
-        Verb::Diff(DiffArgs { note: note(), from: Some(1), to: None }),
-        Verb::Revert(RevertArgs { note: note(), to: 2 }),
         Verb::Watch(WatchArgs { since: Some(12), kinds: vec!["post".into(), "comment".into()] }),
         Verb::Batch(BatchArgs { ops: vec![Verb::Doctor, Verb::SessionList], atomic: true }),
         Verb::Manifest,
@@ -242,7 +207,6 @@ fn unknown_fields_in_args_and_parts_are_rejected() {
         (json!({"v":1,"id":1,"verb":"post-list","args":{"sesion":"s1"}}), "sesion"),
         (json!({"v":1,"id":1,"verb":"post-new","args":{"parts":[{"kind":"markdown","markdown":"x","colour":"red"}]}}), "colour"),
         (json!({"v":1,"id":1,"verb":"comment-new","args":{"text":"x","anchor":{"kind":"point","part":0,"post_version":1,"x":0.5,"y":0.5,"z":1}}}), "z"),
-        (json!({"v":1,"id":1,"verb":"edit","args":{"note":"n","edits":[{"old":"a","new":"b","every":true}]}}), "every"),
     ] {
         let e = serde_json::from_value::<Request>(bad).unwrap_err().to_string();
         assert!(e.contains(field), "{field}: {e}");

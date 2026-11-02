@@ -1,11 +1,9 @@
-//! `notesd`: owns the vault, SQLite and fff search, and serves the line protocol
+//! `notesd`: owns the stage session folder and SQLite, and serves the line protocol
 //! (crates/proto) on a unix socket. One thread per connection, one blocking kqueue
-//! watcher thread; nothing wakes up while nobody is talking and the vault is still.
+//! watcher thread; nothing wakes up while nobody is talking and the folder is still.
 
 mod ops;
-mod search;
 mod store;
-mod text;
 mod watcher;
 
 use std::{
@@ -43,8 +41,17 @@ use store::Daemon;
 pub struct Fail(pub ErrorBody);
 pub type R<T> = Result<T, Fail>;
 
+pub fn error(code: ErrorCode, message: impl Into<String>, hint: Option<&str>) -> ErrorBody {
+    ErrorBody {
+        code,
+        message: message.into(),
+        hint: hint.map(Into::into),
+        details: None,
+    }
+}
+
 pub fn fail(code: ErrorCode, message: impl Into<String>, hint: Option<&str>) -> Fail {
-    Fail(text::error(code, message, hint))
+    Fail(error(code, message, hint))
 }
 
 impl From<ErrorBody> for Fail {
@@ -100,12 +107,6 @@ fn call(d: &Daemon, verb: &Verb, author: &str, cwd: Option<&str>) -> R<Value> {
                 })
                 .map_err(Fail)?;
             Ok(serde_json::to_value(found).expect("comment serializes"))
-        }
-        // Lock-free: fff has its own RwLock and these never touch SQLite.
-        // (A folder-scoped search goes through the unit below, which validates the folder.)
-        Verb::Find(a) => Ok(serde_json::to_value(d.search.find(a)?).expect("hits serialize")),
-        Verb::Search(a) if a.folder.as_deref().is_none_or(|f| f.trim().is_empty()) => {
-            Ok(serde_json::to_value(d.search.search(a, None)?).expect("hits serialize"))
         }
         Verb::Manifest => Ok(ops::manifest()),
         Verb::Batch(b) => {
@@ -270,7 +271,7 @@ fn serve(d: Arc<Daemon>, stream: UnixStream) {
                     .unwrap_or(0);
                 Response::err(
                     id,
-                    text::error(
+                    error(
                         ErrorCode::Usage,
                         format!("bad request: {e}"),
                         Some("see `notes manifest`"),
@@ -279,7 +280,7 @@ fn serve(d: Arc<Daemon>, stream: UnixStream) {
             }
             Ok(req) if req.v != PROTOCOL_VERSION => Response::err(
                 req.id,
-                text::error(
+                error(
                     ErrorCode::Usage,
                     format!(
                         "protocol v{} isn't supported; notesd speaks v{PROTOCOL_VERSION}",
@@ -391,10 +392,6 @@ fn run() -> Result<(), String> {
             Some(PathBuf::from(OsStr::from_bytes(path)))
         })
         .unwrap_or(socket);
-    let vault = notes_proto::default_vault_path();
-    let vault = fs::create_dir_all(&vault)
-        .and_then(|()| vault.canonicalize())
-        .map_err(|e| format!("vault {}: {e}", vault.display()))?;
     let db_path = env::var_os("NOTES_DB")
         .map(PathBuf::from)
         .unwrap_or_else(|| notes_proto::app_support_dir().join("notes.db"));
@@ -402,19 +399,12 @@ fn run() -> Result<(), String> {
     if !stage.is_absolute() {
         return Err("Stage session directory must be absolute; set NOTES_STAGE_DIR to an absolute path".into());
     }
-    let daemon =
-        Arc::new(Daemon::open(vault, db_path, socket, stage).map_err(|Fail(e)| e.message)?);
-    // Watch before reconciling, so nothing changed in between goes unseen.
-    watcher::start(daemon.clone()).map_err(|e| format!("vault watcher: {e}"))?;
+    let daemon = Arc::new(Daemon::open(db_path, socket, stage).map_err(|Fail(e)| e.message)?);
     if let Err(e) = watcher::start_stage(daemon.clone()) {
         eprintln!("notesd: session folder watcher: {e}");
     }
-    daemon.reconcile().map_err(|Fail(e)| e.message)?;
-    eprintln!(
-        "notesd: serving {} on {}",
-        daemon.vault.display(),
-        daemon.socket.display()
-    );
+    daemon.purge_trash().map_err(|Fail(e)| e.message)?;
+    eprintln!("notesd: serving {}", daemon.socket.display());
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
