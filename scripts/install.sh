@@ -25,7 +25,7 @@ case "$stage_dir" in
   ""|/*) ;;
   *) echo "NOTES_STAGE_DIR must be an absolute path" >&2; exit 1 ;;
 esac
-mkdir -p "$bin" "$support" "$HOME/Notes" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+mkdir -p "$bin" "$support" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 install -m 755 target/release/notesd target/release/notes target/release/stage "$bin/"
 # stage-helper (Swift): mermaid via pele, image decoding, live HTML frames for stage.
 # It loads pele from Notes_NotesCore.bundle, which must sit next to the binary.
@@ -37,7 +37,7 @@ rm -rf "$bin/Notes_NotesCore.bundle" && cp -R "$swiftbin/Notes_NotesCore.bundle"
 for skills in "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.pi/agent/skills" "$HOME/.agents/skills"; do
   if [ -d "$skills" ]; then rm -rf "$skills/stage" && cp -R skills/stage "$skills/stage"; fi
 done
-# Standard, not Background: notesd answers the UI and the CLI, so it shouldn't be throttled.
+# Standard, not Background: notesd answers stage and the CLI, so it shouldn't be throttled.
 cat > "$plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

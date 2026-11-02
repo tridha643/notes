@@ -40,11 +40,11 @@ def main(session, binary=None):
     root = Path(__file__).resolve().parent.parent
     binary = Path(binary or root / "target/debug/stage").resolve()
     base = Path(tempfile.mkdtemp(prefix="stage-resize-e2e-", dir="/tmp"))
-    env = dict(os.environ, HOME=str(base / "home"), NOTES_VAULT=str(base / "vault"),
+    env = dict(os.environ, HOME=str(base / "home"),,
                NOTES_DB=str(base / "state/notes.db"), NOTES_SOCK=str(base / "s.sock"),
                NOTES_STAGE_DIR=str(base / "sessions"), STAGE_HELPER="/nonexistent",
                STAGE_TRACE=str(base / "graphics.log"))
-    for name in ("home", "vault", "sessions"):
+    for name in ("home", "sessions"):
         (base / name).mkdir()
     daemon_log = open(base / "daemon.log", "w")
     daemon = subprocess.Popen([str(root / "target/debug/notesd")], env=env,
