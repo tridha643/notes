@@ -10,6 +10,20 @@ import CoreText
 import Foundation
 import JavaScriptCore
 
+public enum PeleError: Error, Sendable, Equatable, CustomStringConvertible {
+    /// pele rejected the source; `message` is pele's, with the line and a caret.
+    case syntax(line: Int, column: Int, message: String)
+    /// pele couldn't load or returned no diagram.
+    case unavailable(String)
+
+    public var description: String {
+        switch self {
+        case let .syntax(_, _, message): "mermaid: \(message)"
+        case let .unavailable(why): "mermaid: \(why)"
+        }
+    }
+}
+
 public struct PeleDiagram: Sendable, Equatable {
     /// SVG with pele's CSS variables still in place; resolve per theme.
     public var svg: String
@@ -38,12 +52,9 @@ public final class Pele: @unchecked Sendable {
                                           "measurer": context.objectForKeyedSubscript("__measurer") as Any]
             if let maxWidth { options["maxWidth"] = maxWidth }
             let result = render.call(withArguments: [source, options])
-            if let exception = context.exception {
-                context.exception = nil
-                throw DaemonError.protocolError("mermaid: \(exception.toString() ?? "render failed")")
-            }
+            try Self.rethrow(context)
             guard let result, let svg = result.forProperty("svg").toString() else {
-                throw DaemonError.protocolError("mermaid: no svg")
+                throw PeleError.unavailable("no svg")
             }
             return PeleDiagram(svg: svg, width: result.forProperty("width").toDouble(),
                                height: result.forProperty("height").toDouble(),
@@ -51,10 +62,31 @@ public final class Pele: @unchecked Sendable {
         }
     }
 
+    /// Parses without laying out: `syntax` for what `render` would reject as source.
+    public func parse(_ source: String) throws {
+        try queue.sync {
+            let (context, _) = try warm()
+            _ = context.objectForKeyedSubscript("pele").forProperty("parse").call(withArguments: [source])
+            try Self.rethrow(context)
+        }
+    }
+
+    /// Turns a pending JavaScript exception into a `PeleError` and clears it.
+    private static func rethrow(_ context: JSContext) throws {
+        guard let exception = context.exception else { return }
+        context.exception = nil
+        guard exception.forProperty("name").toString() == "PeleError" else {
+            throw PeleError.unavailable(exception.toString() ?? "render failed")
+        }
+        throw PeleError.syntax(line: Int(exception.forProperty("line").toInt32()),
+                               column: Int(exception.forProperty("column").toInt32()),
+                               message: exception.forProperty("message").toString() ?? "parse error")
+    }
+
     private func warm() throws -> (JSContext, JSValue) {
         if let context, let renderFunction { return (context, renderFunction) }
         guard let url = Self.scriptURL, let script = try? String(contentsOf: url, encoding: .utf8) else {
-            throw DaemonError.protocolError("pele.global.js missing from the app bundle")
+            throw PeleError.unavailable("pele.global.js missing next to stage-helper")
         }
         let context = JSContext()!
         let width: @convention(block) (String, Double, Int) -> Double = { [unowned self] text, size, style in
@@ -65,7 +97,7 @@ public final class Pele: @unchecked Sendable {
         context.setObject(measurer, forKeyedSubscript: "__measurer" as NSString)
         context.evaluateScript(script, withSourceURL: url)
         guard context.exception == nil, let render = context.objectForKeyedSubscript("pele")?.forProperty("render"), render.isObject else {
-            throw DaemonError.protocolError("pele failed to load: \(context.exception?.toString() ?? "no pele.render")")
+            throw PeleError.unavailable("pele failed to load: \(context.exception?.toString() ?? "no pele.render")")
         }
         self.context = context
         renderFunction = render

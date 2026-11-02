@@ -4,8 +4,8 @@ of mixed posts (markdown, code, json) from 1/4/16 concurrent clients.
 
     scripts/daemon-load.py --bin target/release/notesd [--json out.json]
 
-Every case runs a fresh notesd on a temp HOME, NOTES_DB, NOTES_VAULT and NOTES_SOCK
-(the session folder is $HOME/Desktop/Stage), never the real vault or the installed daemon.
+Every case runs a fresh notesd on a temp HOME, NOTES_DB and NOTES_SOCK
+(the session folder is $HOME/Desktop/Stage), never the installed daemon.
 Each client is its own process with one persistent connection, like stage's client.
 """
 
@@ -181,7 +181,7 @@ def rss_kb(pid):
 def run_case(binary, scenario, posts, clients, duration):
     tmp = tempfile.mkdtemp(prefix="ndl-", dir="/tmp")  # short: sun_path is 104 bytes
     home = os.path.join(tmp, "home")
-    env = dict(os.environ, HOME=home, NOTES_VAULT=os.path.join(tmp, "vault"),
+    env = dict(os.environ, HOME=home,,
                NOTES_DB=os.path.join(tmp, "state", "notes.db"), NOTES_SOCK=os.path.join(tmp, "s.sock"))
     env.pop("NOTES_AGENT", None)
     real_home = os.path.expanduser("~")

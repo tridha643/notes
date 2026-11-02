@@ -89,6 +89,26 @@ private func page(_ html: String) throws -> String {
         #expect((r["width"] as? Double ?? 0) > 0 && (r["height"] as? Double ?? 0) > 0)
     }
 
+    @Test func mermaidSyntaxErrorReadsAsPelesMessage() throws {
+        let h = try Helper()
+        try h.send(["op": "mermaid", "id": 1, "source": "flowchart TD\n  A --> B[a@b]", "max_width": 400, "font_size": 14])
+        let r = try #require(h.next())
+        #expect(r["ok"] as? Bool == false)
+        let error = try #require(r["error"] as? String)
+        #expect(error.hasPrefix("Parse error on line 2:") && error.contains("got 'LINK_ID'"), "\(error)")
+        #expect(r["line"] as? Int == 2 && r["column"] as? Int == 9, "\(r)")
+    }
+
+    @Test func mermaidCheckParsesWithoutRendering() throws {
+        let h = try Helper()
+        try h.send(["op": "mermaid-check", "id": 1, "source": "flowchart TD\n  A --> B[a@b]"])
+        try h.send(["op": "mermaid-check", "id": 2, "source": "flowchart TD\n  A --> B[\"a@b\"]"])
+        var byId: [Int: [String: Any]] = [:]
+        for _ in 0..<2 { let r = try #require(h.next()); byId[r["id"] as? Int ?? 0] = r }
+        #expect(byId[1]?["ok"] as? Bool == false && byId[1]?["line"] as? Int == 2, "\(byId)")
+        #expect(byId[2]?["ok"] as? Bool == true && byId[2]?["svg"] == nil, "\(byId)")
+    }
+
     @Test func mermaidDoesNotWaitBehindWebKitStartup() throws {
         // A fresh helper spends its first ~100 ms building a spare web view on the main
         // thread; `warm` is answered there, so mermaid must not queue behind it.

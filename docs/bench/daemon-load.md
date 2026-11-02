@@ -7,7 +7,7 @@ alternating base and final. Cells are the median of the 5 runs; the range is the
 
 - **base**: 5287fe5. **final**: cf329c4 (branch codex/stage-daemon-load).
 - Harness: `scripts/daemon-load.py --bin <notesd>`. Every case starts a fresh notesd with a temp
-  HOME (so the session folder is `$HOME/Desktop/Stage`), NOTES_DB, NOTES_VAULT and NOTES_SOCK. It
+  HOME (so the session folder is `$HOME/Desktop/Stage`), NOTES_DB and NOTES_SOCK. It
   seeds one session with 100 or 1000 posts (markdown, code and json in turn; 8 distinct code
   bodies, so renders mostly hit the cache) and runs 4 s per case. Each client is its own process
   with one persistent connection, like stage's client.

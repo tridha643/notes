@@ -6,7 +6,7 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 spec=${1:-$here/model/StagePixels.tla}
 cfg=${2:-${spec%.tla}.cfg}
 version=1.8.0
-sha=fc6878c603f0fdc18b9fe3e5bf51860cb90ab5b1154e3c371660c036d6bdd63e
+sha=c57d4d7bbee3ed2c89c32cb9c60cac728f751e80e2570bc4b7368ae39291fc21
 jar="$HOME/.cache/notes-gpui/tla2tools-$version.jar"
 if [ ! -f "$jar" ]; then
   mkdir -p "$(dirname "$jar")"

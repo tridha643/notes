@@ -1,0 +1,1 @@
+{"id":2,"ok":false,"error":"Parse error on line 2:\n  A --> B[a@b]\n--------^\nExpecting 'NODE_STRING', got 'LINK_ID'","line":2,"column":9}

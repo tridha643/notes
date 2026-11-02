@@ -1,38 +1,29 @@
-# `notes` CLI spec (P0 draft, 2026-10-18)
+# `notes` CLI spec
 
-Notes are plain `.md` files in folders under one vault directory; folders are
-real directories and there are no tags. The CLI is the safe, fast way in for
-agents (atomic writes, version checks, history), but `cat` and `grep` on the
-vault still work. Search is fff (`fff-search` crate) embedded in `notesd`.
+The CLI is how agents post to stage: diagrams, diffs, code, terminal output
+and html as cards in the user's terminal pane. See `docs/stage-plan.md`.
 
-References: Obsidian's CLI (~100 verbs, `format=json`, one JSON line over a
-socket; see `obsidian-internals.md`), Claude Code's Read/Edit/Grep semantics,
-sideshow's CLI verbs (`docs/ref/sideshow/bin/sideshow.js`).
+References: sideshow's CLI verbs (`docs/ref/sideshow/bin/sideshow.js`).
 
 ## Shape
 
-- Binary `notes` (Rust). It never touches the vault or SQLite itself; every
-  call is one request to `notesd` over a unix socket and one (or a stream of)
-  responses.
-- Vault: `~/Notes` by default, override with `NOTES_VAULT`. A note is
-  `<folder>/<title>.md`. `notesd` writes atomically (temp file + rename) and
-  watches the vault, so edits made outside the CLI are picked up and versioned.
-- SQLite (WAL) holds what isn't a note: versions and history, trash, the event
-  log, and sideshow's tables.
+- Binary `notes` (Rust). It never touches the session folder or SQLite itself;
+  every call is one request to `notesd` over a unix socket and one (or a stream
+  of) responses.
+- Sessions live in `~/Desktop/Stage` (override with `NOTES_STAGE_DIR`), one JSON
+  file per session. SQLite (WAL) holds the event log, settings and the render
+  cache. `notesd` is the only writer.
 - Socket: `~/Library/Application Support/Notes/notesd.sock`, override with
   `NOTES_SOCK`. launchd owns the socket and starts `notesd` on first connect.
-- Budget (target, unmeasured for the real CLI): ≤10 ms per warm call. The
-  measured process floor on the M5 is ~6.5 ms; a socket round trip is ~8 µs.
-- Milestone 1 verbs keep working: `new`, `list`, `append`, `show` (alias of `read`).
 
 ## Wire protocol
 
 One JSON object per line, UTF-8, both directions.
 
 ```
-→ {"v":1,"id":7,"verb":"edit","args":{"note":"work/plan","edits":[{"old":"foo","new":"bar"}]},"cwd":"/path"}
-← {"id":7,"ok":true,"result":{"path":"work/plan.md","version":43}}
-← {"id":7,"ok":false,"error":{"code":"ambiguous","message":"\"foo\" matches 3 times (lines 4, 9, 30)","hint":"add surrounding text or pass --all"}}
+→ {"v":1,"id":7,"verb":"post-show","args":{"id":"p1"},"cwd":"/path"}
+← {"id":7,"ok":true,"result":{…}}
+← {"id":7,"ok":false,"error":{"code":"not_found","message":"no post p1","hint":"run `notes post list`"}}
 ```
 
 Streaming verbs (`watch`, `wait`) send `{"id":7,"event":{...}}` lines until
@@ -44,16 +35,8 @@ Other tools may speak the protocol directly (e.g. `socat`). The Rust types live 
 | Flag | Meaning |
 |---|---|
 | `--json` | Print the `result` object; lists print one JSON object per line (NDJSON) |
-| `--if-version N` | On writes: fail with exit 5 unless the note is at version N |
 | `--sock PATH` | Socket path (same as `NOTES_SOCK`) |
 | `-q`, `--quiet` | Print nothing on success; rely on the exit code |
-
-## Note references
-
-A `<ref>` is a vault-relative path with or without `.md` (`work/plan`), a bare
-title when only one note has it, or `@last` (most recently updated). A bare
-title that matches notes in several folders fails with exit 4 and lists their
-paths.
 
 ## Exit codes
 
@@ -63,8 +46,6 @@ paths.
 | 1 | Other error (message on stderr) |
 | 2 | Usage error |
 | 3 | Not found |
-| 4 | Ambiguous (bare title or edit match) |
-| 5 | Version conflict (`--if-version` mismatch); the error's `details` carry `{"current_version": N}` |
 | 6 | Daemon unreachable |
 
 Errors go to stderr as one line plus a `hint:` line saying how to fix it.
@@ -72,50 +53,7 @@ With `--json`, the error object is printed to stdout as well.
 
 ## Verbs
 
-### Read
-
-| Verb | What it does |
-|---|---|
-| `notes list [FOLDER] [-r] [--sort updated\|created\|title] [--limit N]` | List notes and subfolders in a folder (vault root by default); `-r` recurses |
-| `notes find <query> [--limit N]` | fff fuzzy path search: typo-tolerant, ranked by how often and how recently you open notes |
-| `notes read <ref> [--lines A:B] [-n]` | Print the body; `--lines` slices, `-n` prefixes line numbers like `cat -n` |
-| `notes search <query> [FOLDER] [-C N] [--case] [--fuzzy] [--limit N]` | fff content grep, results `path:line: text`. Smart case, regex detected automatically, ranked by fff's frecency; `--fuzzy` turns on typo-tolerant matching (off by default, so a miss stays a miss); `-C` adds context lines |
-| `notes links <ref>` / `notes backlinks <ref>` | Outgoing `[[links]]` and notes linking here |
-
-`list --json` prints one line per entry, folders first: `{"folder":"work"}` or a note summary `{path, title, version, updated_at}`.
-
-`read --json` returns `{path, title, version, body, line_count, created_at, updated_at}`.
-
-### Write
-
-| Verb | What it does |
-|---|---|
-| `notes new <path> [TEXT\|-]` | Create a note, making folders as needed; prints its path |
-| `notes edit <ref> --old S --new S [--all]` | Exact find-and-replace. `--old` must match exactly once unless `--all`; otherwise exit 4 with the match count and line numbers |
-| `notes edit <ref> --from FILE\|-` | Several edits from JSON `[{"old":…,"new":…}]`, applied all-or-nothing |
-| `notes append <ref> TEXT\|- [--under HEADING]` | Add to the end, or to the end of a section |
-| `notes prepend <ref> TEXT\|-` | Add at the top |
-| `notes write <ref> -` | Replace the whole body from stdin; requires `--if-version` or `--force` |
-| `notes move <ref> <path>` | Move or rename a note; updates `[[links]]` that point to it |
-| `notes mkdir <folder>` / `notes rmdir <folder>` | Create a folder, or remove an empty one |
-| `notes delete <ref> [--purge]` | Move to trash (kept 30 days, purged when the daemon is idle), or delete for good |
-| `notes restore <ref>` | Bring a note back from trash |
-
-`edit`, `append` and `prepend` don't need `--if-version`: the daemon serializes
-writes per note and re-checks `--old` at apply time, so two agents editing
-different parts of a note both land. Every write returns the new `version`.
-
-### History
-
-| Verb | What it does |
-|---|---|
-| `notes history <ref> [--limit N]` | Versions with time and author (human, or the agent name from `NOTES_AGENT`) |
-| `notes diff <ref> [--from V] [--to V]` | Unified diff between versions (default: previous to current) |
-| `notes revert <ref> --to V` | Restore an earlier version as a new version |
-
-### Sideshow posts
-
-Sideshow's verbs live under `post` so they don't collide with note verbs.
+### Posts
 
 | Verb | What it does |
 |---|---|
@@ -132,13 +70,13 @@ Sideshow's verbs live under `post` so they don't collide with note verbs.
 
 An id that is neither live nor trashed is `not_found` for both verbs, so `--purge` on something already purged (or never there) is `not_found`: no tombstone is kept. Delete emits `session-deleted` (stage drops it from the sidebar), restore emits `session-restored`; repeats emit nothing.
 
-Session data lives in `~/Desktop/Stage/`: one JSON file per session (`<date>-<slug>-<id>.json`, `"schema": 1`) plus `assets/`. notesd is the only writer; deleting a file in Finder deletes the session. Trashed sessions sit in `.trash/` as `<deleted_at>--<file>`, which the folder loader skips; notesd purges those older than 30 days (and their unreferenced assets) at startup and after each note delete, like the notes trash.
+Session data lives in `~/Desktop/Stage/`: one JSON file per session (`<date>-<slug>-<id>.json`, `"schema": 1`) plus `assets/`. notesd is the only writer; deleting a file in Finder deletes the session. Trashed sessions sit in `.trash/` as `<deleted_at>--<file>`, which the folder loader skips; notesd purges those older than 30 days (and their unreferenced assets) at startup.
 
 ### Events
 
 | Verb | What it does |
 |---|---|
-| `notes watch [--since SEQ] [--kind note,post,comment]` | Stream events as NDJSON from the event log, resuming after `SEQ` |
+| `notes watch [--since SEQ] [--kind session,post,comment]` | Stream events as NDJSON from the event log, resuming after `SEQ` |
 | `notes wait --comment [--post ID] [--timeout S]` | Block until the user comments, then print it and exit |
 
 ### Batch
@@ -154,9 +92,8 @@ at its first error.
 
 | Verb | What it does |
 |---|---|
-| `notes import <dir\|file> [FOLDER]` | Copy `.md` files into the vault, keeping their folder structure (Obsidian vaults included) |
 | `notes manifest` | Machine-readable JSON of every verb, its args, output schema and exit codes |
-| `notes agent-howto` | How agents post to stage (sessions, updates, reading comments) and use notes |
+| `notes agent-howto` | How agents post to stage (sessions, updates, reading comments) |
 | `notes guide` | The stage design guide for posts, with the space the user's card gives each part; `notes post` refuses a post that can't fit it and warns about the rest |
 | `notes setup` | A block to paste into AGENTS.md or CLAUDE.md that points agents at stage |
 | `notes doctor` | Socket and database paths, daemon reachable, versions |
@@ -168,16 +105,7 @@ at its first error.
 - No MCP server, no HTTP API, no XPC.
 - No in-process plugins; extending means another client on the socket.
 - No direct SQLite access from the CLI.
-- No tags or properties.
 
-## Decided (2026-10-18)
+## Decided
 
-- Folders only, no tags.
-- Trash keeps notes 30 days.
-- Search and find use fff's ranking (frecency). fff runs with its own watcher off (`watch: false`); `notesd` feeds it changes from its writes and its own watcher, so fff adds no idle timer. See docs/research/fff-check.md on codex/core.
-- Search budget: median ≤20 ms. Searches always run to completion; a rare word or a miss reads the whole vault (~30–60 ms on a 103 MB vault, scaling with size).
 - `batch` exits with the first failed op's exit code, after printing every op's result.
-
-## Open questions
-
-- Loro: with plain files as the source of truth, P0 history is per-write snapshots in SQLite. Loro stays for shared notes later, unless we want it from day one.

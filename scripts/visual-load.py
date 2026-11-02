@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded, isolated stage-helper stress test. No notesd, real posts or vault writes.
+"""Bounded, isolated stage-helper stress test. No notesd or real posts.
 
 Measures helper request -> SVG/first RGBA frame (NOT terminal-visible latency).
 Consumes/unlinks every received shm object and checks actual HTML pixels, dimensions,

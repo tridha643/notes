@@ -25,6 +25,7 @@ private func helperJSON(_ data: Data) throws -> NSDictionary {
 private let requests: [String: HelperRequest] = [
     "warm": .warm(id: 1),
     "mermaid": .mermaid(id: 2, source: "flowchart TD\n  a --> b", maxWidth: 400, fontSize: 14),
+    "mermaid-check": .mermaidCheck(id: 2, source: "flowchart TD\n  a --> b"),
     "image": .image(id: 3, path: "/tmp/photo.heic"),
     "html-open": .htmlOpen(id: 4, path: "/tmp/page.html", width: 330, maxHeight: 180, scale: 2, fps: 60),
     "html-update": .htmlUpdate(id: 4, path: "/tmp/page.html"),
@@ -41,6 +42,7 @@ private let replies: [String: HelperReply] = [
     "image": .image(id: 3, shm: "/stg-123-1", w: 640, h: 480),
     "failed": .failed(id: 3, error: "can't decode /tmp/photo.heic"),
     "failed-no-id": .failed(id: nil, error: "bad request: not a JSON object"),
+    "mermaid-syntax": .mermaidSyntax(id: 2, error: "Parse error on line 2:\n  A --> B[a@b]\n--------^\nExpecting 'NODE_STRING', got 'LINK_ID'", line: 2, column: 9),
     "frame": .frame(id: 4, frame: 7, shm: "/stg-123-2", w: 660, h: 360),
     "patched": .patched(id: 4, patched: true),
 ]

@@ -40,7 +40,7 @@ real-daemon stage integration tests. New regressions cover the exact phone
 viewport, picker round-trips, tappable search, long input, 2,000 boundary wheel
 events, auto-follow, table/list/label fitting, and HTML scale/pixel agreement.
 
-A live Rex smoke test used an isolated temporary HOME/vault/database and real
+A live Rex smoke test used an isolated temporary HOME/database and real
 notesd, installed Stage, and installed Swift helper. It sent SGR wheel/click
 sequences via `rex send`, then checked `rex capture` after each action:
 

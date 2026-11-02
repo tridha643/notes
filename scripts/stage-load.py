@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Load test for stage against a real notesd, with stage in a PTY.
 
-Every scenario runs its own notesd on a temp HOME/NOTES_VAULT/NOTES_DB/NOTES_SOCK
-(your vault, database and ~/Desktop/Stage are never touched), starts stage in a
+Every scenario runs its own notesd on a temp HOME/NOTES_DB/NOTES_SOCK
+(your database and ~/Desktop/Stage are never touched), starts stage in a
 PTY sized like a pane, publishes over the socket from separate processes, and
 records every byte stage writes with its read time. Afterwards a small VT
 parser replays those bytes into a screen grid at each synchronized-update end
@@ -308,9 +308,8 @@ def scenario(name, cfg, stage_bin, notesd_bin, keep, sample):
     d = Path(tempfile.mkdtemp(prefix=f"stage-load-{name}-"))
     home = d / "home"
     (home / "Desktop").mkdir(parents=True)
-    (d / "vault").mkdir()
     sock = str(d / "s.sock")
-    env = {**os.environ, "HOME": str(home), "NOTES_VAULT": str(d / "vault"), "NOTES_DB": str(d / "state/notes.db"), "NOTES_SOCK": sock,
+    env = {**os.environ, "HOME": str(home), "NOTES_DB": str(d / "state/notes.db"), "NOTES_SOCK": sock,
            "STAGE_LATENCY_LOG": str(d / "painted"), "STAGE_LOOP_TRACE": str(d / "loop"), "STAGE_HELPER": str(d / "no-stage-helper"), "TERM": "xterm-256color"}
     for k in ("NOTES_OWNER", "CLAUDE_SESSION_ID", "STAGE_TRACE"):
         env.pop(k, None)
