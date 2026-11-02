@@ -1,4 +1,4 @@
-//! The stage ↔ stage-helper wire: JSON lines over a unix socket (`helper-v4.sock`).
+//! The stage ↔ stage-helper wire: JSON lines over a unix socket (`helper-v5.sock`).
 //!
 //! ```text
 //! → {"op":"mermaid","id":3,"source":"flowchart TD\n a-->b","max_width":400.0,"font_size":14.0}
@@ -172,7 +172,7 @@ pub fn binary() -> PathBuf {
 /// this process and the next client finds pele warm) if nobody answers.
 pub fn connect(cache: &Path) -> Result<UnixStream, String> {
     // Versioned so a client never talks to a helper from an older protocol behavior.
-    let sock = cache.join("helper-v4.sock");
+    let sock = cache.join("helper-v5.sock");
     if let Ok(stream) = UnixStream::connect(&sock) {
         return Ok(stream);
     }
