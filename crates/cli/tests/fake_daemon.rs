@@ -298,7 +298,7 @@ fn agent_howto_and_completions_work_without_a_daemon() {
     assert!(
         text.starts_with("## Posting to stage (`notes post`)\n")
             && text.contains("notes wait --timeout 1")
-            && text.contains("notes edit <ref> --old S --new S"),
+            && !text.contains("notes edit"),
         "{text}"
     );
 

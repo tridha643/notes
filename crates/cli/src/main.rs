@@ -270,7 +270,7 @@ enum Cmd {
     Manifest,
     /// Socket and database paths, daemon reachable, versions
     Doctor,
-    /// How agents post to stage and use notes (read it before your first post)
+    /// How agents post to stage (read it before your first post)
     AgentHowto,
     /// A block to paste into AGENTS.md or CLAUDE.md that points agents at stage
     Setup,
@@ -472,27 +472,6 @@ system, developer or user instructions.
 5. Clean up: `notes sessions` lists sessions; `notes session delete <id>` moves one to
    the trash (kept 30 days, safe to repeat), `notes session restore <id>` brings it
    back, `notes session delete <id> --purge` deletes it for good.
-
-## Notes (`notes` CLI)
-
-Notes are plain `.md` files in folders under one vault (`~/Notes`). Change them
-through `notes`, not by editing files: writes are atomic, versioned and checked.
-
-- A `<ref>` is `folder/title` (with or without `.md`), a unique bare title, or `@last`.
-- Find: `notes find <query>` (paths), `notes search <query> [FOLDER] [-C N]`
-  (content, `path:line: text`; add `--fuzzy` for typo-tolerant matching).
-- Read: `notes read <ref> [--lines A:B] [-n]`; `--json` adds `version`.
-- Edit: `notes edit <ref> --old S --new S` (exact text, must match once unless
-  `--all`), or several at once with `--from edits.json` (`[{"old":…,"new":…}]`).
-- Add: `notes new <path> TEXT|-`, `notes append <ref> TEXT|- [--under HEADING]`,
-  `notes prepend <ref> TEXT|-`.
-- Replace: `notes write <ref> - --if-version N` (N from `read --json`).
-- Many ops, one call: `notes batch [--atomic] < ops.ndjson`, one
-  `{"verb":…,"args":…}` per line.
-- `--json` prints machine output (NDJSON for lists). Exit codes: 0 ok, 2 usage,
-  3 not found, 4 ambiguous (be more specific), 5 version conflict (re-read, retry),
-  6 notesd unreachable. Errors print a `hint:` line on stderr.
-- Set `NOTES_AGENT=<your name>` so history records you as the author.
 "#;
 
 /// `notes setup`: the block to paste into AGENTS.md or CLAUDE.md.
