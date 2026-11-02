@@ -45,7 +45,8 @@ tracks its guide/DESIGN_GUIDE.md.
 - `scripts/install.sh` builds this checkout and installs it with the release installer
   (`install.sh`), restarting notesd; run it to try changes against your real stage.
   `scripts/release.sh vX.Y.Z` publishes a release the curl installer picks up.
-- Drive and prove stage changes with `.claude/skills/verify`; model-check diagram pixels with
-  `.claude/skills/stage-pixels`.
+- Drive and prove stage changes with `.claude/skills/verify`. Model-check diagram pixels with
+  `.claude/skills/stage-pixels`, and comment delivery to agents (`agent_seq`) with
+  `.claude/skills/stage-feedback`.
 - Orchestrate agents with the rex skill (`rex skill show`): each agent runs interactively in a
   Rex session in its own worktree.
