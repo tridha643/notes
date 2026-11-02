@@ -81,6 +81,11 @@ card first:
   the diagram. Use `<br/>` in labels when a name needs wrapping.
 - Use `subgraph` blocks to group layers vertically rather than stretching one
   row across the card.
+- Quote any label with punctuation: `B["account_list<br/>qa@ accounts"]`, not
+  `B[account_list<br/>qa@ accounts]`. An unquoted `name@` opens mermaid's
+  `A@{ shape }` syntax and the diagram fails to parse. `notes post` parses
+  every mermaid part first and refuses one that doesn't, with pele's line and
+  caret.
 
 Prefer this shape:
 

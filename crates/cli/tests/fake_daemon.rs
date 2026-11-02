@@ -543,3 +543,31 @@ fn sideshow_verbs_send_exact_requests_and_print_text() {
     }
     fs::remove_file(&upload).unwrap();
 }
+
+#[test]
+fn post_refuses_mermaid_that_stage_helper_cannot_parse() {
+    use std::os::unix::fs::PermissionsExt;
+    let helper = temp_file(
+        "helper.sh",
+        b"#!/bin/sh\ncat >/dev/null\nprintf 'Parse error on line 2:\\nExpecting NODE_STRING\\n'\nexit 1\n",
+    );
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_notes"))
+        .args(["post", "mermaid", "-", "--title", "Flow", "--sock", "/nonexistent/notesd.sock"])
+        .env("STAGE_HELPER", &helper)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"flowchart TD\n  A --> B[a@b]\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(
+        err.starts_with("error: mermaid part 1: Parse error on line 2:\nExpecting NODE_STRING\n")
+            && err.contains("wasn't sent")
+            && err.contains(r#"B["qa@ accounts"]"#),
+        "{err}"
+    );
+}

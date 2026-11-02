@@ -254,6 +254,22 @@ func scheduleIdleExit() {
     DispatchQueue.main.asyncAfter(deadline: .now() + 600, execute: work)
 }
 
+// `stage-helper --check-mermaid`: parse stdin with pele and exit, for `notes post`.
+// Exit 0 parses, 1 prints pele's syntax error, 2 means pele couldn't run.
+if CommandLine.arguments.dropFirst() == ["--check-mermaid"] {
+    let source = String(decoding: FileHandle.standardInput.readDataToEndOfFile(), as: UTF8.self)
+    do {
+        _ = try Pele.shared.render(source)
+        exit(0)
+    } catch let PeleError.syntax(_, _, message) {
+        print(message)
+        exit(1)
+    } catch {
+        print(error)
+        exit(2)
+    }
+}
+
 // Warm up before the first request: pele's JavaScript on its queue first (it doesn't
 // need AppKit, which takes ~40 ms to start cold), then a spare web view (and with it
 // WebKit's web process) on the main thread.

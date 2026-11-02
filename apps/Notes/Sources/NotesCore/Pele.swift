@@ -10,8 +10,18 @@ import CoreText
 import Foundation
 import JavaScriptCore
 
-public enum PeleError: Error, Sendable, Equatable {
-    case protocolError(String)
+public enum PeleError: Error, Sendable, Equatable, CustomStringConvertible {
+    /// pele rejected the source; `message` is pele's, with the line and a caret.
+    case syntax(line: Int, column: Int, message: String)
+    /// pele couldn't load or returned no diagram.
+    case unavailable(String)
+
+    public var description: String {
+        switch self {
+        case let .syntax(_, _, message): "mermaid: \(message)"
+        case let .unavailable(why): "mermaid: \(why)"
+        }
+    }
 }
 
 public struct PeleDiagram: Sendable, Equatable {
@@ -44,10 +54,15 @@ public final class Pele: @unchecked Sendable {
             let result = render.call(withArguments: [source, options])
             if let exception = context.exception {
                 context.exception = nil
-                throw PeleError.protocolError("mermaid: \(exception.toString() ?? "render failed")")
+                guard exception.forProperty("name").toString() == "PeleError" else {
+                    throw PeleError.unavailable(exception.toString() ?? "render failed")
+                }
+                throw PeleError.syntax(line: Int(exception.forProperty("line").toInt32()),
+                                       column: Int(exception.forProperty("column").toInt32()),
+                                       message: exception.forProperty("message").toString() ?? "parse error")
             }
             guard let result, let svg = result.forProperty("svg").toString() else {
-                throw PeleError.protocolError("mermaid: no svg")
+                throw PeleError.unavailable("no svg")
             }
             return PeleDiagram(svg: svg, width: result.forProperty("width").toDouble(),
                                height: result.forProperty("height").toDouble(),
@@ -58,7 +73,7 @@ public final class Pele: @unchecked Sendable {
     private func warm() throws -> (JSContext, JSValue) {
         if let context, let renderFunction { return (context, renderFunction) }
         guard let url = Self.scriptURL, let script = try? String(contentsOf: url, encoding: .utf8) else {
-            throw PeleError.protocolError("pele.global.js missing from the app bundle")
+            throw PeleError.unavailable("pele.global.js missing next to stage-helper")
         }
         let context = JSContext()!
         let width: @convention(block) (String, Double, Int) -> Double = { [unowned self] text, size, style in
@@ -69,7 +84,7 @@ public final class Pele: @unchecked Sendable {
         context.setObject(measurer, forKeyedSubscript: "__measurer" as NSString)
         context.evaluateScript(script, withSourceURL: url)
         guard context.exception == nil, let render = context.objectForKeyedSubscript("pele")?.forProperty("render"), render.isObject else {
-            throw PeleError.protocolError("pele failed to load: \(context.exception?.toString() ?? "no pele.render")")
+            throw PeleError.unavailable("pele failed to load: \(context.exception?.toString() ?? "no pele.render")")
         }
         self.context = context
         renderFunction = render

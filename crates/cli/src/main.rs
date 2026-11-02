@@ -15,7 +15,7 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    process::ExitCode,
+    process::{Command, ExitCode, Stdio},
 };
 
 use clap::{CommandFactory, Parser, Subcommand};
@@ -387,6 +387,17 @@ fn space_lines(s: &StageSpace) -> String {
 /// warnings, and refuse a post that can't fit. Until stage has reported its
 /// space, overflow is checked against a default and only warned about.
 fn fit(title: Option<&str>, parts: &[Part], ask: &mut Ask<'_>) -> Result<(), ErrorBody> {
+    let broken = mermaid_errors(parts);
+    if !broken.is_empty() {
+        for e in &broken {
+            eprintln!("error: {e}");
+        }
+        return Err(fail(
+            ErrorCode::Usage,
+            "a mermaid part doesn't parse, so the post wasn't sent",
+            "quote any label with punctuation, e.g. B[\"qa@ accounts\"], and post again",
+        ));
+    }
     let reported = stage_space(ask);
     let space = reported.unwrap_or(lint::DEFAULT_SPACE);
     let found = lint::check(title, parts, &space);
@@ -404,6 +415,41 @@ fn fit(title: Option<&str>, parts: &[Part], ask: &mut Ask<'_>) -> Result<(), Err
     }
     let message = format!("post doesn't fit the user's stage card, so it wasn't sent. The card gives:\n{}", space_lines(&space));
     Err(fail(ErrorCode::Usage, message.trim_end(), "fix each error above and post again"))
+}
+
+/// pele's syntax error for each mermaid part that doesn't parse, checked with the
+/// stage-helper stage would render it with (`STAGE_HELPER`, else next to this binary).
+/// A part that can't be checked only warns.
+fn mermaid_errors(parts: &[Part]) -> Vec<String> {
+    let helper = env::var_os("STAGE_HELPER").map(PathBuf::from).unwrap_or_else(|| {
+        env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|d| d.join("stage-helper")))
+            .filter(|p| p.exists())
+            .unwrap_or_else(|| PathBuf::from("stage-helper"))
+    });
+    let check = |source: &str| -> io::Result<(Option<i32>, String)> {
+        let mut child = Command::new(&helper)
+            .arg("--check-mermaid")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        child.stdin.take().expect("piped").write_all(source.as_bytes())?;
+        let out = child.wait_with_output()?;
+        Ok((out.status.code(), String::from_utf8_lossy(&out.stdout).trim_end().to_owned()))
+    };
+    let mut errors = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        let Part::Mermaid { mermaid, .. } = part else { continue };
+        match check(mermaid) {
+            Ok((Some(0), _)) => {}
+            Ok((Some(1), why)) => errors.push(format!("mermaid part {}: {why}", i + 1)),
+            Ok((_, why)) => eprintln!("warning: mermaid part {} not checked: {why}", i + 1),
+            Err(e) => eprintln!("warning: mermaid part {} not checked: {}: {e}", i + 1, helper.display()),
+        }
+    }
+    errors
 }
 
 /// Parse a flag value as one of a proto enum's kebab-case names.
