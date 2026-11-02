@@ -1,3 +1,0 @@
-import NotesUI
-
-runApp()

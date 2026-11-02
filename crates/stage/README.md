@@ -80,7 +80,7 @@ The code splits IO from decisions, so nearly everything is testable without a te
   in cells. Every escape carries `q=2`, so the terminal never answers into stage's input.
 - Without the helper, those cards fall back to text ("no stage-helper").
 - [`page.rs`](src/page.rs) wraps every html part in stage's own page (sideshow's theme tokens in
-  stage's palette, base styles, SVG classes, kits) before the helper loads it, as Notes.app does.
+  stage's palette, base styles, SVG classes, kits) before the helper loads it.
 - An html page is laid out at the card's width and may grow to the feed's height. stage writes
   that space, with the card's text width, to the `stage.space` setting whenever it changes, and
   `notes guide` and `notes post` hold agents to it.

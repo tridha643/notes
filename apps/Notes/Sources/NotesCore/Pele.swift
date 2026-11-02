@@ -10,6 +10,10 @@ import CoreText
 import Foundation
 import JavaScriptCore
 
+public enum PeleError: Error, Sendable, Equatable {
+    case protocolError(String)
+}
+
 public struct PeleDiagram: Sendable, Equatable {
     /// SVG with pele's CSS variables still in place; resolve per theme.
     public var svg: String
@@ -40,10 +44,10 @@ public final class Pele: @unchecked Sendable {
             let result = render.call(withArguments: [source, options])
             if let exception = context.exception {
                 context.exception = nil
-                throw DaemonError.protocolError("mermaid: \(exception.toString() ?? "render failed")")
+                throw PeleError.protocolError("mermaid: \(exception.toString() ?? "render failed")")
             }
             guard let result, let svg = result.forProperty("svg").toString() else {
-                throw DaemonError.protocolError("mermaid: no svg")
+                throw PeleError.protocolError("mermaid: no svg")
             }
             return PeleDiagram(svg: svg, width: result.forProperty("width").toDouble(),
                                height: result.forProperty("height").toDouble(),
@@ -54,7 +58,7 @@ public final class Pele: @unchecked Sendable {
     private func warm() throws -> (JSContext, JSValue) {
         if let context, let renderFunction { return (context, renderFunction) }
         guard let url = Self.scriptURL, let script = try? String(contentsOf: url, encoding: .utf8) else {
-            throw DaemonError.protocolError("pele.global.js missing from the app bundle")
+            throw PeleError.protocolError("pele.global.js missing from the app bundle")
         }
         let context = JSContext()!
         let width: @convention(block) (String, Double, Int) -> Double = { [unowned self] text, size, style in
@@ -65,7 +69,7 @@ public final class Pele: @unchecked Sendable {
         context.setObject(measurer, forKeyedSubscript: "__measurer" as NSString)
         context.evaluateScript(script, withSourceURL: url)
         guard context.exception == nil, let render = context.objectForKeyedSubscript("pele")?.forProperty("render"), render.isObject else {
-            throw DaemonError.protocolError("pele failed to load: \(context.exception?.toString() ?? "no pele.render")")
+            throw PeleError.protocolError("pele failed to load: \(context.exception?.toString() ?? "no pele.render")")
         }
         self.context = context
         renderFunction = render

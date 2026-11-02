@@ -1,4 +1,4 @@
-//! stage against a real notesd (target/debug/notesd) on a temp vault, database,
+//! stage against a real notesd (target/debug/notesd) on a temp database,
 //! socket and HOME (so ~/Desktop/Stage lands in the temp dir). If notesd isn't
 //! built, each test prints SKIP and returns; build it with `cargo build -p notesd`.
 
@@ -84,10 +84,8 @@ fn notesd() -> Option<Notesd> {
     static N: AtomicUsize = AtomicUsize::new(0);
     let dir = PathBuf::from(format!("/tmp/st-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
     let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(dir.join("vault")).unwrap();
     fs::create_dir_all(dir.join("home")).unwrap();
     let child = Command::new(bin)
-        .env("NOTES_VAULT", dir.join("vault"))
         .env("NOTES_DB", dir.join("state/notes.db"))
         .env("NOTES_SOCK", dir.join("s.sock"))
         .env("HOME", dir.join("home"))

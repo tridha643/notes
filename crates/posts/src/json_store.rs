@@ -146,7 +146,7 @@ pub struct Store {
 }
 
 fn fsync(file: &File) -> io::Result<()> {
-    // ponytail: fsync, not F_FULLFSYNC, matching the vault's notes (crash-safe, not power-loss-safe).
+    // ponytail: fsync, not F_FULLFSYNC, (crash-safe, not power-loss-safe).
     if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -383,7 +383,7 @@ impl Store {
     /// settings and the render cache. Moves sessions out of a pre-JSON database once.
     pub fn open(db: Connection, root: PathBuf) -> Result<Store> {
         crate::migrate(&db)?;
-        // An unreadable folder (macOS privacy, a file in the way) mustn't take the vault
+        // An unreadable folder (macOS privacy, a file in the way) mustn't take the daemon
         // down with it: serve no sessions, report it in `doctor`, and let writes fail.
         let (stage, problem) = match Stage::load(&root) {
             Ok(stage) => (stage, None),

@@ -1,7 +1,7 @@
 # Stage latency and load tests — 2026-10-30
 
-18-core Apple Silicon, 48 GiB RAM. All tests use isolated temporary homes, sockets,
-vaults and databases. No benchmark publishes to the user's real stage session.
+18-core Apple Silicon, 48 GiB RAM. All tests use isolated temporary homes, sockets
+and databases. No benchmark publishes to the user's real stage session.
 Storage measurements and five alternating daemon A/B runs are in
 [daemon-load.md](daemon-load.md).
 

@@ -5,7 +5,7 @@ Run after cargo build && cargo build --release -p stage:
     python3 scripts/stage-scroll-e2e.py REX_SESSION
 
 Only generated fixtures in a temporary HOME are used. Test windows stay in the
-background and are closed on exit. No user vault or live notesd is touched.
+background and are closed on exit. No live notesd is touched.
 """
 import json
 import os
@@ -75,10 +75,9 @@ def run(*args, **kwargs):
 def main(session):
     root = Path(__file__).resolve().parent.parent
     base = Path(tempfile.mkdtemp(prefix="stage-scroll-e2e-", dir="/tmp"))
-    env = dict(os.environ, HOME=str(base / "home"), NOTES_VAULT=str(base / "vault"),
+    env = dict(os.environ, HOME=str(base / "home"),,
                NOTES_DB=str(base / "state/notes.db"), NOTES_SOCK=str(base / "s.sock"))
     (base / "home").mkdir()
-    (base / "vault").mkdir()
     daemon_log = open(base / "daemon.log", "w")
     daemon = subprocess.Popen([str(root / "target/debug/notesd")], env=env,
                               stdout=subprocess.DEVNULL, stderr=daemon_log)

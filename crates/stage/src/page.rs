@@ -1,8 +1,6 @@
 //! The document stage loads an html part into: stage's palette as sideshow's
 //! theme tokens, sideshow's base styles and SVG classes, the part's kits, then
-//! the part itself. It mirrors Notes.app's shell (apps/Notes/Sources/NotesUI/
-//! WebParts.swift), so a post written to sideshow's guide renders the same in
-//! both. The defaults sit in a cascade layer, so any rule the agent writes wins
+//! the part itself. A post written to sideshow's guide renders the same here as in sideshow. The defaults sit in a cascade layer, so any rule the agent writes wins
 //! over them; only media is held to the card's width.
 
 use notes_proto::kits::kits;
@@ -33,7 +31,7 @@ const TOKENS: &str = ":root{color-scheme:dark;\
 --font-mono:ui-monospace,SFMono-Regular,Menlo,monospace;\
 --border-radius-md:8px;--border-radius-lg:12px;--border-radius-xl:16px}";
 
-/// From sideshow's server/surfacePage.ts, as Notes.app has it, at a card's text size.
+/// From sideshow's server/surfacePage.ts, at a card's text size.
 const BASE: &str = "html{box-sizing:border-box}*,*::before,*::after{box-sizing:inherit}\
 body{margin:0;padding:12px;background:var(--color-background-primary);color:var(--color-text-primary);font:14px/1.5 var(--font-sans)}\
 code,pre,kbd{font-family:var(--font-mono)}\

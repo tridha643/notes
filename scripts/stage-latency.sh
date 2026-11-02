@@ -1,6 +1,6 @@
 #!/bin/sh
 # Publish→painted latency for stage: 100 posts into one session, p50/p95, fails if p95 ≥ 250 ms.
-# Runs its own notesd on temp dirs (your vault and ~/Desktop/Stage are untouched) and stage in
+# Runs its own notesd on temp dirs (~/Desktop/Stage is untouched) and stage in
 # a pty via script(1). Publish times are taken right before each post-new request is written
 # to the socket; paint times come from stage's STAGE_LATENCY_LOG.
 set -eu
@@ -9,8 +9,8 @@ cd "$(dirname "$0")/.."
 cargo build -q --release -p notesd -p stage
 dir=$(mktemp -d /tmp/stl.XXXXXX)
 trap 'kill $stage_pid $notesd_pid 2>/dev/null; rm -rf "$dir"' EXIT
-mkdir -p "$dir/vault" "$dir/home"
-export NOTES_VAULT="$dir/vault" NOTES_DB="$dir/state/notes.db" NOTES_SOCK="$dir/s.sock" HOME="$dir/home"
+mkdir -p "$dir/home"
+export NOTES_DB="$dir/state/notes.db" NOTES_SOCK="$dir/s.sock" HOME="$dir/home"
 target/release/notesd 2>/dev/null &
 notesd_pid=$!
 python3 - "$dir" <<'PY'
