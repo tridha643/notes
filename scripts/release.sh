@@ -5,6 +5,7 @@ set -eu
 tag="$1"
 cd "$(dirname "$0")/.."
 case "$tag" in v[0-9]*) ;; *) echo "usage: scripts/release.sh vX.Y.Z" >&2; exit 2 ;; esac
+[ "$(uname -m)" = arm64 ] || { echo "build releases on Apple Silicon outside Rosetta: the asset is arm64" >&2; exit 1; }
 [ -z "$(git status --porcelain)" ] || { echo "commit or stash changes first" >&2; exit 1; }
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT

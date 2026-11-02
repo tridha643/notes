@@ -326,6 +326,22 @@ fn session_delete_trashes_and_restore_brings_it_back_idempotently() {
 }
 
 #[test]
+fn deleting_a_session_purges_trash_past_its_30_days() {
+    let d = Notesd::new();
+    let old = d.ok("post-new", json!({ "title": "Old", "parts": [md("x")] }))["post"]["session"].clone();
+    d.ok("session-delete", json!({ "id": old }));
+    let trash = d.stage().join(".trash");
+    let file = fs::read_dir(&trash).unwrap().next().unwrap().unwrap().path();
+    let name = file.file_name().unwrap().to_string_lossy().into_owned();
+    fs::rename(&file, trash.join(format!("0--{}", name.split_once("--").unwrap().1))).unwrap();
+
+    let new = d.ok("session-new", json!({ "agent": "claude", "title": "New" }))["id"].clone();
+    d.ok("session-delete", json!({ "id": new }));
+    d.err("not_found", "session-restore", json!({ "id": old }));
+    d.ok("session-restore", json!({ "id": new }));
+}
+
+#[test]
 fn session_search_finds_titles_then_content() {
     let d = Notesd::new();
     let named = d.ok("session-new", json!({ "agent": "claude", "title": "Redirect bug" }));

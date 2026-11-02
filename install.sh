@@ -11,6 +11,7 @@ repo="tridha643/notes"
 asset="stage-macos-arm64.tar.gz"
 [ "$(uname -s)" = Darwin ] || { echo "stage runs on macOS only" >&2; exit 1; }
 [ "$(uname -m)" = arm64 ] || { echo "stage needs an Apple Silicon Mac" >&2; exit 1; }
+[ "$(sw_vers -productVersion | cut -d. -f1)" -ge 26 ] || { echo "stage needs macOS 26 or later" >&2; exit 1; }
 
 dist="${1:-}"
 if [ -z "$dist" ]; then
@@ -72,6 +73,7 @@ case ":$PATH:" in
   *) echo "add $bin to your PATH: echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc" >&2 ;;
 esac
 # launchd needs a moment after bootstrap before the socket answers.
-for _ in 1 2 3 4 5 6 7 8 9 10; do "$bin/notes" doctor >/dev/null 2>&1 && break; sleep 0.2; done
-"$bin/notes" doctor
+sock="$support/notesd.sock"
+for _ in 1 2 3 4 5 6 7 8 9 10; do "$bin/notes" doctor --sock "$sock" >/dev/null 2>&1 && break; sleep 0.2; done
+"$bin/notes" doctor --sock "$sock"
 echo "installed. Open a terminal pane and run: stage"

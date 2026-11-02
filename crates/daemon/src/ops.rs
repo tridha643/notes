@@ -44,7 +44,11 @@ impl Tx<'_> {
             Verb::SessionList => value(p::session_list(db).map_err(Fail)?),
             Verb::SessionSearch(a) => value(p::session_search(db, a).map_err(Fail)?),
             Verb::SessionRename(a) => self.written_posts(p::session_rename(db, a)),
-            Verb::SessionDelete(a) => self.written_posts(p::session_delete(db, a)),
+            Verb::SessionDelete(a) => {
+                // Trash only grows here, so expired sessions leave here too, not only at startup.
+                p::trash_purge(db, self.now).map_err(Fail)?;
+                self.written_posts(p::session_delete(db, a))
+            }
             Verb::SessionRestore(a) => self.written_posts(p::session_restore(db, &a.id)),
             Verb::PostNew(a) => {
                 let cwd = self.cwd.clone();
