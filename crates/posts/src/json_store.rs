@@ -146,7 +146,7 @@ pub struct Store {
 }
 
 fn fsync(file: &File) -> io::Result<()> {
-    // ponytail: fsync, not F_FULLFSYNC, (crash-safe, not power-loss-safe).
+    // ponytail: fsync, not F_FULLFSYNC (crash-safe, not power-loss-safe).
     if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
         return Err(io::Error::last_os_error());
     }
