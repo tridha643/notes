@@ -10,6 +10,8 @@ before calling a feature verified.
 | Scrolling to visuals that weren't on screen | [scroll.md](scroll.md) |
 | Card focus (`z`, `Esc`) | [card-focus.md](card-focus.md) |
 | Sidebar toggle (`s`) | [sidebar.md](sidebar.md) |
+| Agent guide and post checks | [agent-guide.md](agent-guide.md) |
+| Install (curl and source) | [install.md](install.md) |
 
 Heavy diagrams: `scripts/heavy.py` makes a "stage verify heavy" session (real charts from
 pstack's /statechart corpus, an 80-state statechart, a 160-node architecture flowchart, a
