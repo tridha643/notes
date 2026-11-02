@@ -547,14 +547,24 @@ fn sideshow_verbs_send_exact_requests_and_print_text() {
 #[test]
 fn post_refuses_mermaid_that_stage_helper_cannot_parse() {
     use std::os::unix::fs::PermissionsExt;
+    // A stand-in for `stage-helper --serve SOCK` that rejects every diagram.
     let helper = temp_file(
-        "helper.sh",
-        b"#!/bin/sh\ncat >/dev/null\nprintf 'Parse error on line 2:\\nExpecting NODE_STRING\\n'\nexit 1\n",
+        "helper.py",
+        br#"#!/usr/bin/env python3
+import json, os, socket, sys
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[2]); s.listen(1)
+c, _ = s.accept(); f = c.makefile("rw")
+req = json.loads(f.readline())
+f.write(json.dumps({"id": req["id"], "ok": False, "error": "Parse error on line 2:\nExpecting NODE_STRING", "line": 2, "column": 8}) + "\n"); f.flush()
+"#,
     );
     fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+    // Short, so the helper socket under it fits sun_path.
+    let home = PathBuf::from(format!("/tmp/ncli-{}", std::process::id()));
     let mut child = Command::new(env!("CARGO_BIN_EXE_notes"))
         .args(["post", "mermaid", "-", "--title", "Flow", "--sock", "/nonexistent/notesd.sock"])
         .env("STAGE_HELPER", &helper)
+        .env("HOME", &home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -562,6 +572,7 @@ fn post_refuses_mermaid_that_stage_helper_cannot_parse() {
         .unwrap();
     child.stdin.take().unwrap().write_all(b"flowchart TD\n  A --> B[a@b]\n").unwrap();
     let out = child.wait_with_output().unwrap();
+    let _ = fs::remove_dir_all(&home);
     let err = String::from_utf8(out.stderr).unwrap();
     assert_eq!(out.status.code(), Some(2), "{err}");
     assert!(

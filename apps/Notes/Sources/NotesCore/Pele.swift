@@ -52,15 +52,7 @@ public final class Pele: @unchecked Sendable {
                                           "measurer": context.objectForKeyedSubscript("__measurer") as Any]
             if let maxWidth { options["maxWidth"] = maxWidth }
             let result = render.call(withArguments: [source, options])
-            if let exception = context.exception {
-                context.exception = nil
-                guard exception.forProperty("name").toString() == "PeleError" else {
-                    throw PeleError.unavailable(exception.toString() ?? "render failed")
-                }
-                throw PeleError.syntax(line: Int(exception.forProperty("line").toInt32()),
-                                       column: Int(exception.forProperty("column").toInt32()),
-                                       message: exception.forProperty("message").toString() ?? "parse error")
-            }
+            try Self.rethrow(context)
             guard let result, let svg = result.forProperty("svg").toString() else {
                 throw PeleError.unavailable("no svg")
             }
@@ -68,6 +60,27 @@ public final class Pele: @unchecked Sendable {
                                height: result.forProperty("height").toDouble(),
                                type: result.forProperty("type").toString() ?? "")
         }
+    }
+
+    /// Parses without laying out: `syntax` for what `render` would reject as source.
+    public func parse(_ source: String) throws {
+        try queue.sync {
+            let (context, _) = try warm()
+            _ = context.objectForKeyedSubscript("pele").forProperty("parse").call(withArguments: [source])
+            try Self.rethrow(context)
+        }
+    }
+
+    /// Turns a pending JavaScript exception into a `PeleError` and clears it.
+    private static func rethrow(_ context: JSContext) throws {
+        guard let exception = context.exception else { return }
+        context.exception = nil
+        guard exception.forProperty("name").toString() == "PeleError" else {
+            throw PeleError.unavailable(exception.toString() ?? "render failed")
+        }
+        throw PeleError.syntax(line: Int(exception.forProperty("line").toInt32()),
+                               column: Int(exception.forProperty("column").toInt32()),
+                               message: exception.forProperty("message").toString() ?? "parse error")
     }
 
     private func warm() throws -> (JSContext, JSValue) {

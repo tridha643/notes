@@ -95,27 +95,18 @@ private func page(_ html: String) throws -> String {
         let r = try #require(h.next())
         #expect(r["ok"] as? Bool == false)
         let error = try #require(r["error"] as? String)
-        #expect(error.hasPrefix("mermaid: Parse error on line 2:") && error.contains("got 'LINK_ID'"), "\(error)")
+        #expect(error.hasPrefix("Parse error on line 2:") && error.contains("got 'LINK_ID'"), "\(error)")
+        #expect(r["line"] as? Int == 2 && r["column"] as? Int == 9, "\(r)")
     }
 
-    @Test func checkMermaidExitsWithPelesError() throws {
-        func check(_ source: String) throws -> (Int32, String) {
-            let p = Process()
-            p.executableURL = Bundle(for: Marker.self).bundleURL.deletingLastPathComponent().appendingPathComponent("stage-helper")
-            p.arguments = ["--check-mermaid"]
-            let (input, output) = (Pipe(), Pipe())
-            p.standardInput = input
-            p.standardOutput = output
-            try p.run()
-            input.fileHandleForWriting.write(Data(source.utf8))
-            try input.fileHandleForWriting.close()
-            let text = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            p.waitUntilExit()
-            return (p.terminationStatus, text)
-        }
-        let (bad, why) = try check("flowchart TD\n  A --> B[a@b]\n")
-        #expect(bad == 1 && why.hasPrefix("Parse error on line 2:"), "\(why)")
-        #expect(try check("flowchart TD\n  A --> B[\"a@b\"]\n").0 == 0)
+    @Test func mermaidCheckParsesWithoutRendering() throws {
+        let h = try Helper()
+        try h.send(["op": "mermaid-check", "id": 1, "source": "flowchart TD\n  A --> B[a@b]"])
+        try h.send(["op": "mermaid-check", "id": 2, "source": "flowchart TD\n  A --> B[\"a@b\"]"])
+        var byId: [Int: [String: Any]] = [:]
+        for _ in 0..<2 { let r = try #require(h.next()); byId[r["id"] as? Int ?? 0] = r }
+        #expect(byId[1]?["ok"] as? Bool == false && byId[1]?["line"] as? Int == 2, "\(byId)")
+        #expect(byId[2]?["ok"] as? Bool == true && byId[2]?["svg"] == nil, "\(byId)")
     }
 
     @Test func mermaidDoesNotWaitBehindWebKitStartup() throws {

@@ -15,7 +15,7 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    process::{Command, ExitCode, Stdio},
+    process::ExitCode,
 };
 
 use clap::{CommandFactory, Parser, Subcommand};
@@ -417,39 +417,44 @@ fn fit(title: Option<&str>, parts: &[Part], ask: &mut Ask<'_>) -> Result<(), Err
     Err(fail(ErrorCode::Usage, message.trim_end(), "fix each error above and post again"))
 }
 
-/// pele's syntax error for each mermaid part that doesn't parse, checked with the
-/// stage-helper stage would render it with (`STAGE_HELPER`, else next to this binary).
+/// pele's syntax error for each mermaid part that doesn't parse, from the shared
+/// stage-helper stage renders with (launched if no stage has, then left warm).
 /// A part that can't be checked only warns.
 fn mermaid_errors(parts: &[Part]) -> Vec<String> {
-    let helper = env::var_os("STAGE_HELPER").map(PathBuf::from).unwrap_or_else(|| {
-        env::current_exe()
-            .ok()
-            .and_then(|e| e.parent().map(|d| d.join("stage-helper")))
-            .filter(|p| p.exists())
-            .unwrap_or_else(|| PathBuf::from("stage-helper"))
-    });
-    let check = |source: &str| -> io::Result<(Option<i32>, String)> {
-        let mut child = Command::new(&helper)
-            .arg("--check-mermaid")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
-        child.stdin.take().expect("piped").write_all(source.as_bytes())?;
-        let out = child.wait_with_output()?;
-        Ok((out.status.code(), String::from_utf8_lossy(&out.stdout).trim_end().to_owned()))
-    };
-    let mut errors = Vec::new();
-    for (i, part) in parts.iter().enumerate() {
-        let Part::Mermaid { mermaid, .. } = part else { continue };
-        match check(mermaid) {
-            Ok((Some(0), _)) => {}
-            Ok((Some(1), why)) => errors.push(format!("mermaid part {}: {why}", i + 1)),
-            Ok((_, why)) => eprintln!("warning: mermaid part {} not checked: {why}", i + 1),
-            Err(e) => eprintln!("warning: mermaid part {} not checked: {}: {e}", i + 1, helper.display()),
-        }
+    use notes_proto::helper::{self, HelperReply, HelperRequest, MermaidSyntax};
+    let sources: Vec<(u64, &str)> = (1..)
+        .zip(parts)
+        .filter_map(|(i, p)| match p {
+            Part::Mermaid { mermaid, .. } => Some((i, mermaid.as_str())),
+            _ => None,
+        })
+        .collect();
+    if sources.is_empty() {
+        return Vec::new();
     }
-    errors
+    let ask = || -> Result<Vec<String>, String> {
+        let mut stream = helper::connect(&helper::cache_dir())?;
+        for &(id, source) in &sources {
+            let req = HelperRequest::MermaidCheck { id, source: source.into() };
+            writeln!(stream, "{}", serde_json::to_string(&req).expect("request serializes")).map_err(|e| e.to_string())?;
+        }
+        let mut errors = Vec::new();
+        let mut lines = BufReader::new(stream).lines();
+        for _ in &sources {
+            let line = lines.next().ok_or("stage-helper hung up")?.map_err(|e| e.to_string())?;
+            match serde_json::from_str(&line).map_err(|e| e.to_string())? {
+                HelperReply::MermaidSyntax(MermaidSyntax { id, error, .. }) => errors.push((id, error)),
+                HelperReply::Failed(f) => eprintln!("warning: mermaid part {} not checked: {}", f.id.unwrap_or(0), f.error),
+                _ => {}
+            }
+        }
+        errors.sort();
+        Ok(errors.into_iter().map(|(id, error)| format!("mermaid part {id}: {error}")).collect())
+    };
+    ask().unwrap_or_else(|e| {
+        eprintln!("warning: mermaid not checked: {e}");
+        Vec::new()
+    })
 }
 
 /// Parse a flag value as one of a proto enum's kebab-case names.

@@ -86,11 +86,6 @@ mod base64_lite {
     }
 }
 
-fn cache_dir() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| "/".into());
-    home.join("Library/Caches/stage")
-}
-
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let mut want = None;
@@ -130,7 +125,7 @@ fn main() -> ExitCode {
         app.size = (size.width, size.height);
     }
     let mut latency = Latency::from_env();
-    let mut gallery = Gallery::new(tx.clone(), StageClient::new(sock.clone()), cache_dir(), notes_proto::default_stage_path(), app.target());
+    let mut gallery = Gallery::new(tx.clone(), StageClient::new(sock.clone()), notes_proto::helper::cache_dir(), notes_proto::default_stage_path(), app.target());
     let mut screen = Screen::default();
     let mut draw = |term: &mut Terminal<CrosstermBackend<kitty::Out>>, app: &mut App, gallery: &mut Gallery, screen: &mut Screen| {
         let _ = term.backend_mut().write_all(b"\x1b[?2026h");
@@ -297,7 +292,7 @@ fn main() -> ExitCode {
                     let _ = term.backend_mut().write_all(&osc52(&text));
                 }
                 Effect::OpenFile { name, contents } => {
-                    let dir = cache_dir();
+                    let dir = notes_proto::helper::cache_dir();
                     let path = dir.join(name.replace('/', "_"));
                     if std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, contents)).is_ok() {
                         let _ = Command::new("open").arg(&path).spawn();

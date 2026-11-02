@@ -13,14 +13,13 @@
 use std::{
     collections::HashMap,
     io::{BufRead, BufReader, Write},
-    os::unix::{net::UnixStream, process::CommandExt},
+    os::unix::net::UnixStream,
     path::PathBuf,
-    process::{Command, Stdio},
     sync::{mpsc::Sender, Arc, Condvar, Mutex, OnceLock},
     thread,
 };
 
-use notes_proto::helper::{Failed, Frame, HelperReply, HelperRequest, Image, Mermaid};
+use notes_proto::helper::{Failed, Frame, HelperReply, HelperRequest, Image, Mermaid, MermaidSyntax};
 
 use crate::{
     app::{Msg, OnScreen, Target, VisualKey, ZoomView},
@@ -444,16 +443,6 @@ fn read_head(path: &std::path::Path) -> Vec<u8> {
     head
 }
 
-fn helper_path() -> PathBuf {
-    std::env::var_os("STAGE_HELPER").map(PathBuf::from).unwrap_or_else(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|e| e.parent().map(|d| d.join("stage-helper")))
-            .filter(|p| p.exists())
-            .unwrap_or_else(|| PathBuf::from("stage-helper"))
-    })
-}
-
 impl Gallery {
     /// Set the daemon's session directory before requesting any post assets.
     pub fn set_stage_path(&mut self, path: PathBuf) {
@@ -513,39 +502,10 @@ impl Gallery {
         let _ = self.ask(|id| HelperRequest::Warm { id });
     }
 
-    /// Connect to the shared helper, launching it (detached, so it outlives this
-    /// stage and the next one starts warm) if nobody answers.
-    fn connect(&self) -> Result<UnixStream, String> {
-        // Versioned so a stage never talks to a helper from an older protocol behavior.
-        let sock = self.cache.join("helper-v3.sock");
-        if let Ok(stream) = UnixStream::connect(&sock) {
-            return Ok(stream);
-        }
-        std::fs::create_dir_all(&self.cache).map_err(|e| e.to_string())?;
-        Command::new(helper_path())
-            .arg("--serve")
-            .arg(&sock)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            // `STAGE_HELPER_LOG=<file>` keeps the helper's stderr (with STAGE_HELPER_TRACE=1, its phase timings).
-            .stderr(std::env::var_os("STAGE_HELPER_LOG").and_then(|p| std::fs::File::create(p).ok()).map_or(Stdio::null(), Stdio::from))
-            .process_group(0)
-            .spawn()
-            .map_err(|e| format!("stage-helper isn't available ({e})"))?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        loop {
-            match UnixStream::connect(&sock) {
-                Ok(stream) => return Ok(stream),
-                Err(_) if std::time::Instant::now() < deadline => thread::sleep(std::time::Duration::from_millis(2)),
-                Err(e) => return Err(format!("stage-helper didn't start ({e})")),
-            }
-        }
-    }
-
     /// Send one request to stage-helper, connecting first if needed.
     fn ask(&mut self, req: impl FnOnce(u64) -> HelperRequest) -> Result<u64, String> {
         if self.helper.is_none() {
-            let stream = self.connect()?;
+            let stream = notes_proto::helper::connect(&self.cache)?;
             let reader = stream.try_clone().map_err(|e| e.to_string())?;
             let tx = self.tx.clone();
             thread::spawn(move || {
@@ -935,6 +895,10 @@ impl Gallery {
                         let msg = self.show(out, key, &shm, (w, h), Some(id), None);
                         let _ = self.send(&HelperRequest::HtmlAck { id, frame });
                         msg.into_iter().collect()
+                    }
+                    HelperReply::MermaidSyntax(MermaidSyntax { id, error: reason, .. }) => {
+                        let Some(Pending::Mermaid(key)) = self.pending.remove(&id) else { return vec![] };
+                        vec![Msg::VisualFailed { key, reason: format!("mermaid: {reason}") }]
                     }
                     HelperReply::Failed(Failed { id, error: reason, .. }) => {
                         let id = id.unwrap_or(0);

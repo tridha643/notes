@@ -9,6 +9,7 @@ import Foundation
 public enum HelperRequest: Sendable, Equatable, Codable {
     case warm(id: Int)
     case mermaid(id: Int, source: String, maxWidth: Double, fontSize: Double)
+    case mermaidCheck(id: Int, source: String)
     case image(id: Int, path: String)
     case htmlOpen(id: Int, path: String, width: Double, maxHeight: Double, scale: Double, fps: Double)
     case htmlUpdate(id: Int, path: String)
@@ -25,7 +26,7 @@ public enum HelperRequest: Sendable, Equatable, Codable {
 
     /// The wire name and the fields (besides `op`) it carries.
     private static let ops: [String: Set<Key>] = [
-        "warm": [.id], "mermaid": [.id, .source, .maxWidth, .fontSize], "image": [.id, .path],
+        "warm": [.id], "mermaid": [.id, .source, .maxWidth, .fontSize], "mermaid-check": [.id, .source], "image": [.id, .path],
         "html-open": [.id, .path, .width, .maxHeight, .scale, .fps], "html-update": [.id, .path],
         "html-ack": [.id, .frame], "html-pause": [.id], "html-resume": [.id], "html-close": [.id],
         "html-resize": [.id, .width, .maxHeight, .scale],
@@ -47,6 +48,7 @@ public enum HelperRequest: Sendable, Equatable, Codable {
         case "mermaid":
             self = .mermaid(id: id, source: try c.decode(String.self, forKey: .source),
                             maxWidth: try c.decode(Double.self, forKey: .maxWidth), fontSize: try c.decode(Double.self, forKey: .fontSize))
+        case "mermaid-check": self = .mermaidCheck(id: id, source: try c.decode(String.self, forKey: .source))
         case "image": self = .image(id: id, path: try c.decode(String.self, forKey: .path))
         case "html-open":
             self = .htmlOpen(id: id, path: try c.decode(String.self, forKey: .path), width: try c.decode(Double.self, forKey: .width),
@@ -70,6 +72,8 @@ public enum HelperRequest: Sendable, Equatable, Codable {
         case .mermaid(let id, let source, let maxWidth, let fontSize):
             try c.encode("mermaid", forKey: .op); try c.encode(id, forKey: .id); try c.encode(source, forKey: .source)
             try c.encode(maxWidth, forKey: .maxWidth); try c.encode(fontSize, forKey: .fontSize)
+        case .mermaidCheck(let id, let source):
+            try c.encode("mermaid-check", forKey: .op); try c.encode(id, forKey: .id); try c.encode(source, forKey: .source)
         case .image(let id, let path): try c.encode("image", forKey: .op); try c.encode(id, forKey: .id); try c.encode(path, forKey: .path)
         case .htmlOpen(let id, let path, let width, let maxHeight, let scale, let fps):
             try c.encode("html-open", forKey: .op); try c.encode(id, forKey: .id); try c.encode(path, forKey: .path)
@@ -104,12 +108,14 @@ private struct AnyKey: CodingKey {
 public enum HelperReply: Sendable, Equatable, Encodable {
     case frame(id: Int, frame: Int, shm: String, w: Int, h: Int)
     case failed(id: Int?, error: String)
+    /// pele rejected the mermaid source: its message, and where it stopped.
+    case mermaidSyntax(id: Int, error: String, line: Int, column: Int)
     case mermaid(id: Int, svg: String, width: Double, height: Double)
     case patched(id: Int, patched: Bool)
     case image(id: Int, shm: String, w: Int, h: Int)
     case done(id: Int)
 
-    enum Key: String, CodingKey { case id, ok, error, frame, shm, w, h, svg, width, height, patched }
+    enum Key: String, CodingKey { case id, ok, error, line, column, frame, shm, w, h, svg, width, height, patched }
 
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: Key.self)
@@ -120,6 +126,9 @@ public enum HelperReply: Sendable, Equatable, Encodable {
         case .failed(let id, let error):
             if let id { try c.encode(id, forKey: .id) } else { try c.encodeNil(forKey: .id) }
             try c.encode(false, forKey: .ok); try c.encode(error, forKey: .error)
+        case .mermaidSyntax(let id, let error, let line, let column):
+            try c.encode(id, forKey: .id); try c.encode(false, forKey: .ok); try c.encode(error, forKey: .error)
+            try c.encode(line, forKey: .line); try c.encode(column, forKey: .column)
         case .mermaid(let id, let svg, let width, let height):
             try c.encode(id, forKey: .id); try c.encode(true, forKey: .ok)
             try c.encode(svg, forKey: .svg); try c.encode(width, forKey: .width); try c.encode(height, forKey: .height)

@@ -243,6 +243,7 @@ mod helper {
         match req {
             HelperRequest::Warm { .. } => "warm",
             HelperRequest::Mermaid { .. } => "mermaid",
+            HelperRequest::MermaidCheck { .. } => "mermaid-check",
             HelperRequest::Image { .. } => "image",
             HelperRequest::HtmlOpen { .. } => "html-open",
             HelperRequest::HtmlUpdate { .. } => "html-update",
@@ -257,7 +258,7 @@ mod helper {
     #[test]
     fn requests_round_trip_and_reject_unknown_fields() {
         let names = files(".request.json");
-        assert_eq!(names.len(), 10, "one fixture per op");
+        assert_eq!(names.len(), 11, "one fixture per op");
         let mut seen = Vec::new();
         for file in names {
             let line = read(&file);
@@ -273,7 +274,7 @@ mod helper {
             assert!(serde_json::from_value::<HelperRequest>(missing).is_err(), "{file} accepted no id");
         }
         seen.dedup();
-        assert_eq!(seen.len(), 10);
+        assert_eq!(seen.len(), 11);
         assert!(serde_json::from_str::<HelperRequest>(r#"{"op":"nope","id":1}"#).is_err());
     }
 
@@ -282,6 +283,7 @@ mod helper {
         let expect = |file: &str, reply: &HelperReply| {
             let ok = match reply {
                 HelperReply::Frame(_) => "frame",
+                HelperReply::MermaidSyntax(_) => "mermaid-syntax",
                 HelperReply::Failed(f) if f.id.is_none() => "failed-no-id",
                 HelperReply::Failed(_) => "failed",
                 HelperReply::Mermaid(_) => "mermaid",
@@ -292,7 +294,7 @@ mod helper {
             assert_eq!(format!("{ok}.reply.json"), file);
         };
         let names = files(".reply.json");
-        assert_eq!(names.len(), 7);
+        assert_eq!(names.len(), 8);
         for file in names {
             let line = read(&file);
             let reply: HelperReply = serde_json::from_str(&line).unwrap_or_else(|e| panic!("{file}: {e}"));

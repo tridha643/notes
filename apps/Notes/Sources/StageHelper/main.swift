@@ -121,6 +121,24 @@ func mermaid(id: Int, source: String, maxWidth: Double, fontSize: Double, client
             traceMark("pele render", since: t0)
             let svg = resolvePeleSVG(d.svg, theme: theme).replacingOccurrences(of: Pele.fontFamily, with: "Helvetica Neue")
             client.send(.mermaid(id: id, svg: svg, width: d.width, height: d.height))
+        } catch let PeleError.syntax(line, column, message) {
+            client.send(.mermaidSyntax(id: id, error: message, line: line, column: column))
+        } catch {
+            client.fail(id, "\(error)")
+        }
+    }
+}
+
+/// `mermaid-check`: parse only, for `notes post`, on pele's queue like `mermaid`.
+func mermaidCheck(id: Int, source: String, client: Client) {
+    renders.enter()
+    DispatchQueue.global(qos: .userInitiated).async {
+        defer { renders.leave() }
+        do {
+            try Pele.shared.parse(source)
+            client.send(.done(id: id))
+        } catch let PeleError.syntax(line, column, message) {
+            client.send(.mermaidSyntax(id: id, error: message, line: line, column: column))
         } catch {
             client.fail(id, "\(error)")
         }
@@ -147,6 +165,7 @@ func handle(_ req: HelperRequest, from client: Client) {
     case .warm(let id): client.send(.done(id: id))
     // Handled on the reader thread, see `readLines`.
     case .mermaid(let id, let source, let maxWidth, let fontSize): mermaid(id: id, source: source, maxWidth: maxWidth, fontSize: fontSize, client: client)
+    case .mermaidCheck(let id, let source): mermaidCheck(id: id, source: source, client: client)
     case .image(let id, let path): image(id: id, path: path, client: client)
     case .htmlOpen(let id, let path, let width, let maxHeight, let scale, let fps):
         guard width > 0 else { return client.fail(id, "html-open needs a width") }
@@ -184,6 +203,10 @@ func readLines(_ fd: Int32, for client: Client) {
         } catch { continue }
         if case .mermaid(let id, let source, let maxWidth, let fontSize) = req {
             mermaid(id: id, source: source, maxWidth: maxWidth, fontSize: fontSize, client: client)
+            continue
+        }
+        if case .mermaidCheck(let id, let source) = req {
+            mermaidCheck(id: id, source: source, client: client)
             continue
         }
         DispatchQueue.main.async { MainActor.assumeIsolated { handle(req, from: client) } }
@@ -252,22 +275,6 @@ func scheduleIdleExit() {
     let work = DispatchWorkItem { exit(0) }
     Served.idleExit = work
     DispatchQueue.main.asyncAfter(deadline: .now() + 600, execute: work)
-}
-
-// `stage-helper --check-mermaid`: parse stdin with pele and exit, for `notes post`.
-// Exit 0 parses, 1 prints pele's syntax error, 2 means pele couldn't run.
-if CommandLine.arguments.dropFirst() == ["--check-mermaid"] {
-    let source = String(decoding: FileHandle.standardInput.readDataToEndOfFile(), as: UTF8.self)
-    do {
-        _ = try Pele.shared.render(source)
-        exit(0)
-    } catch let PeleError.syntax(_, _, message) {
-        print(message)
-        exit(1)
-    } catch {
-        print(error)
-        exit(2)
-    }
 }
 
 // Warm up before the first request: pele's JavaScript on its queue first (it doesn't
