@@ -69,6 +69,10 @@ mod tests {
         assert!(!plain.contains(".tree{"));
         let kit = document("<ul class=tree></ul>", &["issues".into()]);
         assert!(kit.contains(".tree{") && !kit.contains(".deck{"));
+        // The kit's script follows the agent's, which it runs; a page without the kit never carries it.
+        let drag = document("<script type=\"text/dragology\">1</script>", &["dragology".into()]);
+        assert!(drag.find("text/dragology").unwrap() < drag.find("window.dragology=").unwrap() && !drag.contains(".stack{"));
+        assert!(!kit.contains("dragology") && !plain.contains("dragology"));
         // The agent's own styles come after the layered defaults, so they win.
         assert!(kit.find("@layer stage").unwrap() < kit.find("<ul class=tree>").unwrap());
     }

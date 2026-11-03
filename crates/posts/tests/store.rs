@@ -1100,6 +1100,7 @@ fn settings_and_kits() {
                 .unwrap()
                 .contains("e.key==='ArrowRight'")
     );
+    assert!(kits[2].css.is_empty() && kits[2].js.as_deref().unwrap().contains("window.dragology="));
 }
 
 #[test]

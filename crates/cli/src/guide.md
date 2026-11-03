@@ -153,6 +153,8 @@ better served another way.
   `slides` kit does exactly this; reach for it before hand-rolling a deck.
 - `<style>` and `<script>` are allowed. One self-contained file, under
   512 KB, with no network: inline your CSS, SVG and images (`data:` URIs).
+- The page takes clicks and drags in stage: buttons, `onclick` and pointer
+  events work. There is no hover, only presses, drags and releases.
 - Give an `id` to text and elements you'll change later. An update that only
   changes stylesheets, inline styles of elements with an id, or the text of
   identified leaf elements (headings, `p`, `span`, `li`, `a`, `button`,
@@ -205,9 +207,30 @@ against the theme tokens.
   tree (nest a `.tree` inside a `.tree` to indent) or a status board.
 - **`slides`**: author a `.deck` with `.slide` children; the kit cross-fades
   one at a time and injects prev/dots/counter/next controls.
+- **`dragology`**: SVG the user drags. You declare the states an element can be
+  dragged between; the library interpolates the drawing and snaps on drop. Write
+  your code in `<script type="text/dragology">`: it runs once `dragology` (the
+  library's exports plus `html`, htm tagged templates for JSX, and
+  `mount(el, draggable, props)`) exists. Position with
+  `transform=${translate(x, y)}`, never `x`/`y`, and name elements with `id`,
+  never `key`. The state must be an object.
 
 ```sh
 notes post html board.html --kit issues --title "CI status"   # repeatable: --kit a --kit b
+```
+
+```html
+<div id="app"></div>
+<script type="text/dragology">
+const { html, mount, translate } = dragology;
+const toggle = ({ state, d }) => html`
+  <g transform=${translate(20, 20)}>
+    <rect width="120" height="60" rx="30" fill="var(--color-background-secondary)" />
+    <circle transform=${translate(state.on ? 90 : 30, 30)} r="24" fill="var(--color-text-info)"
+      dragologyOnDrag=${() => d.between([{ on: false }, { on: true }])} />
+  </g>`;
+mount(document.getElementById("app"), toggle, { initialState: { on: false }, width: 160, height: 100 });
+</script>
 ```
 
 A kit only adds vocabulary; you can hand-roll custom markup right beside the
