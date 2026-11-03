@@ -24,7 +24,8 @@ ap.add_argument("--session", required=True)
 ap.add_argument("--mode", choices=["cold", "warm"], default="cold")
 ap.add_argument("--runs", type=int, default=1)
 ap.add_argument("--keys", default="", help="comma list of KEY@seconds; KEY is a char or one of " + ",".join(KEYS))
-ap.add_argument("--mouse", default="", help="semicolon list of EVENT:col,row@seconds; EVENT is press, drag or release (1-based cells, left button)")
+ap.add_argument("--mouse", default="", help="semicolon list of EVENT:x,y@seconds; EVENT is press, drag or release (left button), x,y in pixels from the top left")
+ap.add_argument("--cells-only", action="store_true", help="don't answer the 1016 (SGR pixel mouse) probe, so stage keeps cell mouse reports")
 ap.add_argument("--stage", default=f"{ROOT}/target/release/stage")
 ap.add_argument("--helper", default=f"{ROOT}/apps/Notes/.build/release/stage-helper")
 ap.add_argument("--size", default="120x40")
@@ -40,11 +41,18 @@ for k in filter(None, a.keys.split(",")):
     name, at = k.rsplit("@", 1)
     keys.append((float(at), name, KEYS.get(name, name.encode())))
 SGR = {"press": "\x1b[<0;{};{}M", "drag": "\x1b[<32;{};{}M", "release": "\x1b[<0;{};{}m"}
+pixel_mode = [False]  # set once stage enables 1016: reports are then pixels, else cells (both 1-based)
+
+
+def mouse(event, x, y):
+    return lambda: SGR[event].format(*((x + 1, y + 1) if pixel_mode[0] else (x // CW + 1, y // CH + 1))).encode()
+
+
 for k in filter(None, a.mouse.split(";")):
     event, rest = k.split(":", 1)
-    cell, at = rest.split("@")
-    col, row = cell.split(",")
-    keys.append((float(at), k.split("@")[0], SGR[event].format(col, row).encode()))
+    xy, at = rest.split("@")
+    x, y = map(int, xy.split(","))
+    keys.append((float(at), k.split("@")[0], mouse(event, x, y)))
 keys.sort()
 os.makedirs(a.out, exist_ok=True)
 
@@ -89,6 +97,12 @@ def run(n, home):
                 os.write(fd, b"\x1b_Gi=31;OK\x1b\\")
             if b"\x1b[16t" in chunk:
                 os.write(fd, f"\x1b[6;{CH};{CW}t".encode())
+            if b"\x1b[?1016$p" in chunk and not a.cells_only:
+                os.write(fd, b"\x1b[?1016;2$y")
+            if b"\x1b[?1016h" in chunk:
+                pixel_mode[0] = True
+            if b"\x1b[?1016l" in chunk:
+                pixel_mode[0] = False
             if b"\x1b[c" in chunk:
                 os.write(fd, b"\x1b[?62;22;52c")
             for m in APC.finditer(chunk):
@@ -118,7 +132,7 @@ def run(n, home):
                     live[i] = p
         while pending_keys and now >= pending_keys[0][0]:
             at, name, seq = pending_keys.pop(0)
-            os.write(fd, seq)
+            os.write(fd, seq() if callable(seq) else seq)
             sent.append({"key": name, "t_ms": round(now * 1000)})
         if quit_at is None and now >= a.quit_at:
             final = [dict(p) for p in live.values()]

@@ -40,6 +40,7 @@ fn restore() {
     let mut out = io::stdout();
     // Delete any kitty placements we made, leave the alt screen, give the shell back.
     let _ = out.write_all(b"\x1b_Ga=d,d=a\x1b\\");
+    let _ = out.write_all(b"\x1b[?1016l");
     let _ = execute!(out, DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen, Show);
     let _ = disable_raw_mode();
 }
@@ -150,6 +151,12 @@ fn main() -> ExitCode {
     gallery.warm();
     let p = probe::read(0, Duration::from_secs(2));
     app.update(Msg::Probed { cell_px: p.cell_px, kitty: p.kitty });
+    // Pixel mouse reports let an html page follow a drag to the pixel. Without a cell size to
+    // split them by they'd be unusable, so then stay on cells. Motion still only comes with a button held (1002).
+    let pixel_mouse = p.pixel_mouse && cell_px().is_some();
+    if pixel_mouse {
+        let _ = io::stdout().write_all(b"\x1b[?1016h").and_then(|()| io::stdout().flush());
+    }
 
     // After the first frame (connecting can wait on launchd starting notesd): the watch
     // starts at the seq notesd had committed before bootstrap lists anything,
@@ -198,9 +205,20 @@ fn main() -> ExitCode {
             while let Ok(ev) = event::read() {
                 let msgs = match ev {
                     TermEvent::Key(k) => vec![Msg::Key(k)],
-                    // Stamped here: wheel acceleration needs arrival times, not batch times.
-                    TermEvent::Mouse(m) if matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => vec![Msg::Wheel(m, std::time::Instant::now())],
-                    TermEvent::Mouse(m) => vec![Msg::Mouse(m)],
+                    TermEvent::Mouse(mut m) => {
+                        // Under 1016 crossterm's column/row are pixels: everything else sees the cell.
+                        let px = cell_px().filter(|_| pixel_mouse).map(|(w, h)| {
+                            let at = (m.column, m.row);
+                            (m.column, m.row) = (at.0 / w, at.1 / h);
+                            at
+                        });
+                        match px {
+                            // Stamped here: wheel acceleration needs arrival times, not batch times.
+                            _ if matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => vec![Msg::Wheel(m, std::time::Instant::now())],
+                            Some(px) => vec![Msg::MousePx(m, px)],
+                            None => vec![Msg::Mouse(m)],
+                        }
+                    }
                     // A pane can start at a placeholder size (Rex: 80x24, 8x16 px cells)
                     // and get its real one in the first resize, so re-measure cells too.
                     TermEvent::Resize(w, h) => [Msg::Resize(w, h)].into_iter().chain(cell_px().map(Msg::CellPx)).collect(),
