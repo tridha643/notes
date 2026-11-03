@@ -8,13 +8,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Kitty graphics query (a 1x1 RGB image, query only), cell size in px, DA1.
-pub const QUERIES: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[c";
+/// Kitty graphics query (a 1x1 RGB image, query only), cell size in px, whether mouse mode
+/// 1016 (SGR pixel coordinates) is known, DA1.
+pub const QUERIES: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[?1016$p\x1b[c";
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Probe {
     pub cell_px: Option<(u16, u16)>,
     pub kitty: bool,
+    /// The terminal reports mouse positions in pixels when asked (mode 1016).
+    pub pixel_mouse: bool,
     /// The DA1 reply arrived, so nothing more is coming.
     pub done: bool,
 }
@@ -34,6 +37,10 @@ pub fn parse(bytes: &[u8]) -> Probe {
             if let (Some(h), Some(w)) = (it.next(), it.next()) {
                 probe.cell_px = Some((w, h));
             }
+        }
+        // DECRQM reply: CSI ? 1016 ; N $ y, with N 1 (set) or 2 (reset) meaning the mode exists.
+        if let Some(n) = reply.strip_prefix("[?1016;").and_then(|r| r.split('$').next()) {
+            probe.pixel_mouse = matches!(n, "1" | "2");
         }
         // DA1: CSI ? digits/semicolons c
         if let Some(rest) = reply.strip_prefix("[?") {
@@ -80,10 +87,13 @@ mod tests {
 
     #[test]
     fn parses_replies_and_drops_keys() {
-        let p = parse(b"jk\x1b_Gi=31;OK\x1b\\\x1b[6;30;14t\x1b[?62;22;52cq");
-        assert_eq!(p, Probe { cell_px: Some((14, 30)), kitty: true, done: true });
+        let p = parse(b"jk\x1b_Gi=31;OK\x1b\\\x1b[6;30;14t\x1b[?1016;2$y\x1b[?62;22;52cq");
+        assert_eq!(p, Probe { cell_px: Some((14, 30)), kitty: true, pixel_mouse: true, done: true });
         let p = parse(b"\x1b[?1;2c");
-        assert_eq!(p, Probe { cell_px: None, kitty: false, done: true });
+        assert_eq!(p, Probe { cell_px: None, kitty: false, pixel_mouse: false, done: true });
+        // Mode unknown (0) or permanently off (4) is not support.
+        assert!(!parse(b"\x1b[?1016;0$y\x1b[?1;2c").pixel_mouse && !parse(b"\x1b[?1016;4$y").pixel_mouse);
+        assert!(parse(b"\x1b[?1016;1$y").pixel_mouse);
         assert!(!parse(b"\x1b[6;30;14t").done);
     }
 }
