@@ -11,7 +11,7 @@ macOS 26+, Apple Silicon.
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/tridha643/notes/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/tridha643/stage/main/install.sh | sh
 ```
 
 This downloads the latest release into `~/.local/bin` (`notesd`, `notes`, `stage`,
