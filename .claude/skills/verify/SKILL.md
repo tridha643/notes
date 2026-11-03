@@ -46,7 +46,8 @@ wait or say so next to any number you report.
 
 ```sh
 .claude/skills/verify/scripts/drive.py --session <id> [--mode cold|warm] [--runs N] \
-    [--keys 'PageUp@1.0,z@1.6,Esc@2.4'] [--quit-at 3.0] [--size 120x40] [--cell 10x20]
+    [--keys 'PageUp@1.0,z@1.6,Esc@2.4'] [--mouse 'press:47,11@1.0;drag:60,11@1.3;release:60,11@1.4'] \
+    [--quit-at 3.0] [--size 120x40] [--cell 10x20]
 ```
 
 - `--mode cold`: a fresh temp `HOME` per run, so stage launches its own helper (process start,
@@ -55,6 +56,12 @@ wait or say so next to any number you report.
 - `--keys`: `KEY@seconds` after launch. `KEY` is one character (`z`, `s`, `j`, `k`, `G`, `g`, `q`)
   or `PageUp`, `PageDown`, `Up`, `Down`, `Esc`, `Enter`. Never send `c`, `r`, `d` or `D`: those
   write comments, renames and deletes to the real notesd.
+- `--mouse`: left-button SGR events, `EVENT:col,row@seconds` joined by `;`, with `EVENT` one of
+  `press`, `drag`, `release` and 1-based cells. `transmits[]` in the result lists every image
+  transmission with its time: a live html card sends a new one per frame, so frames that follow a
+  drag show up there. A cell is 5x10 CSS px at the usual 2x scale, so aim by cell, not by CSS px.
+- `NOTES_SOCK` in the environment points the drive at another notesd (a private one built from this
+  checkout, when the real one predates what you're testing).
 - stage quits on `q` at `--quit-at`; the script then TERMs and KILLs if it has to (`stopped_by`).
 
 One JSON line per run on stdout:

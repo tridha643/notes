@@ -3,7 +3,7 @@
 what reached the screen. One JSON line per run on stdout; evidence files under --out.
 
   drive.py --session ID [--mode cold|warm] [--runs N] [--keys 'PageUp@1.0,z@1.6']
-           [--stage BIN] [--helper BIN] [--size 120x40] [--cell 10x20] [--quit-at 3.0]
+           [--mouse 'press:60,12@1.0;drag:70,12@1.2;release:70,12@1.4'] [--stage BIN] [--helper BIN] [--size 120x40] [--cell 10x20] [--quit-at 3.0]
            [--out DIR]
 
 cold: a fresh temp HOME per run, so stage launches its own stage-helper (first
@@ -24,6 +24,7 @@ ap.add_argument("--session", required=True)
 ap.add_argument("--mode", choices=["cold", "warm"], default="cold")
 ap.add_argument("--runs", type=int, default=1)
 ap.add_argument("--keys", default="", help="comma list of KEY@seconds; KEY is a char or one of " + ",".join(KEYS))
+ap.add_argument("--mouse", default="", help="semicolon list of EVENT:col,row@seconds; EVENT is press, drag or release (1-based cells, left button)")
 ap.add_argument("--stage", default=f"{ROOT}/target/release/stage")
 ap.add_argument("--helper", default=f"{ROOT}/apps/Notes/.build/release/stage-helper")
 ap.add_argument("--size", default="120x40")
@@ -33,11 +34,17 @@ ap.add_argument("--out", default=f"{ROOT}/target/verify")
 a = ap.parse_args()
 COLS, ROWS = map(int, a.size.split("x"))
 CW, CH = map(int, a.cell.split("x"))
-SOCK = os.path.expanduser("~/Library/Application Support/Notes/notesd.sock")  # before HOME changes
+SOCK = os.environ.get("NOTES_SOCK") or os.path.expanduser("~/Library/Application Support/Notes/notesd.sock")  # before HOME changes
 keys = []
 for k in filter(None, a.keys.split(",")):
     name, at = k.rsplit("@", 1)
     keys.append((float(at), name, KEYS.get(name, name.encode())))
+SGR = {"press": "\x1b[<0;{};{}M", "drag": "\x1b[<32;{};{}M", "release": "\x1b[<0;{};{}m"}
+for k in filter(None, a.mouse.split(";")):
+    event, rest = k.split(":", 1)
+    cell, at = rest.split("@")
+    col, row = cell.split(",")
+    keys.append((float(at), k.split("@")[0], SGR[event].format(col, row).encode()))
 keys.sort()
 os.makedirs(a.out, exist_ok=True)
 
@@ -62,6 +69,7 @@ def run(n, home):
     raw = bytearray()
     # live: what kitty would show now (id -> placement), after places and deletes.
     sizes, placements, live, pending_keys, sent = {}, [], {}, list(keys), []
+    transmits = []  # every image transmission: a live html page sends a new one per frame
     held = {}  # image id -> bytes the terminal stores (freed by d=I / d=A, not by d=i)
     final = None
     memory = None
@@ -90,6 +98,7 @@ def run(n, home):
                         shm_unlink(base64.b64decode(m.group(4)).decode())
                 if b"s" in k and b"i" in k:
                     sizes[int(k[b"i"])] = (int(k[b"s"]), int(k[b"v"]))
+                    transmits.append({"t_ms": round(now * 1000), "id": int(k[b"i"]), "px": sizes[int(k[b"i"])]})
                     held[int(k[b"i"])] = int(k[b"s"]) * int(k[b"v"]) * 4
                 elif k.get(b"t") == b"f" and b"i" in k:
                     held[int(k[b"i"])] = 0  # a PNG file; size unknown here
@@ -149,7 +158,7 @@ def run(n, home):
               "all_one_to_one": all(p["one_to_one"] for p in placements),
               # The proof for geometry: what is on screen at the end, not what was ever sent.
               "on_screen_at_end": [{k: p[k] for k in ("id", "row", "col", "cells", "src", "one_to_one")} for p in final],
-              "memory_at_quit": memory, "keys": after_keys, "placements": placements, "evidence": ev}
+              "memory_at_quit": memory, "keys": after_keys, "transmits": transmits, "placements": placements, "evidence": ev}
     with open(f"{ev}/result.json", "w") as f:
         json.dump(result, f, indent=1)
     print(json.dumps({k: v for k, v in result.items() if k != "placements"}))
