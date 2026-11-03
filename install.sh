@@ -1,13 +1,13 @@
 #!/bin/sh
 # Install stage on macOS (Apple Silicon):
-#   curl -fsSL https://raw.githubusercontent.com/tridha643/notes/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/tridha643/stage/main/install.sh | sh
 # Installs notesd, notes, stage and stage-helper into ~/.local/bin, loads the notesd
 # LaunchAgent (launchd owns the socket and starts notesd on first connect), and copies
 # the stage skill into every agent skills folder it finds. Run it again to upgrade.
 # STAGE_VERSION=v0.1.0 pins a release; `sh install.sh DIR` installs an unpacked build
 # (scripts/install.sh uses that for source builds).
 set -eu
-repo="tridha643/notes"
+repo="tridha643/stage"
 asset="stage-macos-arm64.tar.gz"
 [ "$(uname -s)" = Darwin ] || { echo "stage runs on macOS only" >&2; exit 1; }
 [ "$(uname -m)" = arm64 ] || { echo "stage needs an Apple Silicon Mac" >&2; exit 1; }

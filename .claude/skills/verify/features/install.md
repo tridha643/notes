@@ -1,7 +1,7 @@
 # Install: the curl installer and a source install
 
 Other Macs install from a GitHub release: `curl -fsSL
-https://raw.githubusercontent.com/tridha643/notes/main/install.sh | sh` downloads
+https://raw.githubusercontent.com/tridha643/stage/main/install.sh | sh` downloads
 `stage-macos-arm64.tar.gz` (bin/ with notesd, notes, stage, stage-helper and its
 `Notes_NotesCore.bundle`, and skills/stage), installs it into `~/.local/bin`, writes and loads
 the `dev.notes.notesd` LaunchAgent, copies the stage skill into every agent skills folder it
@@ -26,7 +26,7 @@ that's the intent (it is the repo's normal "try my change" step).
 
 ```sh
 scripts/dist.sh /tmp/stage-dist && sh install.sh /tmp/stage-dist     # what the release installs
-curl -fsSL https://raw.githubusercontent.com/tridha643/notes/main/install.sh | sh   # after a release
+curl -fsSL https://raw.githubusercontent.com/tridha643/stage/main/install.sh | sh   # after a release
 ```
 
 Proof: `notes doctor` succeeds at the end of the run; `launchctl print gui/$(id -u)/dev.notes.notesd`
