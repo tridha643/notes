@@ -283,6 +283,7 @@ fn main() -> ExitCode {
                         later.extend(app.update(m));
                     }
                 }
+                Effect::Pointer { key, kind, x, y } => gallery.pointer(&key, kind, x, y),
                 Effect::Fatal(m) => {
                     restore();
                     eprintln!("{m}");

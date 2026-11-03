@@ -7,6 +7,7 @@ use std::{collections::{HashMap, HashSet}, time::Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use notes_proto::{
+    helper::PointerKind,
     posts::{
         Comment, CommentNewArgs, Part, Post, PostId, PostRender, PostShowArgs, PostSummary, Session,
         SessionHit, SessionId, SessionRenameArgs, SessionSearchArgs, StageSpace,
@@ -202,6 +203,13 @@ pub enum Msg {
     Gfx(crate::gallery::Gfx),
 }
 
+/// A cell's centre as fractions of the visual's frame: rows cut off above (`top`) still count.
+fn page_point(o: &OnScreen, column: u16, row: u16) -> (f64, f64) {
+    let x = (f64::from(column) - f64::from(o.col) + 0.5) / f64::from(o.cols.max(1));
+    let y = (f64::from(row) - f64::from(o.row) + f64::from(o.top) + 0.5) / f64::from(o.total.max(1));
+    (x, y)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
     Request(StageRequest),
@@ -217,6 +225,8 @@ pub enum Effect {
     NeedVisual { key: VisualKey, source: VisualSource },
     /// Rasterize the diagram under the cursor for focus now, so `z` shows it crisp at once.
     PrefetchZoom { key: VisualKey, target: Target },
+    /// The mouse over a live html page, as fractions of its frame (outside 0..1 while a drag leaves it).
+    Pointer { key: VisualKey, kind: PointerKind, x: f64, y: f64 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -332,6 +342,8 @@ pub struct App {
     jump: Option<PostId>,
     /// A mouse drag in the feed: where it started and where it is, as (line, cell column).
     pub drag: Option<((usize, u16), (usize, u16))>,
+    /// The html card a left press landed on, until release: its page gets the drag, not the feed.
+    page_drag: Option<VisualKey>,
     /// Sessions opened before: their posts, comments and place in the feed, so
     /// coming back shows them at once (then refreshes) instead of a blank pane.
     remembered: HashMap<SessionId, Remembered>,
@@ -438,6 +450,7 @@ impl App {
             jump: None,
             remembered: HashMap::new(),
             drag: None,
+            page_drag: None,
             wheel: WheelAccel::default(),
             needle: Vec::new(),
             find_post: None,
@@ -1657,6 +1670,7 @@ impl App {
             m.column >= r.x && m.column < r.x + r.width && m.row >= r.y && m.row < r.y + r.height
         };
         let session_area = ui::session_area(self);
+        let press = if m.kind == MouseEventKind::Down(MouseButton::Left) && session_area.is_none() { self.html_under(m.column, m.row) } else { None };
         let fx = match m.kind {
             MouseEventKind::Down(MouseButton::Left) if m.row == g.header.y && m.column < 3 => {
                 if matches!(self.mode, Mode::Search { .. }) {
@@ -1704,6 +1718,26 @@ impl App {
                     self.select_session(row, true)
                 }
             }
+            // Over an html card the page gets the press, drag and release, and nothing is selected.
+            // No redraw: the page streams its own frames.
+            MouseEventKind::Down(MouseButton::Left) if press.is_some() => {
+                let (key, x, y) = press.expect("checked");
+                self.page_drag = Some(key.clone());
+                return vec![Effect::Pointer { key, kind: PointerKind::Down, x, y }];
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.page_drag.is_some() => {
+                let key = self.page_drag.clone().expect("checked");
+                return match self.on_screen.iter().find(|o| o.key == key) {
+                    Some(o) => { let (x, y) = page_point(o, m.column, m.row); vec![Effect::Pointer { key, kind: PointerKind::Move, x, y }] }
+                    None => vec![],
+                };
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.page_drag.is_some() => {
+                let key = self.page_drag.take().expect("checked");
+                // A card scrolled away mid-drag releases off the page, so the page still ends its drag.
+                let (x, y) = self.on_screen.iter().find(|o| o.key == key).map_or((-1.0, -1.0), |o| page_point(o, m.column, m.row));
+                return vec![Effect::Pointer { key, kind: PointerKind::Up, x, y }];
+            }
             // In the feed: press starts a selection, drag extends it, release
             // copies it; a press and release in one place is a click.
             MouseEventKind::Down(MouseButton::Left) if session_area.is_none() && inside(g.main) && m.row > g.main.y => {
@@ -1741,6 +1775,16 @@ impl App {
         let mut fx = fx;
         fx.push(Effect::Redraw);
         fx
+    }
+
+    /// The html card on screen at this cell, with the position as fractions of its page.
+    fn html_under(&self, column: u16, row: u16) -> Option<(VisualKey, f64, f64)> {
+        let o = self.on_screen.iter().find(|o| {
+            (o.col..o.col + o.cols).contains(&column) && (o.row..o.row + o.rows).contains(&row)
+                && matches!(self.visual_source(&o.key), Some(VisualSource::Html(_)))
+        })?;
+        let (x, y) = page_point(o, column, row);
+        Some((o.key.clone(), x, y))
     }
 
     /// A mouse position in the feed as (line, cell column inside the content area).
@@ -2415,6 +2459,36 @@ mod tests {
         let copied = fx.iter().find_map(|e| match e { Effect::Copy(t) => Some(t.clone()), _ => None }).expect("a copy");
         assert!(!copied.contains('│') && !copied.contains('╭'), "{copied:?}");
         assert!(app.toast.as_deref().is_some_and(|t| t.starts_with("copied")));
+    }
+
+    #[test]
+    fn a_press_drag_release_over_an_html_card_goes_to_its_page_and_elsewhere_still_selects() {
+        let mut app = booted(&fake());
+        let id = PostId::from("b");
+        let p = Post { parts: vec![Part::Html { html: "<p>hello</p>".into(), kits: vec![], id: None }], ..post("b", "s1", 2, "") };
+        let r = PostRender { id: id.clone(), version: 2, parts: vec![notes_proto::posts::PartRender::Native] };
+        app.loaded.get_mut(&(id.clone(), 2)).unwrap().cards = Some(build_cards(&p, Some(&r)));
+        let visual = (id, 2, 0);
+        // Ten rows tall with the top two scrolled off; 8 shown from screen row 5.
+        app.on_screen = vec![OnScreen { key: visual.clone(), col: 30, row: 5, cols: 40, top: 2, rows: 8, total: 10, px: (0, 0) }];
+        let mouse = |kind, column, row| Msg::Mouse(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE });
+        let pointer = |kind, x, y| vec![Effect::Pointer { key: visual.clone(), kind, x, y }];
+        let (down, drag, up) = (MouseEventKind::Down(MouseButton::Left), MouseEventKind::Drag(MouseButton::Left), MouseEventKind::Up(MouseButton::Left));
+
+        assert_eq!(app.update(mouse(down, 30, 5)), pointer(PointerKind::Down, 0.5 / 40.0, 2.5 / 10.0));
+        assert_eq!(app.update(mouse(drag, 45, 8)), pointer(PointerKind::Move, 15.5 / 40.0, 5.5 / 10.0));
+        // Past the card's right edge the fraction leaves 0..1, so the page keeps following.
+        assert_eq!(app.update(mouse(drag, 75, 8)), pointer(PointerKind::Move, 45.5 / 40.0, 5.5 / 10.0));
+        assert_eq!(app.update(mouse(up, 75, 8)), pointer(PointerKind::Up, 45.5 / 40.0, 5.5 / 10.0));
+        assert!(app.drag.is_none() && app.toast.is_none(), "nothing was selected or copied");
+        assert_eq!(app.update(mouse(drag, 45, 8)), vec![], "released: a stray drag is nobody's");
+
+        // The same gesture where no visual is drawn selects and copies text.
+        let g = ui::geometry(app.size);
+        app.update(mouse(down, g.main.x + 1, g.main.y + 1));
+        app.update(mouse(drag, g.main.x + 40, g.main.y + 4));
+        let fx = app.update(mouse(up, g.main.x + 40, g.main.y + 4));
+        assert!(fx.iter().any(|e| matches!(e, Effect::Copy(_))) && !fx.iter().any(|e| matches!(e, Effect::Pointer { .. })));
     }
 
     /// Every pane size from 1×1 to 160×50, with real content: drawing never
