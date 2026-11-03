@@ -5,6 +5,8 @@
 
 import Foundation
 
+public enum PointerKind: String, Sendable, Codable { case down, move, up }
+
 /// One request line from stage.
 public enum HelperRequest: Sendable, Equatable, Codable {
     case warm(id: Int)
@@ -18,9 +20,11 @@ public enum HelperRequest: Sendable, Equatable, Codable {
     case htmlResume(id: Int)
     case htmlClose(id: Int)
     case htmlResize(id: Int, width: Double, maxHeight: Double, scale: Double)
+    /// The mouse over the page, as fractions of its frame.
+    case htmlPointer(id: Int, kind: PointerKind, x: Double, y: Double)
 
     enum Key: String, CodingKey, CaseIterable {
-        case op, id, source, path, width, scale, fps, frame
+        case op, id, source, path, width, scale, fps, frame, kind, x, y
         case maxWidth = "max_width", fontSize = "font_size", maxHeight = "max_height"
     }
 
@@ -29,7 +33,7 @@ public enum HelperRequest: Sendable, Equatable, Codable {
         "warm": [.id], "mermaid": [.id, .source, .maxWidth, .fontSize], "mermaid-check": [.id, .source], "image": [.id, .path],
         "html-open": [.id, .path, .width, .maxHeight, .scale, .fps], "html-update": [.id, .path],
         "html-ack": [.id, .frame], "html-pause": [.id], "html-resume": [.id], "html-close": [.id],
-        "html-resize": [.id, .width, .maxHeight, .scale],
+        "html-resize": [.id, .width, .maxHeight, .scale], "html-pointer": [.id, .kind, .x, .y],
     ]
 
     public init(from decoder: Decoder) throws {
@@ -59,6 +63,9 @@ public enum HelperRequest: Sendable, Equatable, Codable {
         case "html-pause": self = .htmlPause(id: id)
         case "html-resume": self = .htmlResume(id: id)
         case "html-close": self = .htmlClose(id: id)
+        case "html-pointer":
+            self = .htmlPointer(id: id, kind: try c.decode(PointerKind.self, forKey: .kind), x: try c.decode(Double.self, forKey: .x),
+                                y: try c.decode(Double.self, forKey: .y))
         default:
             self = .htmlResize(id: id, width: try c.decode(Double.self, forKey: .width), maxHeight: try c.decode(Double.self, forKey: .maxHeight),
                                scale: try c.decode(Double.self, forKey: .scale))
@@ -87,6 +94,9 @@ public enum HelperRequest: Sendable, Equatable, Codable {
         case .htmlResize(let id, let width, let maxHeight, let scale):
             try c.encode("html-resize", forKey: .op); try c.encode(id, forKey: .id)
             try c.encode(width, forKey: .width); try c.encode(maxHeight, forKey: .maxHeight); try c.encode(scale, forKey: .scale)
+        case .htmlPointer(let id, let kind, let x, let y):
+            try c.encode("html-pointer", forKey: .op); try c.encode(id, forKey: .id)
+            try c.encode(kind, forKey: .kind); try c.encode(x, forKey: .x); try c.encode(y, forKey: .y)
         }
     }
 

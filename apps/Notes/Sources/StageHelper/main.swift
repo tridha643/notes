@@ -174,9 +174,10 @@ func handle(_ req: HelperRequest, from client: Client) {
     case .htmlUpdate(let id, let path):
         guard let page = client.pages[id] else { return client.fail(id, "no page \(id)") }
         page.update(path: path)
-    case .htmlAck(let id, _), .htmlPause(let id), .htmlResume(let id), .htmlResize(let id, _, _, _), .htmlClose(let id):
+    case .htmlPointer(let id, _, _, _), .htmlAck(let id, _), .htmlPause(let id), .htmlResume(let id), .htmlResize(let id, _, _, _), .htmlClose(let id):
         guard let page = client.pages[id] else { return client.fail(id, "no page \(id)") }
         switch req {
+        case .htmlPointer(_, let kind, let x, let y): page.pointer(kind: kind, x: x, y: y)
         case .htmlAck(_, let frame): page.ack(frame)
         case .htmlPause: page.pause()
         case .htmlResume: page.resume()
