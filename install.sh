@@ -3,7 +3,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/tridha643/stage/main/install.sh | sh
 # Installs notesd, notes, stage and stage-helper into ~/.local/bin, loads the notesd
 # LaunchAgent (launchd owns the socket and starts notesd on first connect), and copies
-# the stage skill into every agent skills folder it finds. Run it again to upgrade.
+# the stage skills (stage, brief-me) into every agent skills folder it finds. Run it again to upgrade.
 # STAGE_VERSION=v0.1.0 pins a release; `sh install.sh DIR` installs an unpacked build
 # (scripts/install.sh uses that for source builds).
 set -eu
@@ -42,7 +42,10 @@ for bundle in "$dist"/bin/*.bundle; do
   rm -rf "$bin/$(basename "$bundle")" && cp -R "$bundle" "$bin/"
 done
 for skills in "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.pi/agent/skills" "$HOME/.agents/skills"; do
-  if [ -d "$skills" ]; then rm -rf "$skills/stage" && cp -R "$dist/skills/stage" "$skills/stage"; fi
+  [ -d "$skills" ] || continue
+  for skill in "$dist"/skills/*; do
+    rm -rf "$skills/${skill##*/}" && cp -R "$skill" "$skills/"
+  done
 done
 # Standard, not Background: notesd answers stage and the CLI, so it shouldn't be throttled.
 cat > "$plist" <<PLIST

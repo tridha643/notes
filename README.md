@@ -31,8 +31,8 @@ curl -fsSL https://raw.githubusercontent.com/tridha643/stage/main/install.sh | s
 ```
 
 This downloads the latest release into `~/.local/bin` (`notesd`, `notes`, `stage`,
-`stage-helper`), registers the `notesd` LaunchAgent, copies the stage skill into every agent
-skills folder it finds (`~/.claude/skills`, `~/.codex/skills`, `~/.pi/agent/skills`,
+`stage-helper`), registers the `notesd` LaunchAgent, copies the stage and brief-me skills into every
+agent skills folder it finds (`~/.claude/skills`, `~/.codex/skills`, `~/.pi/agent/skills`,
 `~/.agents/skills`), and ends with `notes doctor`. Run it again to upgrade. Pin a version with
 `STAGE_VERSION=v0.1.0`.
 
@@ -51,7 +51,8 @@ notes setup >> AGENTS.md
 
 Agents learn the rest from the installed CLI, so the instructions always match the binary.
 `notes agent-howto` covers posting, revising and reading comments. `notes guide` is the design
-guide, sideshow's adapted to stage, ending with the live size of your card. Before sending,
+guide, sideshow's adapted to stage, ending with the live size of your card. `notes brief` is the recipe
+for briefing the user on a PR as one card with an html before/after diagram. Before sending,
 `notes post` checks each post against that card and refuses one that won't render or fit,
 such as a Mermaid diagram that doesn't parse. The `error:` lines tell the agent what to fix.
 
@@ -93,7 +94,7 @@ flowchart TD
 | `crates/cli` | `notes`, the CLI agents use, plus the design guide ([README](crates/cli/README.md)) |
 | `crates/stage` | `stage`, the ratatui TUI ([README](crates/stage/README.md)) |
 | `apps/Notes` | `stage-helper` (Swift) ([README](apps/Notes/README.md)) |
-| `skills/stage` | the agent skill the installer copies |
+| `skills/` | the agent skills the installer copies (stage, brief-me) |
 | `install.sh` | the curl installer |
 | `scripts/` | `install.sh` (from source), `dist.sh`, `release.sh`, latency and load tests |
 | `docs/` | `cli-spec.md` (the protocol), `stage-plan.md`, `bench/` |

@@ -95,6 +95,7 @@ at its first error.
 | `notes manifest` | Machine-readable JSON of every verb, its args, output schema and exit codes |
 | `notes agent-howto` | How agents post to stage (sessions, updates, reading comments) |
 | `notes guide` | The stage design guide for posts, with the space the user's card gives each part; `notes post` refuses a post that can't fit it and warns about the rest |
+| `notes brief` | How to brief the user on a PR or branch: one card with a few lines of why and an html before/after diagram (the brief-me skill reads it) |
 | `notes setup` | A block to paste into AGENTS.md or CLAUDE.md that points agents at stage |
 | `notes doctor` | Socket and database paths, daemon reachable, versions |
 | `notes completions zsh\|bash\|fish` | Shell completion script |

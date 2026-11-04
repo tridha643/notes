@@ -16,6 +16,10 @@ notes agent-howto   # how to post, revise a post, and read the user's comments
 notes guide         # how posts should look
 ```
 
+Default to `html` parts with inline SVG for anything visual; use the other
+kinds for prose and data. To brief the user on a PR or branch, use the
+`brief-me` skill.
+
 Then post with `notes post <kind> <file|-> --title "..."` (add
 `--session-title "The task"` on the first one), revise with
 `notes post update <id> ...`, and treat `feedback:` lines on stderr as messages

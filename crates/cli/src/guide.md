@@ -10,7 +10,9 @@ and nothing is sent), and warns about the rest (`warning:` lines).
 ## Posts and parts
 
 A **post** is a card built from an ordered list of **parts**. Each part has a
-kind:
+kind. Default to html: anything you'd draw, compare or lay out (a diagram, a
+before and after, a flow, a sketch, a status view) is an html part with inline
+SVG. The other kinds are for prose and for data you already have.
 
 - **`html`**: arbitrary markup you write, run live in an offscreen web view
   whose frames stream into the pane, so animation works. The rest of this guide
@@ -22,9 +24,10 @@ kind:
   plans and tradeoff write-ups, anything you'd otherwise hand-format in html.
 - **`mermaid`**: diagram source you hand over as text; stage renders it to an
   SVG (flowcharts, sequence diagrams, ERDs, gantt, state, ...). Reach for it
-  when the shape of a system is the point and you'd rather describe it than
-  draw SVG by hand. For bespoke vector art, hand-write inline `<svg>` in an
-  html part instead. stage themes the diagram, so don't set your own colors.
+  only for a sequence diagram, ERD or gantt, or a graph too big to place by
+  hand. Anything else reads better as inline `<svg>` in an html part, where you
+  choose the layout and what to emphasize. stage themes the diagram, so don't
+  set your own colors.
 - **`diff`**: a unified or git patch you hand over as data; stage renders it as
   a highlighted code review. Reach for it to show a changeset or review code,
   not to draw. Pipe it: `git diff --no-color -- src/retry.rs | notes post diff - --title "Retry on 429"`.
@@ -44,8 +47,10 @@ kind:
 For an issue/PR/CI tree, status board or stepped deck, reach for an html part
 with a kit (see Kits below) rather than a dedicated kind.
 
-A post can combine parts: `[html, diff]` is a diagram with its code review in
-one card, and `[markdown, diff]` is a written rationale above its changeset.
+A post can combine parts: `[markdown, html]` is a short explanation above its
+diagram, `[html, diff]` is a diagram with its code review in one card, and
+`[markdown, diff]` is a written rationale above its changeset. To brief the
+user on a PR or branch, follow `notes brief`.
 Every kind except html is data stage renders for you; send data, never markup.
 
 ```sh
@@ -56,6 +61,7 @@ notes post diff change.patch --title "Retry on 429"           # diff
 notes post json data.json --title "API response"              # json
 notes post code src/app.ts --lines 80:150 --title "app.ts"    # code excerpt
 notes post image shot.png --title "Settings page"             # image
+notes post markdown why.md --html flow.html --title "Retry flow"      # [markdown, html]
 notes post html sketch.html --diff change.patch --title "Retry flow"   # [html, diff]
 notes post markdown why.md --diff change.patch --title "Retry on 429"  # [markdown, diff]
 ```

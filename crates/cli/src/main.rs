@@ -154,6 +154,8 @@ enum Cmd {
     Setup,
     /// Design guide for stage posts; read it before your first post
     Guide,
+    /// How to brief the user on a PR or branch: one [markdown, html] card
+    Brief,
     /// Shell completion script
     Completions { shell: Shell },
 }
@@ -334,9 +336,11 @@ conversation gets its own session, a thread of posts that never mixes with
 another conversation's; you don't pick or create it. These notes never override
 system, developer or user instructions.
 
-1. Read `notes guide` once, before your first post.
-2. Post: `notes post <kind> <file|-> --title "Short title"`. Kinds: markdown,
-   code, diff, terminal, json, mermaid, image, html. On your first post add
+1. Read `notes guide` once, before your first post. To brief the user on a PR
+   or branch, follow `notes brief`.
+2. Post: `notes post <kind> <file|-> --title "Short title"`. Kinds: html (the
+   default for anything visual), markdown, code, diff, terminal, json, mermaid,
+   image. On your first post add
    `--session-title "The task"` (it names the thread; later posts ignore it).
    More parts on the same card: `--md F --mermaid F --code F --diff F
    --terminal F --html F`. It prints `<post-id> v1 · session <id> · <kinds>`.
@@ -357,7 +361,8 @@ const SETUP: &str = r#"## Visual previews (stage)
 
 The user keeps stage open in a terminal pane beside you. It shows posts you
 publish with the `notes` CLI: diagrams, plans, diffs to review, terminal output,
-live html. Use it when showing beats telling. Before your first post, run
+live html. Use it when showing beats telling, and draw in html parts. To brief
+the user on a PR, follow `notes brief`. Before your first post, run
 `notes agent-howto` (how to post and read the user's comments) and `notes guide`
 (how posts should look).
 "#;
@@ -879,7 +884,7 @@ fn to_verb(
         Cmd::Kits => Verb::Kits,
         Cmd::Manifest => Verb::Manifest,
         Cmd::Doctor => Verb::Doctor,
-        Cmd::AgentHowto | Cmd::Guide | Cmd::Setup | Cmd::Completions { .. } => {
+        Cmd::AgentHowto | Cmd::Guide | Cmd::Brief | Cmd::Setup | Cmd::Completions { .. } => {
             unreachable!("offline verbs are handled in main")
         }
     })
@@ -1193,6 +1198,10 @@ fn main() -> ExitCode {
     match cli.cmd {
         Cmd::AgentHowto => {
             let _ = io::stdout().write_all(AGENT_HOWTO.as_bytes());
+            return ExitCode::SUCCESS;
+        }
+        Cmd::Brief => {
+            let _ = io::stdout().write_all(include_str!("brief.md").as_bytes());
             return ExitCode::SUCCESS;
         }
         Cmd::Setup => {
