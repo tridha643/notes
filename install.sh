@@ -68,6 +68,24 @@ if [ -n "$stage_dir" ]; then
 fi
 launchctl bootout "gui/$(id -u)/dev.notes.notesd" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$plist"
+# stage runs in Herdr panes, and its kitty graphics need a current Herdr. Replace an older
+# copy (Homebrew's or a loose binary) with the latest release in $bin. Not installed: skip.
+if have="$(herdr --version 2>/dev/null)"; then
+  have="${have#herdr }"
+  # A failed lookup or download leaves the old herdr in place rather than failing the install.
+  latest="$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/herdrdev/herdr/releases/latest || true)"
+  latest="${latest##*/tag/v}"
+  if [ -n "$latest" ] && [ "$have" != "$latest" ] && [ "$(printf '%s\n%s\n' "$have" "$latest" | sort -V | tail -1)" = "$latest" ] &&
+    curl -fsSL -o "$bin/herdr.new" "https://github.com/herdrdev/herdr/releases/download/v$latest/herdr-macos-aarch64"; then
+    echo "replacing herdr $have with $latest"
+    chmod 755 "$bin/herdr.new"
+    if brew list herdr >/dev/null 2>&1; then brew uninstall herdr; fi
+    old="$(command -v herdr || true)"
+    if [ -n "$old" ] && [ "$old" != "$bin/herdr" ]; then rm -f "$old" || echo "remove $old by hand: it shadows $bin/herdr" >&2; fi
+    mv "$bin/herdr.new" "$bin/herdr"
+    echo "a running herdr keeps $have until you restart it (herdr server stop)"
+  fi
+fi
 case ":$PATH:" in
   *":$bin:"*) ;;
   *) echo "add $bin to your PATH: echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc" >&2 ;;

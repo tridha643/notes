@@ -1,13 +1,14 @@
-//! Opt-in style/behaviour bundles for html parts. The CSS/JS below is verbatim
-//! from docs/ref/sideshow/server/kits.ts. Sideshow injects `CORE_CSS` once when
+//! Opt-in style/behaviour bundles for html parts. The `issues` and `slides` CSS/JS below
+//! is verbatim from docs/ref/sideshow/server/kits.ts. Sideshow injects `CORE_CSS` once when
 //! any kit is used; `Kit` has no slot for it, so each kit's `css` starts with it
-//! (identical rules, so loading two kits just repeats them harmlessly).
+//! (identical rules, so loading two kits just repeats them harmlessly). `dragology` is
+//! ours: a bundle built by scripts/vendor-dragology.sh.
 
 use crate::posts::Kit;
 
-pub const KIT_IDS: &[&str] = &["issues", "slides"];
+pub const KIT_IDS: &[&str] = &["issues", "slides", "dragology"];
 
-/// Both kits, CSS prefixed with the shared core helpers.
+/// Every kit; the sideshow ones have their CSS prefixed with the shared core helpers.
 pub fn kits() -> Vec<Kit> {
     vec![
         Kit {
@@ -24,8 +25,18 @@ pub fn kits() -> Vec<Kit> {
             css: [CORE_CSS, SLIDES_CSS].concat(),
             js: Some(SLIDES_JS.into()),
         },
+        Kit {
+            id: "dragology".into(),
+            label: "Dragology".into(),
+            summary: "drag-driven SVG interfaces: declare the states an element can be dragged between".into(),
+            css: String::new(),
+            js: Some(DRAGOLOGY_JS.into()),
+        },
     ]
 }
+
+/// Dragology with preact, built by scripts/vendor-dragology.sh; licenses in kits/dragology-LICENSES.
+pub const DRAGOLOGY_JS: &str = include_str!("kits/dragology.js");
 
 pub const CORE_CSS: &str = r#"
 .stack{display:flex;flex-direction:column;gap:8px}.stack.sm{gap:4px}.stack.lg{gap:16px}

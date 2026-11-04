@@ -19,7 +19,7 @@ use std::{
     thread,
 };
 
-use notes_proto::helper::{Failed, Frame, HelperReply, HelperRequest, Image, Mermaid, MermaidSyntax};
+use notes_proto::helper::{Failed, Frame, HelperReply, HelperRequest, Image, Mermaid, MermaidSyntax, PointerKind};
 
 use crate::{
     app::{Msg, OnScreen, Target, VisualKey, ZoomView},
@@ -492,6 +492,13 @@ impl Gallery {
             for page in pages {
                 let _ = self.send(&HelperRequest::HtmlPause { id: page });
             }
+        }
+    }
+
+    /// The mouse over `key`'s page, if it has a live one.
+    pub fn pointer(&mut self, key: &VisualKey, kind: PointerKind, x: f64, y: f64) {
+        if let Some(id) = self.images.get(key).and_then(|img| img.page) {
+            let _ = self.send(&HelperRequest::HtmlPointer { id, kind, x, y });
         }
     }
 

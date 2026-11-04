@@ -252,6 +252,42 @@ private func page(_ html: String) throws -> String {
         try h.send(["op": "html-close", "id": 11])
     }
 
+    @Test func pointerDragMovesAnElementAndClicksFireOnRelease() throws {
+        let path = try page("""
+        <body style='margin:0;background:#1e1e2e'><div style='position:relative;height:100px'>
+        <div id=box style='position:absolute;left:0;top:30px;width:40px;height:40px;background:#a6e3a1'></div></div>
+        <script>
+        let from = null;
+        box.addEventListener('pointerdown', e => { from = e.clientX - box.offsetLeft });
+        addEventListener('pointermove', e => { if (from !== null) box.style.left = (e.clientX - from) + 'px' });
+        addEventListener('pointerup', () => { from = null });
+        box.addEventListener('click', () => { box.style.top = '0px' });
+        </script></body>
+        """)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let h = try Helper()
+        try h.send(["op": "html-open", "id": 12, "path": path, "width": 200, "max_height": 100, "scale": 1, "fps": 60])
+        let first = try #require(h.next())
+        shm_unlink(try #require(first["shm"] as? String))
+        try h.send(["op": "html-ack", "id": 12, "frame": try #require(first["frame"] as? Int)])
+        for (kind, x) in [("down", 0.1), ("move", 0.3), ("move", 0.6), ("up", 0.6)] {
+            try h.send(["op": "html-pointer", "id": 12, "kind": kind, "x": x, "y": 0.5])
+        }
+        let (w, height) = (200, 100)
+        var pixel: ((Int, Int) -> [UInt8])?
+        while let frame = h.next(1) {
+            guard let shm = frame["shm"] as? String, let number = frame["frame"] as? Int else { continue }
+            let px = try takeShm(shm, w * height * 4)
+            try h.send(["op": "html-ack", "id": 12, "frame": number])
+            pixel = { x, y in Array(px[(y * w + x) * 4..<(y * w + x) * 4 + 4]) }
+            // The box was grabbed at x=20 and released at x=120, so it spans 100..<140; the click then lifts it to the top.
+            if pixel?(120, 10) == [0xa6, 0xe3, 0xa1, 255] { break }
+        }
+        let at = try #require(pixel)
+        #expect(at(120, 10) == [0xa6, 0xe3, 0xa1, 255] && at(20, 50) == [0x1e, 0x1e, 0x2e, 255], "dragged to 100..<140, then clicked up")
+        try h.send(["op": "html-close", "id": 12])
+    }
+
     @Test func widePagesAreZoomedOutToFitTheCard() throws {
         let path = try page("<body style='margin:0'><div style='width:1000px;height:500px;background:#89b4fa'></div></body>")
         let h = try Helper()

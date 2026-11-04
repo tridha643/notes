@@ -8,9 +8,12 @@
 // the ack, so stage always gets the newest pixels and never a backlog.
 
 import AppKit
+import NotesCore
 import WebKit
 
-/// Reports mutations and the first rAF after idle, and answers "still animating?".
+/// Reports mutations and the first rAF after idle, answers "still animating?", and plays
+/// stage's mouse into the page as pointer events, then the mouse events and click that
+/// follow them in a browser (unless the page cancelled the pointer event).
 private let pageScript = """
 (() => {
   const post = m => { try { webkit.messageHandlers.stage.postMessage(m) } catch (e) {} };
@@ -23,6 +26,18 @@ private let pageScript = """
     calls = 0;
     if (!busy) armed = true;
     return busy;
+  };
+  let pressed = null;
+  window.__stagePointer = (kind, x, y) => {
+    const el = document.elementFromPoint(x, y) || document.documentElement;
+    if (kind === 'down') pressed = el;
+    const init = { bubbles: true, cancelable: true, composed: true, view: window, clientX: x, clientY: y,
+      button: 0, buttons: kind === 'up' ? 0 : 1, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+    if (el.dispatchEvent(new PointerEvent('pointer' + kind, init))) el.dispatchEvent(new MouseEvent('mouse' + kind, init));
+    if (kind === 'up') {
+      if (pressed && pressed.contains(el)) el.dispatchEvent(new MouseEvent('click', init));
+      pressed = null;
+    }
   };
   const watch = () => new MutationObserver(() => post('mut')).observe(document.documentElement,
     { subtree: true, childList: true, attributes: true, characterData: true });
@@ -408,6 +423,13 @@ final class Page: NSObject, WKNavigationDelegate {
         // Keep ownership of an outstanding frame: its ack releases backpressure.
         capture()
         checkAnimating()
+    }
+
+    /// The mouse at fractions `x`,`y` of the frame, in the page's CSS pixels.
+    func pointer(kind: PointerKind, x: Double, y: Double) {
+        guard loaded, !measuring, !paused, !closed else { return }
+        let zoom = web.pageZoom
+        web.evaluateJavaScript("__stagePointer('\(kind.rawValue)', \(x * width / zoom), \(y * height / zoom))")
     }
 
     func resize(width: Double?, maxHeight: Double?, scale: Double?) {

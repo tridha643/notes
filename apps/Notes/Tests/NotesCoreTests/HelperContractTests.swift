@@ -34,6 +34,7 @@ private let requests: [String: HelperRequest] = [
     "html-resume": .htmlResume(id: 4),
     "html-close": .htmlClose(id: 4),
     "html-resize": .htmlResize(id: 4, width: 400, maxHeight: 200, scale: 2),
+    "html-pointer": .htmlPointer(id: 4, kind: .move, x: 0.25, y: 1.5),
 ]
 
 private let replies: [String: HelperReply] = [

@@ -252,13 +252,14 @@ mod helper {
             HelperRequest::HtmlResume { .. } => "html-resume",
             HelperRequest::HtmlClose { .. } => "html-close",
             HelperRequest::HtmlResize { .. } => "html-resize",
+            HelperRequest::HtmlPointer { .. } => "html-pointer",
         }
     }
 
     #[test]
     fn requests_round_trip_and_reject_unknown_fields() {
         let names = files(".request.json");
-        assert_eq!(names.len(), 11, "one fixture per op");
+        assert_eq!(names.len(), 12, "one fixture per op");
         let mut seen = Vec::new();
         for file in names {
             let line = read(&file);
@@ -274,7 +275,7 @@ mod helper {
             assert!(serde_json::from_value::<HelperRequest>(missing).is_err(), "{file} accepted no id");
         }
         seen.dedup();
-        assert_eq!(seen.len(), 11);
+        assert_eq!(seen.len(), 12);
         assert!(serde_json::from_str::<HelperRequest>(r#"{"op":"nope","id":1}"#).is_err());
     }
 

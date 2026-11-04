@@ -40,6 +40,7 @@ fn restore() {
     let mut out = io::stdout();
     // Delete any kitty placements we made, leave the alt screen, give the shell back.
     let _ = out.write_all(b"\x1b_Ga=d,d=a\x1b\\");
+    let _ = out.write_all(b"\x1b[?1016l");
     let _ = execute!(out, DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen, Show);
     let _ = disable_raw_mode();
 }
@@ -150,6 +151,12 @@ fn main() -> ExitCode {
     gallery.warm();
     let p = probe::read(0, Duration::from_secs(2));
     app.update(Msg::Probed { cell_px: p.cell_px, kitty: p.kitty });
+    // Pixel mouse reports let an html page follow a drag to the pixel. Without a cell size to
+    // split them by they'd be unusable, so then stay on cells. Motion still only comes with a button held (1002).
+    let pixel_mouse = p.pixel_mouse && cell_px().is_some();
+    if pixel_mouse {
+        let _ = io::stdout().write_all(b"\x1b[?1016h").and_then(|()| io::stdout().flush());
+    }
 
     // After the first frame (connecting can wait on launchd starting notesd): the watch
     // starts at the seq notesd had committed before bootstrap lists anything,
@@ -198,9 +205,20 @@ fn main() -> ExitCode {
             while let Ok(ev) = event::read() {
                 let msgs = match ev {
                     TermEvent::Key(k) => vec![Msg::Key(k)],
-                    // Stamped here: wheel acceleration needs arrival times, not batch times.
-                    TermEvent::Mouse(m) if matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => vec![Msg::Wheel(m, std::time::Instant::now())],
-                    TermEvent::Mouse(m) => vec![Msg::Mouse(m)],
+                    TermEvent::Mouse(mut m) => {
+                        // Under 1016 crossterm's column/row are pixels: everything else sees the cell.
+                        let px = cell_px().filter(|_| pixel_mouse).map(|(w, h)| {
+                            let at = (m.column, m.row);
+                            (m.column, m.row) = (at.0 / w, at.1 / h);
+                            at
+                        });
+                        match px {
+                            // Stamped here: wheel acceleration needs arrival times, not batch times.
+                            _ if matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => vec![Msg::Wheel(m, std::time::Instant::now())],
+                            Some(px) => vec![Msg::MousePx(m, px)],
+                            None => vec![Msg::Mouse(m)],
+                        }
+                    }
                     // A pane can start at a placeholder size (Rex: 80x24, 8x16 px cells)
                     // and get its real one in the first resize, so re-measure cells too.
                     TermEvent::Resize(w, h) => [Msg::Resize(w, h)].into_iter().chain(cell_px().map(Msg::CellPx)).collect(),
@@ -283,6 +301,7 @@ fn main() -> ExitCode {
                         later.extend(app.update(m));
                     }
                 }
+                Effect::Pointer { key, kind, x, y } => gallery.pointer(&key, kind, x, y),
                 Effect::Fatal(m) => {
                     restore();
                     eprintln!("{m}");
@@ -387,22 +406,36 @@ fn main() -> ExitCode {
 /// Exit once the terminal hangs up (its pane closed). crossterm's reader spins on a
 /// hung-up tty instead of failing, and a closed pane doesn't always send SIGHUP, so
 /// an orphaned stage would burn a core forever. Blocks in `kevent`, waking only for
-/// the user's keystrokes.
+/// the user's keystrokes. Also restores the terminal before exiting on SIGTERM, SIGINT
+/// or SIGHUP: their default action would leave raw mode and mouse reporting on, so the
+/// pane's shell gets every click typed into it as `0;492;296M`.
 fn exit_on_hangup() {
+    const SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
     thread::spawn(|| {
-        // SAFETY: plain kqueue calls on stdin with zeroed, fully initialized kevents.
+        // SAFETY: plain kqueue calls on stdin and signals with zeroed, fully initialized
+        // kevents; SIG_IGN only stops the default action, kqueue still reports the signal.
         unsafe {
             let kq = libc::kqueue();
-            let mut change: libc::kevent = std::mem::zeroed();
-            change.ident = libc::STDIN_FILENO as usize;
-            change.filter = libc::EVFILT_READ;
-            change.flags = libc::EV_ADD | libc::EV_CLEAR;
-            if kq < 0 || libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) < 0 {
+            let mut changes = [std::mem::zeroed::<libc::kevent>(); 1 + SIGNALS.len()];
+            changes[0].ident = libc::STDIN_FILENO as usize;
+            changes[0].filter = libc::EVFILT_READ;
+            changes[0].flags = libc::EV_ADD | libc::EV_CLEAR;
+            for (change, sig) in changes[1..].iter_mut().zip(SIGNALS) {
+                libc::signal(sig, libc::SIG_IGN);
+                change.ident = sig as usize;
+                change.filter = libc::EVFILT_SIGNAL;
+                change.flags = libc::EV_ADD;
+            }
+            if kq < 0 || libc::kevent(kq, changes.as_ptr(), changes.len() as i32, std::ptr::null_mut(), 0, std::ptr::null()) < 0 {
                 return;
             }
             let mut event: libc::kevent = std::mem::zeroed();
             loop {
                 match libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, std::ptr::null()) {
+                    1 if event.filter == libc::EVFILT_SIGNAL => {
+                        restore();
+                        std::process::exit(128 + event.ident as i32);
+                    }
                     1 if event.flags & libc::EV_EOF != 0 => std::process::exit(0),
                     n if n < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted => return,
                     _ => {}

@@ -1,4 +1,4 @@
-//! The stage ↔ stage-helper wire: JSON lines over a unix socket (`helper-v5.sock`).
+//! The stage ↔ stage-helper wire: JSON lines over a unix socket (`helper-v6.sock`).
 //!
 //! ```text
 //! → {"op":"mermaid","id":3,"source":"flowchart TD\n a-->b","max_width":400.0,"font_size":14.0}
@@ -46,6 +46,17 @@ pub enum HelperRequest {
     HtmlResume { id: u64 },
     HtmlClose { id: u64 },
     HtmlResize { id: u64, width: f64, max_height: f64, scale: f64 },
+    /// The mouse at `x`,`y` over the page, as fractions of its frame (outside 0..1 while a
+    /// drag leaves it). No reply: a page that changes streams frames as usual.
+    HtmlPointer { id: u64, kind: PointerKind, x: f64, y: f64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PointerKind {
+    Down,
+    Move,
+    Up,
 }
 
 /// A boolean that is always `V` on the wire (`"ok":true` / `"ok":false`).
@@ -172,7 +183,7 @@ pub fn binary() -> PathBuf {
 /// this process and the next client finds pele warm) if nobody answers.
 pub fn connect(cache: &Path) -> Result<UnixStream, String> {
     // Versioned so a client never talks to a helper from an older protocol behavior.
-    let sock = cache.join("helper-v5.sock");
+    let sock = cache.join("helper-v6.sock");
     if let Ok(stream) = UnixStream::connect(&sock) {
         return Ok(stream);
     }
