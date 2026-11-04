@@ -406,22 +406,36 @@ fn main() -> ExitCode {
 /// Exit once the terminal hangs up (its pane closed). crossterm's reader spins on a
 /// hung-up tty instead of failing, and a closed pane doesn't always send SIGHUP, so
 /// an orphaned stage would burn a core forever. Blocks in `kevent`, waking only for
-/// the user's keystrokes.
+/// the user's keystrokes. Also restores the terminal before exiting on SIGTERM, SIGINT
+/// or SIGHUP: their default action would leave raw mode and mouse reporting on, so the
+/// pane's shell gets every click typed into it as `0;492;296M`.
 fn exit_on_hangup() {
+    const SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
     thread::spawn(|| {
-        // SAFETY: plain kqueue calls on stdin with zeroed, fully initialized kevents.
+        // SAFETY: plain kqueue calls on stdin and signals with zeroed, fully initialized
+        // kevents; SIG_IGN only stops the default action, kqueue still reports the signal.
         unsafe {
             let kq = libc::kqueue();
-            let mut change: libc::kevent = std::mem::zeroed();
-            change.ident = libc::STDIN_FILENO as usize;
-            change.filter = libc::EVFILT_READ;
-            change.flags = libc::EV_ADD | libc::EV_CLEAR;
-            if kq < 0 || libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) < 0 {
+            let mut changes = [std::mem::zeroed::<libc::kevent>(); 1 + SIGNALS.len()];
+            changes[0].ident = libc::STDIN_FILENO as usize;
+            changes[0].filter = libc::EVFILT_READ;
+            changes[0].flags = libc::EV_ADD | libc::EV_CLEAR;
+            for (change, sig) in changes[1..].iter_mut().zip(SIGNALS) {
+                libc::signal(sig, libc::SIG_IGN);
+                change.ident = sig as usize;
+                change.filter = libc::EVFILT_SIGNAL;
+                change.flags = libc::EV_ADD;
+            }
+            if kq < 0 || libc::kevent(kq, changes.as_ptr(), changes.len() as i32, std::ptr::null_mut(), 0, std::ptr::null()) < 0 {
                 return;
             }
             let mut event: libc::kevent = std::mem::zeroed();
             loop {
                 match libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, std::ptr::null()) {
+                    1 if event.filter == libc::EVFILT_SIGNAL => {
+                        restore();
+                        std::process::exit(128 + event.ident as i32);
+                    }
                     1 if event.flags & libc::EV_EOF != 0 => std::process::exit(0),
                     n if n < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted => return,
                     _ => {}
