@@ -31,8 +31,8 @@ curl -fsSL https://raw.githubusercontent.com/tridha643/stage/main/install.sh | s
 
 Proof: `notes doctor` succeeds at the end of the run; `launchctl print gui/$(id -u)/dev.notes.notesd`
 shows the socket at `~/Library/Application Support/Notes/notesd.sock`; `~/.local/bin` holds the
-four binaries and `Notes_NotesCore.bundle`; `~/.claude/skills/stage/SKILL.md` matches
-`skills/stage/SKILL.md`; `stage` opens and draws a Mermaid card (drive.py against the fixture).
+four binaries and `Notes_NotesCore.bundle`; `~/.claude/skills/stage/SKILL.md` and `~/.claude/skills/brief-me/SKILL.md` match
+their copies under `skills/`; `stage` opens and draws a Mermaid card (drive.py against the fixture).
 
 ## Gotchas
 

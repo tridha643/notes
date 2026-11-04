@@ -13,7 +13,7 @@ schema and exit codes as JSON. The groups are:
   `wait`, `sessions`, `session`, `trace`, `kits`.
 - **Plumbing:** `watch` (NDJSON events, `--since` to resume), `batch` (NDJSON ops over one
   connection, `--atomic`), `doctor`, `completions`.
-- **For agents:** `agent-howto`, `guide`, `setup`.
+- **For agents:** `agent-howto`, `guide`, `brief`, `setup`.
 
 `--json` prints raw results (lists as one object per line) and `-q` prints nothing, relying on
 the exit code.
@@ -34,7 +34,7 @@ against [`guide.md`](src/guide.md) and the space stage last reported for its car
 or taller than its viewport) is refused with `error:` lines and exit 2; style slips only print
 `warning:` lines. Until stage has reported a space, overflow only warns too.
 
-`agent-howto` and `guide` are compiled into the binary, so the instructions an agent reads
+`agent-howto`, `guide` and `brief` are compiled into the binary, so the instructions an agent reads
 always match the CLI it's running.
 
 ## Test

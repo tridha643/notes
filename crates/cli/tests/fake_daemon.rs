@@ -228,6 +228,14 @@ fn agent_howto_and_completions_work_without_a_daemon() {
         "{text}"
     );
 
+    let brief = Command::new(env!("CARGO_BIN_EXE_notes"))
+        .args(["brief", "--sock", "/nonexistent/notesd.sock"])
+        .output()
+        .unwrap();
+    assert_eq!(brief.status.code(), Some(0));
+    let text = String::from_utf8(brief.stdout).unwrap();
+    assert!(text.contains("notes post markdown brief.md --html before-after.html"), "{text}");
+
     for (shell, marker) in [
         ("zsh", "#compdef notes"),
         ("bash", "_notes()"),
