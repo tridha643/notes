@@ -6,6 +6,22 @@ to the agent. It's [sideshow](https://github.com/modem-dev/sideshow)'s parts and
 guide, rebuilt as a native terminal app. One Rust daemon owns the data, and the `notes` CLI
 and the `stage` TUI are thin clients over a unix socket.
 
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <img width="100%" alt="stage in a Rex pane: agent sessions in a sidebar, a markdown plan with a table, and a Mermaid flowchart of the retry loop rendered inline with kitty graphics" src="docs/stage-plan.png">
+    </td>
+    <td width="50%" valign="top">
+      <img width="100%" alt="A highlighted diff card with a comment thread under it, where the user asks a question and the agent replies, followed by colored cargo test output" src="docs/stage-diff.png">
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2">
+      <img width="100%" alt="Animated demo: an agent posts a sequence diagram that appears live in stage, the user comments a question under it, and the agent replies and revises the diagram to v2 in the same card" src="docs/stage-demo.gif">
+    </td>
+  </tr>
+</table>
+
 macOS 26+, Apple Silicon.
 
 ## Install
